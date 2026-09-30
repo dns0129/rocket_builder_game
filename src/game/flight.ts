@@ -1,0 +1,1073 @@
+import { Matrix4, Quaternion, Vector3 } from 'three';
+import {
+  EARTH,
+  MOON,
+  type Body,
+  G0,
+  atmoDensity,
+  atmoPressure,
+  bodyPosition,
+  bodyRotation,
+  bodyVelocity,
+  dominantBody,
+  fromBodyFixed,
+  gravityAccel,
+  machDragFactor,
+  speedOfSound,
+  surfaceVelocity,
+  toBodyFixed,
+} from '../physics/bodies';
+import { adaptiveStep, rk4Step } from '../physics/integrate';
+import { computeOrbit, type OrbitInfo } from '../physics/orbit';
+import { terrainHeight, terrainNormal } from '../physics/terrain';
+import type { RocketDesign } from '../rocket/design';
+import { Debris, Vessel, type RuntimePart } from './vessel';
+import { predict, nodeDvWorld, type NodeSpec, type Prediction } from './predictor';
+import { burnTime } from './maneuver';
+import { Autopilot } from './autopilot';
+import { MissionTracker } from './missions';
+
+export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000];
+export const PHYS_WARP_MAX = 3;
+
+export type SasMode = 'stability' | 'prograde' | 'retrograde' | 'normal' | 'antinormal' | 'radialOut' | 'radialIn' | 'maneuver';
+export type SpeedMode = 'auto' | 'surface' | 'orbit';
+export type Scenario = 'pad' | 'leo' | 'llo';
+
+export interface FlightEvent {
+  type: string;
+  msg?: string;
+  level?: 'info' | 'good' | 'warn' | 'bad';
+  pos?: Vector3;
+  size?: number;
+  debrisId?: number;
+}
+
+export interface Telemetry {
+  body: Body;
+  alt: number;
+  radarAlt: number;
+  terrainH: number;
+  vVert: number;
+  vHoriz: number;
+  surfSpeed: number;
+  orbSpeed: number;
+  speedModeUsed: 'surface' | 'orbit';
+  orbit: OrbitInfo;
+  pressure: number;
+  density: number;
+  dynPressure: number;
+  mach: number;
+  gforce: number;
+  heatFlux: number;
+  temp: number;
+  tempMax: number;
+  thrust: number;
+  twr: number;
+  gLocal: number;
+  mass: number;
+  stageDv: number;
+  lat: number;
+  lon: number;
+  up: Vector3;
+  north: Vector3;
+  east: Vector3;
+  vSurfVec: Vector3;
+  vOrbVec: Vector3;
+  suicideIn: number; // 距建议点火的秒数（NaN 表示无意义）
+  timeToImpact: number;
+  inAtmosphere: boolean;
+}
+
+export interface ManeuverNode extends NodeSpec {
+  fixedDv: Vector3 | null; // 开始执行后锁定的惯性系 Δv 矢量
+  remaining: Vector3 | null;
+}
+
+const UP = new Vector3(0, 1, 0);
+const _v1 = new Vector3();
+const _v2 = new Vector3();
+const _v3 = new Vector3();
+const _q1 = new Quaternion();
+
+export class FlightSim {
+  t = 0;
+  met = 0;
+  metStarted = false;
+  vessel: Vessel;
+  debris: Debris[] = [];
+  events: FlightEvent[] = [];
+  warpIndex = 0;
+  input = { pitch: 0, yaw: 0, roll: 0 };
+  controlCmd = new Vector3(); // 实际控制量（x 俯仰, y 滚转, z 偏航），用于喷管摆动显示
+  sasOn = true;
+  sasMode: SasMode = 'stability';
+  private sasHold: Quaternion | null = null;
+  speedMode: SpeedMode = 'auto';
+  landed = false;
+  private landedBody: Body = EARTH;
+  private landedPos = new Vector3();
+  private landedQ = new Quaternion();
+  private settle = 0;
+  touchingWater = false;
+  destroyed = false;
+  destroyReason = '';
+  launched = false;
+  body: Body = EARTH;
+  telemetry!: Telemetry;
+  nodes: ManeuverNode[] = [];
+  prediction: Prediction | null = null;
+  predictionAge = 999;
+  autopilot: Autopilot;
+  missions: MissionTracker;
+  isWater: (body: Body, dirBf: Vector3) => boolean = () => false;
+  maxG = 0;
+  lastThrustAccel = new Vector3();
+  heatFlux = 0;
+  private overheatWarned = false;
+  private lastNonGravAcc = 0;
+  landedOnMoonOnce = false;
+  paused = false;
+  autoWarpTo: number | null = null;
+  scenario: Scenario;
+  contactCount = 0;
+  tempLimit = 1500;
+  private warnedFlameout = new Set<string>();
+
+  constructor(design: RocketDesign, scenario: Scenario = 'pad') {
+    this.vessel = new Vessel(design);
+    this.scenario = scenario;
+    this.autopilot = new Autopilot(this);
+    this.missions = new MissionTracker(this);
+    this.setupScenario(scenario);
+    this.updateTelemetry();
+  }
+
+  get warp(): number {
+    return WARP_LEVELS[this.warpIndex];
+  }
+
+  emit(e: FlightEvent): void {
+    this.events.push(e);
+  }
+
+  drainEvents(): FlightEvent[] {
+    const e = this.events;
+    this.events = [];
+    return e;
+  }
+
+  // ---------------------------------------------------------------- 场景初始化
+
+  private setupScenario(sc: Scenario): void {
+    const V = this.vessel;
+    if (sc === 'pad') {
+      const up = new Vector3(1, 0, 0);
+      const west = new Vector3(0, 0, 1);
+      const south = new Vector3(0, -1, 0);
+      V.q.setFromRotationMatrix(new Matrix4().makeBasis(south, up, west));
+      const b = V.bounds();
+      V.r.copy(up).multiplyScalar(EARTH.radius + (V.com.y - b.minY) - 0.01);
+      V.v.copy(surfaceVelocity(EARTH, 0, V.r));
+      V.throttle = 1;
+      this.body = EARTH;
+      this.lockLanded(EARTH);
+      this.landed = true;
+    } else {
+      const body = sc === 'leo' ? EARTH : MOON;
+      const alt = sc === 'leo' ? 100_000 : 22_000;
+      const bp = bodyPosition(body, 0, new Vector3());
+      const bv = bodyVelocity(body, 0, new Vector3());
+      // 选择一个与太阳成一定角度的位置，保证画面有光照
+      const dir = new Vector3(0.3, 0, 0.95).normalize();
+      const rr = body.radius + alt;
+      V.r.copy(bp).addScaledVector(dir, rr);
+      const vc = Math.sqrt(body.mu / rr);
+      const pro = new Vector3().crossVectors(new Vector3(0, 1, 0), dir).normalize();
+      V.v.copy(bv).addScaledVector(pro, vc);
+      // 机头指向逆行方向（准备减速）
+      const fwd = pro.clone().negate();
+      const top = dir.clone();
+      const right = new Vector3().crossVectors(fwd, top).normalize();
+      V.q.setFromRotationMatrix(new Matrix4().makeBasis(right, fwd, top));
+      V.throttle = 0;
+      this.launched = true;
+      this.metStarted = true;
+      this.body = body;
+      // 预先激活第一级（点燃发动机，油门为零）
+      if (V.stages[0] && V.stages[0].ignite.length && V.stages[0].decoupleSection === null) {
+        V.activateStage();
+      }
+      this.sasMode = 'stability';
+    }
+  }
+
+  // ---------------------------------------------------------------- 玩家操作
+
+  stage(): void {
+    if (this.destroyed) return;
+    const V = this.vessel;
+    const origin = V.r.clone().sub(V.com.clone().applyQuaternion(V.q));
+    const mBefore = V.mass;
+    const res = V.activateStage();
+    if (!res) return;
+    if (this.landed) {
+      this.landed = false;
+      this.settle = 0;
+    }
+    if (!this.metStarted && res.action.ignite.length) {
+      this.metStarted = true;
+      this.met = 0;
+    }
+    const fwd = UP.clone().applyQuaternion(V.q);
+    let jettisonMass = 0;
+    for (const g of res.groups) {
+      const d = new Debris(g);
+      d.q.copy(V.q);
+      d.w.copy(V.w);
+      d.r.copy(origin).add(d.com.clone().applyQuaternion(V.q));
+      d.v.copy(V.v);
+      const radial = g[0].p.radial;
+      if (radial) {
+        const out = new Vector3(g[0].p.x, 0, g[0].p.z).normalize().applyQuaternion(V.q);
+        d.v.addScaledVector(out, 3).addScaledVector(fwd, -1);
+        d.w.add(new Vector3(g[0].p.z, 0, -g[0].p.x).normalize().multiplyScalar(0.4));
+      } else {
+        d.v.addScaledVector(fwd, -2);
+      }
+      jettisonMass += d.mass;
+      this.debris.push(d);
+      this.emit({ type: 'decouple', debrisId: d.id, pos: d.r.clone() });
+    }
+    if (jettisonMass > 0) {
+      V.v.addScaledVector(fwd, (2 * jettisonMass) / Math.max(1, mBefore - jettisonMass));
+    }
+    if (res.action.ignite.length) this.emit({ type: 'ignite' });
+    if (res.action.chutes.length) this.emit({ type: 'chuteArm', msg: '降落伞已启用：低于 7 km 且速度足够低时自动张开', level: 'info' });
+    this.emit({ type: 'stage', msg: `第 ${V.stageIndex} 级：${res.action.label}`, level: 'info' });
+  }
+
+  toggleLegs(): void {
+    if (!this.vessel.hasLegs()) {
+      this.emit({ type: 'msg', msg: '没有着陆腿', level: 'warn' });
+      return;
+    }
+    this.vessel.legsDeployed = !this.vessel.legsDeployed;
+    this.emit({ type: 'legs', msg: this.vessel.legsDeployed ? '着陆腿放下' : '着陆腿收起', level: 'info' });
+  }
+
+  armChute(): void {
+    const V = this.vessel;
+    if (!V.chutePart()) {
+      this.emit({ type: 'msg', msg: '没有降落伞', level: 'warn' });
+      return;
+    }
+    if (V.chuteState === 'stowed') {
+      V.chuteState = 'armed';
+      this.emit({ type: 'chuteArm', msg: '降落伞已启用：低于 7 km 且速度足够低时自动张开', level: 'info' });
+    }
+  }
+
+  setSas(mode: SasMode): void {
+    this.sasOn = true;
+    this.sasMode = mode;
+    this.sasHold = null;
+  }
+
+  toggleSas(): void {
+    this.sasOn = !this.sasOn;
+    this.sasHold = null;
+    this.emit({ type: 'msg', msg: this.sasOn ? '姿态稳定 SAS 开启' : 'SAS 关闭', level: 'info' });
+  }
+
+  maxWarpIndex(): number {
+    if (this.destroyed) return WARP_LEVELS.length - 1;
+    if (this.landed) return WARP_LEVELS.length - 1;
+    const tel = this.telemetry;
+    if (this.vessel.parts.some((rp) => rp.thrustNow > 0)) return PHYS_WARP_MAX;
+    if (this.autopilot.mode === 'ascent' || this.autopilot.mode === 'land') return PHYS_WARP_MAX;
+    if (tel.inAtmosphere) return PHYS_WARP_MAX;
+    const s = tel.body.radius / EARTH.radius;
+    const a = tel.radarAlt;
+    if (a < 3000 * s + 2000) return PHYS_WARP_MAX;
+    if (a < 20_000 * s) return 5;
+    if (a < 60_000 * s) return 6;
+    if (a < 250_000 * s) return 7;
+    if (a < 2_000_000 * s) return 8;
+    return 9;
+  }
+
+  setWarp(i: number): void {
+    const max = this.maxWarpIndex();
+    const ni = Math.max(0, Math.min(i, WARP_LEVELS.length - 1));
+    if (ni > max) {
+      this.warpIndex = max;
+      const reason = this.vessel.parts.some((rp) => rp.thrustNow > 0)
+        ? '发动机工作时只能使用 ×4 以内的物理加速'
+        : this.telemetry.inAtmosphere
+          ? '在大气层内只能使用 ×4 以内的物理加速'
+          : '离地面太近，无法使用更高倍率';
+      this.emit({ type: 'msg', msg: reason, level: 'warn' });
+      return;
+    }
+    this.warpIndex = ni;
+  }
+
+  warpToTime(t: number): void {
+    this.autoWarpTo = t;
+  }
+
+  // ---------------------------------------------------------------- 主循环
+
+  update(dtReal: number): void {
+    if (this.paused) return;
+    dtReal = Math.min(dtReal, 0.05);
+    // 自动时间加速
+    if (this.autoWarpTo !== null) {
+      const remain = this.autoWarpTo - this.t;
+      if (remain <= 0.5) {
+        this.autoWarpTo = null;
+        this.warpIndex = 0;
+      } else {
+        let idx = 0;
+        for (let i = WARP_LEVELS.length - 1; i >= 0; i--) {
+          if (WARP_LEVELS[i] * dtReal * 3 < remain) {
+            idx = i;
+            break;
+          }
+        }
+        this.warpIndex = Math.min(idx, this.maxWarpIndex());
+      }
+    }
+    if (this.warpIndex > this.maxWarpIndex()) {
+      this.warpIndex = this.maxWarpIndex();
+    }
+    const simDt = dtReal * this.warp;
+    this.autopilot.update(dtReal);
+
+    if (this.warpIndex > PHYS_WARP_MAX && !this.landed && !this.destroyed) {
+      this.stepRails(simDt);
+    } else {
+      const near = this.telemetry ? this.telemetry.radarAlt < 200 : true;
+      const hMax = near ? 1 / 480 : 1 / 200;
+      const n = Math.max(1, Math.ceil(simDt / hMax));
+      const h = simDt / n;
+      for (let i = 0; i < n; i++) this.stepPhysics(h);
+    }
+    if (this.metStarted) this.met += simDt;
+    this.updateDebris(simDt);
+    this.updateTelemetry();
+    this.checkSoi();
+    this.missions.update();
+    this.updateNodes();
+    this.predictionAge += dtReal;
+    const thrusting = this.vessel.parts.some((rp) => rp.thrustNow > 0);
+    const interval = thrusting ? 0.25 : this.warpIndex > PHYS_WARP_MAX ? 0.1 : 0.5;
+    if (this.predictionAge > interval) this.refreshPrediction();
+  }
+
+  refreshPrediction(): void {
+    this.predictionAge = 0;
+    if (this.destroyed || (this.landed && this.nodes.length === 0)) {
+      this.prediction = null;
+      return;
+    }
+    const V = this.vessel;
+    const tel = this.telemetry;
+    // 在地表附近低速飞行时轨迹没有意义
+    if (tel && tel.radarAlt < 50 && tel.surfSpeed < 5) {
+      this.prediction = null;
+      return;
+    }
+    this.prediction = predict(V.r, V.v, this.t, this.nodes, { maxSteps: 2500, eta: 0.02 });
+  }
+
+  private checkSoi(): void {
+    const b = dominantBody(this.vessel.r, this.t);
+    if (b !== this.body) {
+      this.emit({
+        type: 'soi',
+        msg: b.id === 'moon' ? '进入月球引力影响球' : '离开月球引力影响球，返回地球轨道',
+        level: 'good',
+      });
+      this.body = b;
+      this.predictionAge = 999;
+    }
+  }
+
+  // ---------------------------------------------------------------- 着陆锁定
+
+  private lockLanded(body: Body): void {
+    const V = this.vessel;
+    this.landedBody = body;
+    this.landedPos.copy(toBodyFixed(body, this.t, V.r));
+    const rot = _q1.setFromAxisAngle(UP, -bodyRotation(body, this.t));
+    this.landedQ.copy(rot).multiply(V.q);
+    V.w.set(0, 0, 0);
+  }
+
+  private applyLanded(): void {
+    const V = this.vessel;
+    const b = this.landedBody;
+    fromBodyFixed(b, this.t, this.landedPos, V.r);
+    surfaceVelocity(b, this.t, V.r, V.v);
+    const rot = _q1.setFromAxisAngle(UP, bodyRotation(b, this.t));
+    V.q.copy(rot).multiply(this.landedQ);
+    V.w.set(0, 0, 0);
+  }
+
+  // ---------------------------------------------------------------- 物理步进
+
+  private stepRails(dt: number): void {
+    const V = this.vessel;
+    let remaining = dt;
+    let guard = 0;
+    for (const rp of V.parts) {
+      rp.thrustNow = 0;
+      rp.throttleEff = 0;
+    }
+    while (remaining > 1e-6 && guard++ < 4000) {
+      const h = Math.min(remaining, adaptiveStep(V.r, this.t, 0.008));
+      rk4Step(V.r, V.v, this.t, h);
+      this.t += h;
+      remaining -= h;
+      const b = dominantBody(V.r, this.t);
+      const alt = V.r.distanceTo(bodyPosition(b, this.t, _v1)) - b.radius;
+      if (b.atmosphere && alt < b.atmosphere.height) {
+        this.warpIndex = 0;
+        this.emit({ type: 'msg', msg: '进入大气层，时间加速已停止', level: 'warn' });
+        break;
+      }
+      if (alt < b.maxTerrain + 2500) {
+        const th = terrainHeight(b, toBodyFixed(b, this.t, V.r, _v2).normalize(), 50);
+        if (alt - th < 2500) {
+          this.warpIndex = 0;
+          this.emit({ type: 'msg', msg: '接近地表，时间加速已停止', level: 'warn' });
+          break;
+        }
+      }
+    }
+    if (remaining > 1e-6 && this.warpIndex <= PHYS_WARP_MAX) {
+      const n = Math.max(1, Math.ceil(remaining / (1 / 200)));
+      const h = remaining / n;
+      for (let i = 0; i < Math.min(n, 400); i++) this.stepPhysics(h);
+    }
+    // 定轨加速时直接对准 SAS 目标
+    if (this.sasOn && this.sasMode !== 'stability') {
+      const d = this.sasTargetDir();
+      if (d) {
+        const fwd = UP.clone().applyQuaternion(V.q);
+        _q1.setFromUnitVectors(fwd, d);
+        V.q.premultiply(_q1).normalize();
+      }
+    }
+    V.w.set(0, 0, 0);
+  }
+
+  private stepPhysics(h: number): void {
+    const V = this.vessel;
+    if (this.destroyed) {
+      this.t += h;
+      return;
+    }
+    // 着陆腿动画
+    const legTarget = V.legsDeployed ? 1 : 0;
+    V.legDeploy += Math.sign(legTarget - V.legDeploy) * Math.min(Math.abs(legTarget - V.legDeploy), h / 1.5);
+
+    const inputActive = this.input.pitch !== 0 || this.input.yaw !== 0 || this.input.roll !== 0;
+    if (this.landed) {
+      const wantThrust = V.computeThrust(1, true) > 0;
+      if (wantThrust || inputActive) {
+        this.landed = false;
+        this.settle = 0;
+      } else {
+        this.applyLanded();
+        this.t += h;
+        V.chuteDeploy = Math.max(0, V.chuteDeploy - h * 0.5);
+        return;
+      }
+    }
+
+    V.updateMassProps();
+    const m = V.mass;
+    const body = dominantBody(V.r, this.t);
+    const bp = bodyPosition(body, this.t, _v1);
+    const rel = _v2.subVectors(V.r, bp);
+    const dist = rel.length();
+    const up = rel.clone().divideScalar(dist);
+    const alt = dist - body.radius;
+    const pressure = atmoPressure(body, alt);
+    const rho = atmoDensity(body, alt);
+    const thrust = V.computeThrust(pressure / 101325, true);
+
+    const F = new Vector3();
+    const tauB = new Vector3();
+    const fwd = UP.clone().applyQuaternion(V.q);
+    F.addScaledVector(fwd, thrust);
+    this.lastThrustAccel.copy(fwd).multiplyScalar(thrust / m);
+
+    // ------------------------------------------------ 气动
+    const vSurf = surfaceVelocity(body, this.t, V.r, _v3);
+    const vAir = V.v.clone().sub(vSurf);
+    const speed = vAir.length();
+    let qdyn = 0;
+    const qInv = V.q.clone().invert();
+    if (rho > 0 && speed > 0.05) {
+      qdyn = 0.5 * rho * speed * speed;
+      const a = V.aero;
+      const mach = speed / speedOfSound(alt);
+      const mf = machDragFactor(mach);
+      const vb = vAir.clone().applyQuaternion(qInv);
+      const u = vb.y;
+      const cdAx = u > 0 ? a.cdFront : a.cdBack;
+      const fAx = -0.5 * rho * speed * u * cdAx * a.areaFront * mf;
+      const nArea = a.areaSide * 0.9 + a.finArea * 2.5;
+      const kN = -0.5 * rho * speed * nArea * mf;
+      const fN = new Vector3(vb.x * kN, 0, vb.z * kN);
+      const fB = new Vector3(fN.x, fAx, fN.z);
+      // 法向力作用于压心
+      const lever = new Vector3(0, a.copY - V.com.y, 0);
+      tauB.add(lever.cross(fN));
+      // 气动阻尼
+      const b = V.bounds();
+      const L = b.maxY - b.minY;
+      const dampI = a.dampK * (L * L) / 12 + a.finArea * 2.5 * (a.finY - V.com.y) ** 2;
+      const kd = 0.5 * rho * speed * dampI * 0.6;
+      tauB.x -= V.w.x * kd;
+      tauB.z -= V.w.z * kd;
+      tauB.y -= V.w.y * kd * 0.05;
+      F.add(fB.applyQuaternion(V.q));
+
+      // 再入加热（Sutton-Graves）
+      this.heatFlux = 1.83e-4 * Math.sqrt(rho / a.noseRadius) * speed * speed * speed;
+    } else {
+      this.heatFlux = 0;
+    }
+
+    // ------------------------------------------------ 降落伞
+    const chute = V.chutePart();
+    if (chute && V.chuteState !== 'stowed' && V.chuteState !== 'cut') {
+      if (V.chuteState === 'armed' && rho > 0.02 && alt < 7000 && speed < 300) {
+        V.chuteState = 'deploying';
+        V.chuteDeploy = 0;
+        this.emit({ type: 'chuteOpen', msg: '减速伞张开', level: 'good' });
+      }
+      if (V.chuteState === 'deploying' && speed < 90 && alt < 2500 + body.maxTerrain) {
+        V.chuteState = 'deployed';
+        this.emit({ type: 'chuteOpen', msg: '主伞张开', level: 'good' });
+      }
+      if (V.chuteState === 'deploying' || V.chuteState === 'deployed') {
+        if (V.chuteState === 'deployed') V.chuteDeploy = Math.min(1, V.chuteDeploy + h / 4);
+        const e = V.chuteDeploy;
+        const area = chute.p.def.parachute!.cda * (V.chuteState === 'deploying' ? 0.04 : 0.04 + 0.96 * e * e);
+        if (rho > 0 && speed > 0.1) {
+          let f = 0.5 * rho * speed * speed * area;
+          f = Math.min(f, 4.5 * G0 * m);
+          const fW = vAir.clone().normalize().multiplyScalar(-f);
+          F.add(fW);
+          const fB = fW.clone().applyQuaternion(qInv);
+          const pos = new Vector3(chute.p.x, chute.p.yTop + 1.5, chute.p.z).sub(V.com);
+          tauB.add(pos.cross(fB));
+          tauB.x -= V.w.x * V.inertia.x * 2;
+          tauB.z -= V.w.z * V.inertia.z * 2;
+        }
+        if (speed > 380 && rho > 0) {
+          V.chuteState = 'cut';
+          this.emit({ type: 'msg', msg: '速度过快，降落伞被撕裂！', level: 'bad' });
+        }
+      }
+    }
+
+    // ------------------------------------------------ 地面接触
+    this.contactCount = 0;
+    const bodyDir = toBodyFixed(body, this.t, V.r).normalize();
+    const hN = terrainHeight(body, bodyDir);
+    const radar = alt - hN;
+    const bnd = V.bounds();
+    const reach = Math.max(bnd.maxY - V.com.y, V.com.y - bnd.minY, bnd.radius) + 3;
+    let crash: RuntimePart | null = null;
+    let crashSpeed = 0;
+    this.touchingWater = false;
+    if (radar < reach) {
+      const nBf = terrainNormal(body, bodyDir, new Vector3());
+      const rotB = bodyRotation(body, this.t);
+      const nW = nBf.clone().applyAxisAngle(UP, rotB);
+      const water = body.hasOcean && this.isWater(body, bodyDir);
+      this.touchingWater = water;
+      const nHull = V.contacts.filter((c) => c.kind === 'hull').length || 1;
+      const nLeg = V.contacts.filter((c) => c.kind === 'leg').length || 1;
+      const pb = new Vector3();
+      const arm = new Vector3();
+      const pw = new Vector3();
+      const vp = new Vector3();
+      const vg = new Vector3();
+      for (const c of V.contacts) {
+        if (c.kind === 'leg' && V.legDeploy < 0.6) continue;
+        V.contactPos(c, pb);
+        arm.subVectors(pb, V.com);
+        const armW = arm.clone().applyQuaternion(V.q);
+        pw.copy(V.r).add(armW);
+        const prel = pw.clone().sub(bp);
+        const pd = prel.length();
+        // 粗略筛选
+        const approxAlt = pd - body.radius - hN;
+        if (approxAlt > 4) continue;
+        const pdir = prel.clone().divideScalar(pd);
+        const pdirBf = pdir.clone().applyAxisAngle(UP, -rotB);
+        const th = terrainHeight(body, pdirBf);
+        const pen = body.radius + th - pd;
+        if (pen <= 0) continue;
+        this.contactCount++;
+        vp.copy(V.w).cross(arm).applyQuaternion(V.q).add(V.v);
+        surfaceVelocity(body, this.t, pw, vg);
+        const vrel = vp.sub(vg);
+        const vn = vrel.dot(nW);
+        const isLeg = c.kind === 'leg';
+        const tol = c.tolerance * (water ? 1.6 : 1);
+        if (-vn > tol && -vn > crashSpeed) {
+          crashSpeed = -vn;
+          crash = V.byKey.get(c.partKey) ?? null;
+        }
+        const wn = isLeg ? 14 : 30;
+        const nPts = isLeg ? nLeg : nHull;
+        let k = (m * wn * wn) / nPts;
+        let cd = (2 * 0.8 * m * wn) / nPts;
+        if (water) {
+          k *= 0.25;
+          cd *= 1.5;
+        }
+        const fn = Math.max(0, k * Math.min(pen, 2) - cd * vn);
+        const vt = vrel.addScaledVector(nW, -vn);
+        const vtl = vt.length();
+        const fc = new Vector3().addScaledVector(nW, fn);
+        if (vtl > 1e-4) {
+          const mu = water ? 0.15 : 0.9;
+          const ft = Math.min(mu * fn, cd * 2 * vtl);
+          fc.addScaledVector(vt, -ft / vtl);
+        }
+        F.add(fc);
+        tauB.add(arm.clone().cross(fc.applyQuaternion(qInv)));
+      }
+    }
+    if (crash) {
+      this.destroy(`${crash.p.def.name} 以 ${crashSpeed.toFixed(1)} m/s 撞击${body.name}${this.touchingWater ? '海面' : '表面'}`);
+      return;
+    }
+
+    // ------------------------------------------------ 控制力矩
+    const tc = V.controlTorque(qdyn);
+    const cmd = this.computeControl(tc.pitch, tc.roll);
+    this.controlCmd.copy(cmd);
+    tauB.x += cmd.x * tc.pitch;
+    tauB.y += cmd.y * tc.roll;
+    tauB.z += cmd.z * tc.pitch;
+
+    // ------------------------------------------------ 积分
+    const g = gravityAccel(V.r, this.t, new Vector3());
+    const nonGrav = F.clone().divideScalar(m);
+    this.lastNonGravAcc = nonGrav.length();
+    V.v.addScaledVector(g, h).addScaledVector(nonGrav, h);
+    V.r.addScaledVector(V.v, h);
+
+    const I = V.inertia;
+    const w = V.w;
+    const Iw = new Vector3(I.x * w.x, I.y * w.y, I.z * w.z);
+    const gyro = new Vector3().crossVectors(w, Iw);
+    w.x += ((tauB.x - gyro.x) / I.x) * h;
+    w.y += ((tauB.y - gyro.y) / I.y) * h;
+    w.z += ((tauB.z - gyro.z) / I.z) * h;
+    const wl = w.length();
+    if (wl > 8) w.multiplyScalar(8 / wl);
+    if (wl > 1e-9) {
+      _q1.setFromAxisAngle(w.clone().divideScalar(wl), wl * h);
+      V.q.multiply(_q1).normalize();
+    }
+
+    // 机动剩余 Δv
+    for (const n of this.nodes) if (n.remaining) n.remaining.addScaledVector(this.lastThrustAccel, -h);
+
+    // ------------------------------------------------ 燃料
+    const fo = V.consumeFuel(h);
+    for (const k of fo) {
+      if (this.warnedFlameout.has(k)) continue;
+      this.warnedFlameout.add(k);
+      const rp = V.byKey.get(k);
+      this.emit({ type: 'flameout', msg: `${rp?.p.def.name ?? '发动机'} 燃料耗尽`, level: 'warn' });
+    }
+
+    // ------------------------------------------------ 温度
+    const a = V.aero;
+    const vbDir = vAir.clone().applyQuaternion(qInv);
+    const tailFirst = speed > 1 && vbDir.y < -0.6 * speed;
+    const protectedByShield = tailFirst && a.shieldBottom;
+    const leading = V.byKey.get(speed > 1 && vbDir.y < 0 ? a.bottomKey : a.topKey);
+    const tMax = protectedByShield ? 3400 : (leading?.p.def.maxTemp ?? 1500);
+    this.tempLimit = tMax;
+    const sigma = 5.67e-8 * 0.85;
+    const tAmb = 250;
+    const dT = (this.heatFlux - sigma * (V.temperature ** 4 - tAmb ** 4)) / 11_000;
+    V.temperature = Math.max(tAmb, V.temperature + dT * h);
+    if (V.temperature > tMax * 0.85 && !this.overheatWarned) {
+      this.overheatWarned = true;
+      this.emit({ type: 'msg', msg: '警告：蒙皮温度接近极限！', level: 'bad' });
+    }
+    if (V.temperature < tMax * 0.7) this.overheatWarned = false;
+    if (V.temperature > tMax) {
+      this.destroy(`${leading?.p.def.name ?? '船体'} 过热烧毁（${V.temperature.toFixed(0)} K）${a.shieldBottom ? '——再入时应让隔热罩朝前（逆行方向）' : ''}`);
+      return;
+    }
+
+    // G 力
+    const gforce = this.lastNonGravAcc / G0;
+    if (this.launched && this.contactCount === 0) this.maxG = Math.max(this.maxG, gforce);
+
+    this.t += h;
+
+    // ------------------------------------------------ 着陆检测
+    const vRelCom = V.v.clone().sub(surfaceVelocity(body, this.t, V.r, _v3)).length();
+    if (!this.launched && radar > 3) {
+      this.launched = true;
+      this.emit({ type: 'liftoff', msg: '起飞！', level: 'good' });
+    }
+    if (this.contactCount > 0 && vRelCom < 0.35 && V.w.length() < 0.06 && thrust < 1) {
+      this.settle += h;
+      if (this.settle > 0.8) {
+        this.landed = true;
+        this.lockLanded(body);
+        if (this.launched) this.onTouchdown(body, up);
+      }
+    } else {
+      this.settle = 0;
+    }
+  }
+
+  private onTouchdown(body: Body, up: Vector3): void {
+    const V = this.vessel;
+    const fwd = UP.clone().applyQuaternion(V.q);
+    const upright = fwd.dot(up) > Math.cos((35 * Math.PI) / 180);
+    const water = this.touchingWater;
+    if (body.id === 'moon') {
+      if (upright && V.hasPod()) {
+        if (!this.landedOnMoonOnce) {
+          this.landedOnMoonOnce = true;
+          this.emit({ type: 'landed', msg: '月面着陆成功！“这是个人的一小步……”', level: 'good' });
+        } else this.emit({ type: 'landed', msg: '已着陆', level: 'good' });
+      } else if (!upright) {
+        this.emit({ type: 'landed', msg: '着陆器倾覆了……很难再起飞', level: 'bad' });
+      }
+    } else {
+      this.emit({ type: 'landed', msg: water ? '溅落成功！' : '着陆成功！', level: 'good' });
+    }
+    this.missions.onTouchdown(body, upright);
+  }
+
+  destroy(reason: string): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.destroyReason = reason;
+    this.vessel.throttle = 0;
+    this.autopilot.mode = 'off';
+    this.warpIndex = 0;
+    this.emit({ type: 'explosion', pos: this.vessel.r.clone(), size: Math.max(4, Math.cbrt(this.vessel.mass) * 0.8) });
+    this.emit({ type: 'destroyed', msg: reason, level: 'bad' });
+  }
+
+  // ---------------------------------------------------------------- 残骸
+
+  private updateDebris(dt: number): void {
+    if (!this.debris.length) return;
+    const V = this.vessel;
+    const rails = this.warpIndex > PHYS_WARP_MAX;
+    for (const d of this.debris) {
+      if (!d.alive) continue;
+      d.age += dt;
+      if (rails || d.r.distanceTo(V.r) > 60_000 || d.age > 900) {
+        d.alive = false;
+        continue;
+      }
+      const n = Math.max(1, Math.ceil(dt / 0.02));
+      const h = dt / n;
+      for (let i = 0; i < n; i++) {
+        const body = dominantBody(d.r, this.t);
+        const bp = bodyPosition(body, this.t, _v1);
+        const dist = d.r.distanceTo(bp);
+        const alt = dist - body.radius;
+        const rho = atmoDensity(body, alt);
+        const g = gravityAccel(d.r, this.t, _v2);
+        d.v.addScaledVector(g, h);
+        if (rho > 0) {
+          const vs = surfaceVelocity(body, this.t, d.r, _v3);
+          const va = d.v.clone().sub(vs);
+          const sp = va.length();
+          if (sp > 0.01) d.v.addScaledVector(va, (-0.5 * rho * sp * 0.9 * d.area * h) / d.mass);
+          d.w.multiplyScalar(1 - Math.min(0.5, rho * h * 0.5));
+        }
+        d.r.addScaledVector(d.v, h);
+        const wl = d.w.length();
+        if (wl > 1e-6) {
+          _q1.setFromAxisAngle(d.w.clone().divideScalar(wl), wl * h);
+          d.q.multiply(_q1).normalize();
+        }
+        if (alt < 40 + (body.id === 'moon' ? body.maxTerrain : 0)) {
+          const dir = toBodyFixed(body, this.t, d.r).normalize();
+          const th = terrainHeight(body, dir);
+          if (alt < th + 1) {
+            d.alive = false;
+            const sp = d.v.clone().sub(surfaceVelocity(body, this.t, d.r, _v3)).length();
+            if (sp > 8) this.emit({ type: 'explosion', pos: d.r.clone(), size: Math.max(2, Math.cbrt(d.mass) * 0.6), debrisId: d.id });
+            break;
+          }
+        }
+      }
+    }
+    const dead = this.debris.filter((d) => !d.alive);
+    for (const d of dead) this.emit({ type: 'debrisGone', debrisId: d.id });
+    this.debris = this.debris.filter((d) => d.alive);
+  }
+
+  // ---------------------------------------------------------------- SAS / 控制
+
+  sasTargetDir(): Vector3 | null {
+    if (this.autopilot.mode !== 'off' && this.autopilot.targetDir) return this.autopilot.targetDir;
+    const tel = this.telemetry;
+    if (!tel) return null;
+    const useSurf = tel.speedModeUsed === 'surface';
+    const vel = useSurf ? tel.vSurfVec : tel.vOrbVec;
+    const V = this.vessel;
+    const bp = bodyPosition(tel.body, this.t, new Vector3());
+    const rel = V.r.clone().sub(bp);
+    const vOrb = tel.vOrbVec;
+    switch (this.sasMode) {
+      case 'prograde':
+        return vel.length() > 0.5 ? vel.clone().normalize() : tel.up.clone();
+      case 'retrograde':
+        return vel.length() > 0.5 ? vel.clone().normalize().negate() : tel.up.clone();
+      case 'normal':
+        return new Vector3().crossVectors(rel, vOrb).normalize();
+      case 'antinormal':
+        return new Vector3().crossVectors(rel, vOrb).normalize().negate();
+      case 'radialOut': {
+        const n = new Vector3().crossVectors(rel, vOrb);
+        return n.cross(vOrb).normalize();
+      }
+      case 'radialIn': {
+        const n = new Vector3().crossVectors(rel, vOrb);
+        return n.cross(vOrb).normalize().negate();
+      }
+      case 'maneuver': {
+        const d = this.nodeBurnVector();
+        return d && d.lengthSq() > 1e-6 ? d.clone().normalize() : null;
+      }
+      default:
+        return null;
+    }
+  }
+
+  private computeControl(tauPitch: number, tauRoll: number): Vector3 {
+    const V = this.vessel;
+    const cmd = new Vector3();
+    const inp = this.input;
+    const manual = inp.pitch !== 0 || inp.yaw !== 0 || inp.roll !== 0;
+    const apActive = this.autopilot.mode !== 'off' && this.autopilot.targetDir !== null;
+    if ((this.sasOn || apActive) && !this.destroyed) {
+      const I = V.inertia;
+      const w = V.w;
+      const wDes = new Vector3();
+      const aP = tauPitch / Math.max(I.x, I.z);
+      const aR = tauRoll / I.y;
+      const target = apActive ? this.autopilot.targetDir : this.sasMode === 'stability' ? null : this.sasTargetDir();
+      if (target) {
+        this.sasHold = null;
+        const tb = target.clone().applyQuaternion(V.q.clone().invert());
+        const axis = new Vector3().crossVectors(UP, tb);
+        const s = axis.length();
+        const c = UP.dot(tb);
+        const ang = Math.atan2(s, c);
+        if (s > 1e-6) axis.divideScalar(s);
+        else axis.set(1, 0, 0);
+        const wMag = Math.min(1.2, Math.sqrt(2 * aP * 0.6 * ang), ang * 4);
+        wDes.copy(axis).multiplyScalar(wMag);
+        wDes.y = 0;
+      } else {
+        if (!this.sasHold || manual) this.sasHold = V.q.clone();
+        const qe = V.q.clone().invert().multiply(this.sasHold);
+        if (qe.w < 0) qe.set(-qe.x, -qe.y, -qe.z, -qe.w);
+        const sw = Math.sqrt(Math.max(0, 1 - qe.w * qe.w));
+        const ang = 2 * Math.acos(Math.min(1, qe.w));
+        if (sw > 1e-6) {
+          const axis = new Vector3(qe.x / sw, qe.y / sw, qe.z / sw);
+          const wp = Math.min(1.0, Math.sqrt(2 * aP * 0.6 * ang), ang * 4);
+          const wr = Math.min(1.0, Math.sqrt(2 * aR * 0.6 * ang), ang * 4);
+          wDes.set(axis.x * wp, axis.y * wr, axis.z * wp);
+        }
+      }
+      const resp = 0.2;
+      cmd.set(
+        (I.x * (wDes.x - w.x)) / resp / Math.max(1, tauPitch),
+        (I.y * (wDes.y - w.y)) / resp / Math.max(1, tauRoll),
+        (I.z * (wDes.z - w.z)) / resp / Math.max(1, tauPitch),
+      );
+      cmd.x = Math.max(-1, Math.min(1, cmd.x));
+      cmd.y = Math.max(-1, Math.min(1, cmd.y));
+      cmd.z = Math.max(-1, Math.min(1, cmd.z));
+    }
+    if (inp.pitch !== 0) cmd.x = inp.pitch;
+    if (inp.roll !== 0) cmd.y = inp.roll;
+    if (inp.yaw !== 0) cmd.z = -inp.yaw;
+    return cmd;
+  }
+
+  // ---------------------------------------------------------------- 机动节点
+
+  addNode(n: NodeSpec): void {
+    this.nodes = [{ t: n.t, dv: n.dv.clone(), fixedDv: null, remaining: null }];
+    this.predictionAge = 999;
+    this.refreshPrediction();
+  }
+
+  removeNode(): void {
+    this.nodes = [];
+    if (this.autopilot.mode === 'node') this.autopilot.mode = 'off';
+    this.predictionAge = 999;
+  }
+
+  /** 机动节点的惯性系 Δv（开始执行后为剩余量）。 */
+  nodeBurnVector(): Vector3 | null {
+    const n = this.nodes[0];
+    if (!n) return null;
+    if (n.remaining) return n.remaining;
+    const ns = this.prediction?.nodeState;
+    if (ns) return nodeDvWorld(ns.r, ns.v, ns.t, n.dv, ns.body);
+    return nodeDvWorld(this.vessel.r, this.vessel.v, this.t, n.dv, this.body);
+  }
+
+  nodeBurnTime(): number {
+    const n = this.nodes[0];
+    if (!n) return 0;
+    const dv = this.nodeBurnVector()?.length() ?? 0;
+    const V = this.vessel;
+    let { thrust, mdot } = V.maxThrustVac();
+    if (thrust <= 0) {
+      thrust = V.nextStageThrust();
+      mdot = thrust / (320 * G0);
+    }
+    return burnTime(dv, V.mass, thrust, mdot);
+  }
+
+  private updateNodes(): void {
+    const n = this.nodes[0];
+    if (!n) return;
+    const bt = this.nodeBurnTime();
+    if (!n.remaining && this.t > n.t - bt / 2 - 20) {
+      const dv = this.nodeBurnVector();
+      if (dv) {
+        n.fixedDv = dv.clone();
+        n.remaining = dv.clone();
+      }
+    }
+    if (n.remaining && n.fixedDv) {
+      const done = n.remaining.dot(n.fixedDv) < 0 || n.remaining.length() < 0.2;
+      if (done && this.autopilot.mode !== 'node') {
+        this.emit({ type: 'msg', msg: '机动完成', level: 'good' });
+        this.nodes = [];
+        this.predictionAge = 999;
+      }
+    }
+    if (this.t > n.t + Math.max(600, bt * 3) && this.autopilot.mode !== 'node') {
+      this.nodes = [];
+      this.predictionAge = 999;
+    }
+  }
+
+  // ---------------------------------------------------------------- 遥测
+
+  updateTelemetry(): void {
+    const V = this.vessel;
+    const body = dominantBody(V.r, this.t);
+    const bp = bodyPosition(body, this.t, new Vector3());
+    const bv = bodyVelocity(body, this.t, new Vector3());
+    const rel = V.r.clone().sub(bp);
+    const vrel = V.v.clone().sub(bv);
+    const dist = rel.length();
+    const up = rel.clone().divideScalar(dist);
+    const alt = dist - body.radius;
+    const dirBf = toBodyFixed(body, this.t, V.r).normalize();
+    const terrainH = terrainHeight(body, dirBf);
+    const b = V.bounds();
+    const radarAlt = alt - terrainH - (V.com.y - b.minY);
+    let north = new Vector3(0, 1, 0).addScaledVector(up, -up.y);
+    if (north.lengthSq() < 1e-8) north.set(1, 0, 0);
+    north.normalize();
+    const east = new Vector3().crossVectors(north, up).normalize();
+    const vs = surfaceVelocity(body, this.t, V.r, new Vector3());
+    const vSurfVec = V.v.clone().sub(vs);
+    const vVert = vSurfVec.dot(up);
+    const vHoriz = Math.sqrt(Math.max(0, vSurfVec.lengthSq() - vVert * vVert));
+    const orbit = computeOrbit(rel, vrel, body);
+    const pressure = atmoPressure(body, alt);
+    const density = atmoDensity(body, alt);
+    const surfSpeed = vSurfVec.length();
+    const dynPressure = 0.5 * density * surfSpeed * surfSpeed;
+    const mach = density > 0 ? surfSpeed / speedOfSound(alt) : 0;
+    const gLocal = body.mu / (dist * dist);
+    const thrust = V.parts.reduce((s, rp) => s + rp.thrustNow, 0);
+    const lat = Math.asin(Math.max(-1, Math.min(1, dirBf.y)));
+    const lon = Math.atan2(-dirBf.z, dirBf.x);
+    const atmoTop = body.atmosphere?.height ?? 0;
+    let speedModeUsed: 'surface' | 'orbit';
+    if (this.speedMode === 'auto') {
+      const thr = body.id === 'earth' ? 36_000 : 8_000;
+      speedModeUsed = alt < thr ? 'surface' : 'orbit';
+    } else speedModeUsed = this.speedMode;
+    // 着陆建议点火
+    const { thrust: fMax } = V.maxThrustVac();
+    const aMax = fMax / V.mass;
+    let suicideIn = NaN;
+    let timeToImpact = NaN;
+    if (vVert < -0.5 && radarAlt > 0) {
+      const disc = vVert * vVert + 2 * gLocal * radarAlt;
+      timeToImpact = (vVert + Math.sqrt(disc)) / gLocal;
+      if (aMax > gLocal * 1.05) {
+        const vTot = surfSpeed;
+        const stop = (vTot * vTot) / (2 * (aMax - gLocal));
+        suicideIn = (radarAlt - stop) / Math.max(0.1, -vVert);
+      }
+    }
+    const tempMax = this.tempLimit;
+    this.telemetry = {
+      body,
+      alt,
+      radarAlt,
+      terrainH,
+      vVert,
+      vHoriz,
+      surfSpeed,
+      orbSpeed: vrel.length(),
+      speedModeUsed,
+      orbit,
+      pressure,
+      density,
+      dynPressure,
+      mach,
+      gforce: this.landed ? gLocal / G0 : this.lastNonGravAcc / G0,
+      heatFlux: this.heatFlux,
+      temp: V.temperature,
+      tempMax,
+      thrust,
+      twr: thrust / (V.mass * gLocal),
+      gLocal,
+      mass: V.mass,
+      stageDv: V.stageDeltaV(),
+      lat,
+      lon,
+      up,
+      north,
+      east,
+      vSurfVec,
+      vOrbVec: vrel,
+      suicideIn,
+      timeToImpact,
+      inAtmosphere: alt < atmoTop,
+    };
+  }
+}

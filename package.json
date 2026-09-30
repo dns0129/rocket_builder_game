@@ -1,0 +1,23 @@
+{
+  "name": "rocket-builder-game",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "火箭总装与飞行模拟游戏：造火箭、入轨、登月、返回地球",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.186.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.3"
+  }
+}
