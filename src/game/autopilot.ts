@@ -49,26 +49,10 @@ export class Autopilot {
   }
 
   private autoStage(dt: number): void {
-    const sim = this.sim;
-    const V = sim.vessel;
     this.stageCooldown -= dt;
-    if (this.stageCooldown > 0 || V.stageIndex >= V.stages.length) return;
-    const next = V.stages[V.stageIndex];
-    if (next.chutes.length && !next.ignite.length && next.decoupleSection === null) return;
-    const active = V.activeEngines();
-    let should = active.length === 0 && V.stages.slice(V.stageIndex).some((s) => s.ignite.length > 0);
-    if (!should && (next.jettisonRadial.length || next.decoupleSection !== null)) {
-      // 即将抛离的部分中有已熄火的发动机
-      const doomed = V.parts.filter(
-        (rp) =>
-          rp.p.def.engine &&
-          rp.ignited &&
-          ((next.decoupleSection !== null && rp.p.section === next.decoupleSection) || (rp.p.radial && next.jettisonRadial.includes(rp.p.parentUid))),
-      );
-      if (doomed.length && doomed.every((rp) => rp.flameout)) should = true;
-    }
-    if (should) {
-      sim.stage();
+    if (this.stageCooldown > 0) return;
+    if (this.sim.stageWanted()) {
+      this.sim.stage();
       this.stageCooldown = 0.8;
     }
   }

@@ -106,6 +106,9 @@ function buildTexture(): THREE.CanvasTexture {
   return t;
 }
 
+/** 导航球上标记图标的边长（px），与 CSS 中 .navball-marker 一致 */
+const MARKER = 20;
+
 export type NavMarker = 'prograde' | 'retrograde' | 'normal' | 'antinormal' | 'radialOut' | 'radialIn' | 'maneuver';
 
 export class Navball {
@@ -194,7 +197,7 @@ export class Navball {
         continue;
       }
       elm.style.display = 'block';
-      elm.style.transform = `translate(${R + v.x * R * 0.98 - 14}px, ${R - v.z * R * 0.98 - 14}px)`;
+      elm.style.transform = `translate(${R + v.x * R * 0.96 - MARKER / 2}px, ${R - v.z * R * 0.96 - MARKER / 2}px)`;
     }
   }
 }

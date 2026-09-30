@@ -57,6 +57,7 @@ body {
   position: fixed;
   inset: 0;
   pointer-events: none;
+  overflow: hidden;
   display: none;
   overflow: hidden;
 }
@@ -463,7 +464,56 @@ input[type='text'] {
   top: 12px;
   left: 12px;
   padding: 10px 14px;
-  min-width: 220px;
+  min-width: 210px;
+}
+
+/* 下一步提示 */
+.guide {
+  position: absolute;
+  top: 58px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(760px, calc(100vw - 560px));
+  padding: 6px 14px 6px 10px;
+  border-radius: 18px;
+  background: rgba(10, 16, 24, 0.78);
+  border: 1px solid rgba(76, 195, 255, 0.35);
+  color: #dff3ff;
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: center;
+  pointer-events: none !important;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.guide::before {
+  content: '下一步';
+  display: inline-block;
+  margin-right: 8px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #03121c;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.guide.wait::before {
+  content: '进行中';
+  background: #7a8aa0;
+}
+
+.guide.done::before {
+  content: '完成';
+  background: var(--good);
+}
+
+.guide.act {
+  border-color: rgba(76, 195, 255, 0.6);
+}
+
+.guide.hidden {
+  display: none;
 }
 
 .hud-row {
@@ -540,9 +590,14 @@ input[type='text'] {
   padding: 10px 14px;
 }
 
+.dlt {
+  font-size: 11px;
+  margin-left: 2px;
+}
+
 .toasts {
   position: absolute;
-  top: 64px;
+  top: 144px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -596,43 +651,43 @@ input[type='text'] {
   transform: translateX(-50%);
   display: flex;
   align-items: flex-end;
-  gap: 10px;
+  gap: 8px;
 }
 
 .navball-wrap {
   position: relative;
-  width: 200px;
-  height: 200px;
+  width: 116px;
+  height: 116px;
 }
 
 .navball-canvas {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  box-shadow: 0 0 0 3px rgba(20, 24, 30, 0.95), 0 0 0 5px rgba(140, 180, 230, 0.25), 0 10px 30px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 0 0 2px rgba(20, 24, 30, 0.95), 0 0 0 4px rgba(140, 180, 230, 0.25), 0 6px 18px rgba(0, 0, 0, 0.55);
 }
 
 .navball-marker {
   position: absolute;
   left: 0;
   top: 0;
-  width: 28px;
-  height: 28px;
+  width: 20px;
+  height: 20px;
   pointer-events: none;
   filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8));
 }
 
 .navball-marker svg {
-  width: 28px;
-  height: 28px;
+  width: 20px;
+  height: 20px;
 }
 
 .navball-center {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 90px;
-  height: 36px;
+  width: 60px;
+  height: 24px;
   transform: translate(-50%, -50%);
   pointer-events: none;
 }
@@ -643,44 +698,56 @@ input[type='text'] {
 }
 
 .nav-panel {
-  padding: 8px 12px;
+  padding: 6px 10px 8px;
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.nav-col {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  min-width: 200px;
+  gap: 3px;
+}
+
+.speed-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
 }
 
 .speed-mode {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--muted);
-  cursor: pointer;
 }
 
 .speed-val {
   font-family: var(--mono);
-  font-size: 22px;
+  font-size: 16px;
   font-weight: 700;
 }
 
 .hdg {
   font-family: var(--mono);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10.5px;
+  white-space: nowrap;
 }
 
 /* 方向舵 */
 .rudder {
-  width: 200px;
-  margin-top: 2px;
+  width: 150px;
   user-select: none;
   -webkit-user-select: none;
 }
 
 .rudder-dial {
   display: block;
-  width: 200px;
-  height: 100px;
+  width: 150px;
+  height: 75px;
   cursor: grab;
   touch-action: none;
 }
@@ -709,13 +776,13 @@ input[type='text'] {
 .rud-num {
   fill: var(--muted);
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 11px;
   text-anchor: middle;
 }
 
 .rud-dir {
   fill: var(--text);
-  font-size: 11px;
+  font-size: 14px;
   font-weight: 700;
   text-anchor: middle;
 }
@@ -767,26 +834,27 @@ input[type='text'] {
 .rudder-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   margin-top: 2px;
 }
 
 .rudder-row button {
-  width: 32px;
-  padding: 3px 0;
-  font-size: 11px;
+  width: 26px;
+  padding: 2px 0;
+  font-size: 10px;
 }
 
 .rudder-lbl {
   flex: 1;
   text-align: center;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 10.5px;
   color: var(--muted);
-  padding: 4px 2px;
+  padding: 3px 2px;
   border-radius: 6px;
   cursor: pointer;
   background: rgba(255, 255, 255, 0.04);
+  white-space: nowrap;
 }
 
 .rudder-lbl.on {
@@ -796,16 +864,16 @@ input[type='text'] {
 
 .gauges {
   display: flex;
-  gap: 8px;
-  padding: 10px;
+  gap: 6px;
+  padding: 8px;
   align-items: stretch;
 }
 
 .gauge {
-  width: 22px;
-  height: 170px;
+  width: 16px;
+  height: 108px;
   background: rgba(255, 255, 255, 0.06);
-  border-radius: 6px;
+  border-radius: 5px;
   position: relative;
   overflow: hidden;
   cursor: ns-resize;
@@ -816,7 +884,7 @@ input[type='text'] {
   left: 0;
   right: 0;
   bottom: 0;
-  border-radius: 6px;
+  border-radius: 5px;
 }
 
 .gauge.thr .fill {
@@ -832,10 +900,11 @@ input[type='text'] {
 }
 
 .gauge-label {
-  font-size: 10px;
+  font-size: 9.5px;
   color: var(--muted);
   text-align: center;
-  margin-top: 4px;
+  margin-top: 3px;
+  white-space: nowrap;
 }
 
 .gauge-col {
@@ -846,34 +915,136 @@ input[type='text'] {
 
 .sas-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: 1fr 1fr;
   gap: 4px;
-  padding: 8px;
-  width: 170px;
+  padding: 7px;
+  width: 150px;
 }
 
 .sas-grid button {
   font-size: 11px;
-  padding: 5px 4px;
+  padding: 4px 3px;
 }
 
-.sas-grid .full {
-  grid-column: span 2;
+.sas-grid .more {
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.sas-grid .adv {
+  display: none;
+}
+
+.sas-grid.expanded .adv {
+  display: block;
 }
 
 .hud-bl {
   position: absolute;
   left: 12px;
   bottom: 12px;
-  width: 240px;
-  max-height: 55vh;
+  width: 318px;
   display: flex;
   flex-direction: column;
-  padding: 10px;
+  gap: 8px;
+}
+
+.stage-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px;
+}
+
+.stage-panel h3 {
+  margin: 0 0 6px;
+}
+
+.stage-stats {
+  margin-top: 6px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.stage-stats .hud-row {
+  flex-direction: column;
+  gap: 0;
+  line-height: 1.35;
+}
+
+.stage-stats .hud-row .k {
+  font-size: 10.5px;
+}
+
+/* 弹道剖面 */
+.profile {
+  padding: 6px 8px 8px;
+}
+
+.profile.far canvas {
+  display: none;
+}
+
+.profile.far .profile-head::after {
+  content: '远离天体表面，按 M 在地图中查看完整轨迹';
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.profile-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.profile-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.profile-head .lg {
+  font-size: 10px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.profile-head .lg i {
+  display: inline-block;
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+  margin-left: 5px;
+}
+
+.lg .c-pw {
+  background: #ff8a2a;
+}
+
+.lg .c-co {
+  background: #9fc8ff;
+}
+
+.lg .c-pr {
+  background: #35d0ff;
+}
+
+.lg .c-gh {
+  background: repeating-linear-gradient(90deg, #fff 0 3px, transparent 3px 5px);
+}
+
+.profile-canvas {
+  display: block;
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(4, 8, 16, 0.85), rgba(10, 20, 36, 0.85));
 }
 
 .stage-list {
-  overflow-y: auto;
   display: flex;
   flex-direction: column-reverse;
   gap: 4px;
@@ -881,7 +1052,7 @@ input[type='text'] {
 
 .stage-card {
   border-radius: 7px;
-  padding: 6px 8px;
+  padding: 4px 8px;
   background: rgba(255, 255, 255, 0.04);
   border-left: 3px solid rgba(255, 255, 255, 0.15);
   font-size: 11.5px;
@@ -934,7 +1105,7 @@ input[type='text'] {
 .land-panel {
   position: absolute;
   left: 50%;
-  bottom: 438px;
+  bottom: 176px;
   transform: translateX(-50%);
   padding: 8px 14px;
   display: flex;
@@ -987,10 +1158,10 @@ input[type='text'] {
 .planner {
   position: absolute;
   right: 12px;
-  top: 222px;
+  top: 140px;
   width: 290px;
   padding: 12px;
-  max-height: calc(100vh - 530px);
+  max-height: calc(100vh - 460px);
   min-height: 160px;
   overflow-y: auto;
 }
@@ -1091,11 +1262,93 @@ input[type='text'] {
 }
 
 .mk-vessel {
-  color: #ffe34a;
-  font-size: 14px;
   padding-left: 0;
-  margin-left: -6px;
-  margin-top: -10px;
+  margin-left: -12px;
+  margin-top: -12px;
+}
+
+.mk-vessel svg {
+  display: block;
+  width: 24px;
+  height: 24px;
+  fill: #ffe34a;
+  stroke: #201a00;
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 5px rgba(255, 227, 74, 0.75));
+}
+
+/* 远/近拱点的变化量 */
+.d-up {
+  color: var(--good);
+  font-weight: 700;
+}
+
+.d-down {
+  color: #ff7a70;
+  font-weight: 700;
+}
+
+/* 飞行视图中的轨迹标签：加底色，便于在明亮的天空上阅读 */
+.map-marker.fl {
+  background: rgba(6, 10, 16, 0.55);
+  border-radius: 6px;
+  padding: 2px 7px 2px 14px;
+  margin-left: -4px;
+  line-height: 1.35;
+}
+
+.map-marker.fl::before {
+  left: 3px;
+  top: 7px;
+}
+
+.traj-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+/* 二维地图工具栏 */
+.map-toolbar {
+  position: absolute;
+  top: 100px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  pointer-events: auto;
+}
+
+.map-toolbar button {
+  padding: 4px 11px;
+}
+
+.map-scale-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  margin-left: 10px;
+  min-width: 90px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.map-scale {
+  height: 6px;
+  border: 1.5px solid rgba(230, 237, 245, 0.75);
+  border-top: none;
+}
+
+.map-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 6px;
 }
 
 .mk-vessel::before,
@@ -1109,6 +1362,11 @@ input[type='text'] {
   letter-spacing: 0.2em;
   padding-left: 0;
   margin-top: 10px;
+}
+
+.mk-body.mk-enc {
+  color: #d3b3ff;
+  letter-spacing: 0.05em;
 }
 
 /* ---------------------------------------------------------------- 模态框 */

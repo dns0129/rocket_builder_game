@@ -28,6 +28,7 @@ import { predict, nodeDvWorld, type NodeSpec, type Prediction } from './predicto
 import { burnTime } from './maneuver';
 import { Autopilot } from './autopilot';
 import { MissionTracker } from './missions';
+import { FlightTrail } from './trail';
 
 export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000];
 export const PHYS_WARP_MAX = 3;
@@ -37,6 +38,10 @@ export const RUDDER_MAX = Math.PI / 2;
 export const IGNITION_DELAY = 0.8;
 /** 沉底发动机提供的加速度 m/s² */
 const ULLAGE_ACC = 1.2;
+/** 简化难度：零件耐撞速度放宽的倍数 */
+const IMPACT_TOLERANCE_SCALE = 1.5;
+/** 简化难度：再入热流的缩放 */
+const HEAT_SCALE = 0.8;
 
 export type SasMode = 'stability' | 'prograde' | 'retrograde' | 'normal' | 'antinormal' | 'radialOut' | 'radialIn' | 'maneuver' | 'rudder';
 export type SpeedMode = 'auto' | 'surface' | 'orbit';
@@ -131,6 +136,8 @@ export class FlightSim {
   body: Body = EARTH;
   telemetry!: Telemetry;
   nodes: ManeuverNode[] = [];
+  /** 已飞过的轨迹 */
+  trail = new FlightTrail();
   prediction: Prediction | null = null;
   predictionAge = 999;
   autopilot: Autopilot;
@@ -145,6 +152,9 @@ export class FlightSim {
   paused = false;
   autoWarpTo: number | null = null;
   scenario: Scenario;
+  /** 简化：当前级燃料耗尽（油门仍打开）时自动分级；飞行辅助工作时由它自己负责 */
+  autoStaging = true;
+  private autoStageCooldown = 0;
   contactCount = 0;
   tempLimit = 1500;
   private warnedFlameout = new Set<string>();
@@ -358,6 +368,40 @@ export class FlightSim {
     this.setRudder(base + delta);
   }
 
+  /**
+   * 现在是否应该分级：没有工作中的发动机而后面还有发动机，
+   * 或者下一级要抛离的部分里点燃过的发动机都已熄火（例如燃尽的助推器）。
+   */
+  stageWanted(): boolean {
+    const V = this.vessel;
+    if (V.stageIndex >= V.stages.length) return false;
+    const next = V.stages[V.stageIndex];
+    // 只含降落伞的一级留给玩家（或自动开伞）
+    if (next.chutes.length && !next.ignite.length && next.decoupleSection === null) return false;
+    if (V.activeEngines().length === 0 && V.stages.slice(V.stageIndex).some((s) => s.ignite.length > 0)) return true;
+    if (next.jettisonRadial.length || next.decoupleSection !== null) {
+      const doomed = V.parts.filter(
+        (rp) =>
+          rp.p.def.engine &&
+          rp.ignited &&
+          ((next.decoupleSection !== null && rp.p.section === next.decoupleSection) || (rp.p.radial && next.jettisonRadial.includes(rp.p.parentUid))),
+      );
+      if (doomed.length && doomed.every((rp) => rp.flameout)) return true;
+    }
+    return false;
+  }
+
+  private checkAutoStage(dt: number): void {
+    this.autoStageCooldown -= dt;
+    if (!this.autoStaging || this.autopilot.mode !== 'off' || this.landed || this.destroyed || this.autoStageCooldown > 0) return;
+    const V = this.vessel;
+    if (V.throttle <= 0 || !V.parts.some((rp) => rp.p.def.engine && rp.ignited && rp.flameout)) return;
+    if (!this.stageWanted()) return;
+    this.stage();
+    this.autoStageCooldown = 1;
+    this.emit({ type: 'msg', msg: '燃料耗尽，已自动分级', level: 'info' });
+  }
+
   maxWarpIndex(): number {
     if (this.destroyed) return WARP_LEVELS.length - 1;
     if (this.landed) return WARP_LEVELS.length - 1;
@@ -435,6 +479,7 @@ export class FlightSim {
       for (let i = 0; i < n; i++) this.stepPhysics(h);
     }
     if (this.metStarted) this.met += simDt;
+    this.checkAutoStage(dtReal);
     this.updateDebris(simDt);
     this.updateTelemetry();
     this.checkSoi();
@@ -512,6 +557,7 @@ export class FlightSim {
       this.t += h;
       remaining -= h;
       const b = dominantBody(V.r, this.t);
+      this.trail.record(b, V.r, this.t, false);
       const alt = V.r.distanceTo(bodyPosition(b, this.t, _v1)) - b.radius;
       if (b.atmosphere && alt < b.atmosphere.height) {
         this.warpIndex = 0;
@@ -637,13 +683,18 @@ export class FlightSim {
       // 再入加热（Sutton-Graves）
       // 机头朝前（上升段，有整流/细长外形）时加热较弱；尾部/隔热罩朝前的钝体再入取全值
       const noseFirst = u > 0;
-      this.heatFlux = 1.83e-4 * Math.sqrt(rho / a.noseRadius) * speed * speed * speed * (noseFirst ? 0.5 : 1);
+      this.heatFlux = HEAT_SCALE * 1.83e-4 * Math.sqrt(rho / a.noseRadius) * speed * speed * speed * (noseFirst ? 0.5 : 1);
     } else {
       this.heatFlux = 0;
     }
 
     // ------------------------------------------------ 降落伞
     const chute = V.chutePart();
+    // 简化：在大气中下落时自动启用降落伞（真正张开仍要等高度和速度合适）
+    if (chute && V.chuteState === 'stowed' && this.launched && rho > 0.01 && alt < 12_000 && vAir.dot(up) < -30) {
+      V.chuteState = 'armed';
+      this.emit({ type: 'chuteArm', msg: '正在下落：降落伞已自动启用', level: 'info' });
+    }
     if (chute && V.chuteState !== 'stowed' && V.chuteState !== 'cut') {
       if (V.chuteState === 'armed' && rho > 0.02 && alt < 7000 && speed < 300) {
         V.chuteState = 'deploying';
@@ -721,7 +772,7 @@ export class FlightSim {
         const vrel = vp.sub(vg);
         const vn = vrel.dot(nW);
         const isLeg = c.kind === 'leg';
-        const tol = c.tolerance * (water ? 1.6 : 1);
+        const tol = c.tolerance * (water ? 1.6 : 1) * IMPACT_TOLERANCE_SCALE;
         if (-vn > tol && -vn > crashSpeed) {
           crashSpeed = -vn;
           crash = V.byKey.get(c.partKey) ?? null;
@@ -820,6 +871,7 @@ export class FlightSim {
     if (this.launched && this.contactCount === 0) this.maxG = Math.max(this.maxG, gforce);
 
     this.t += h;
+    if (this.launched || radar > 0.5) this.trail.record(body, V.r, this.t, thrust > 0);
 
     // ------------------------------------------------ 着陆检测
     const vRelCom = V.v.clone().sub(surfaceVelocity(body, this.t, V.r, _v3)).length();

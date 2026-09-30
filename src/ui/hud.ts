@@ -5,6 +5,8 @@ import { MISSIONS } from '../game/missions';
 import { solveCapture, solveChangeApsis, solveCircularize, solveCorrection, solveReturn, solveTLI, type SolveResult } from '../game/maneuver';
 import type { FlightScene } from '../render/flightScene';
 import { Navball } from '../render/navball';
+import { nextStep } from '../game/guide';
+import { TrajectoryProfile } from './profile';
 import { h, setText } from './dom';
 import { fmtDist, fmtMET, fmtSpeed, fmtTime, fmtMass } from './format';
 
@@ -17,11 +19,19 @@ export interface HudCallbacks {
 
 const UP = new THREE.Vector3(0, 1, 0);
 
+/** 导航球直径（px） */
+const NAVBALL = 116;
+
 export class FlightHUD {
   root: HTMLDivElement;
   navball: Navball;
+  profile: TrajectoryProfile;
   private sim: FlightSim;
+  private scene: FlightScene;
   private cb: HudCallbacks;
+  /** 最近几秒的远/近拱点，用来显示变化趋势 */
+  private apsisHist: { at: number; ap: number; pe: number }[] = [];
+  private clock = 0;
   private els: Record<string, HTMLElement> = {};
   private toasts: HTMLDivElement;
   private stageList: HTMLDivElement;
@@ -47,7 +57,7 @@ export class FlightHUD {
 
   constructor(parent: HTMLElement, sim: FlightSim, scene: FlightScene, cb: HudCallbacks) {
     this.sim = sim;
-    void scene;
+    this.scene = scene;
     this.cb = cb;
     this.root = h('div', { class: 'hud' });
     parent.appendChild(this.root);
@@ -61,14 +71,14 @@ export class FlightHUD {
         { class: 'hud-tl panel' },
         h('div', { class: 'hud-row' }, (E.met = h('span', { class: 'hud-met' })), (E.situ = h('span', { class: 'k' }))),
         h('div', { class: 'hud-row' }, h('span', { class: 'k' }, '海拔'), (E.alt = h('span', { class: 'hud-big' }))),
-        row('离地高度', 'radar'),
         row('垂直速度', 'vv'),
         row('水平速度', 'hv'),
-        row('马赫 / 动压', 'mach'),
         row('过载', 'g'),
-        row('大气压', 'pres'),
       ),
     );
+
+    // 顶部：下一步提示
+    this.root.appendChild((E.guide = h('div', { class: 'guide' })));
 
     // 顶部中间：时间加速
     const warp = h('div', { class: 'hud-tc panel' });
@@ -93,12 +103,9 @@ export class FlightHUD {
         'div',
         { class: 'hud-tr panel' },
         h('h3', null, (E.orbTitle = h('span'))),
-        row('远拱点', 'ap'),
-        row('近拱点', 'pe'),
-        row('距远拱点', 'tap'),
-        row('距近拱点', 'tpe'),
-        row('轨道周期', 'per'),
-        row('倾角', 'inc'),
+        h('div', { class: 'hud-row' }, (E.apK = h('span', { class: 'k' }, '远拱点')), h('span', { class: 'v' }, (E.ap = h('span')), (E.apD = h('span', { class: 'dlt' })))),
+        h('div', { class: 'hud-row' }, (E.peK = h('span', { class: 'k' }, '近拱点')), h('span', { class: 'v' }, (E.pe = h('span')), (E.peD = h('span', { class: 'dlt' })))),
+        h('div', { class: 'hud-row' }, (E.tapK = h('span', { class: 'k' }, '到达远拱点')), (E.tap = h('span', { class: 'v' }))),
         this.missionBox,
       ),
     );
@@ -128,31 +135,39 @@ export class FlightHUD {
       h('div', { class: 'gauge-col' }, h('div', { class: 'gauge fuel', title: '当前级燃料' }, (E.fuelFill = h('div', { class: 'fill' }))), h('div', { class: 'gauge-label' }, '燃料')),
       h('div', { class: 'gauge-col' }, h('div', { class: 'gauge heat', title: '蒙皮温度（相对极限）' }, (E.heatFill = h('div', { class: 'fill' }))), h('div', { class: 'gauge-label' }, '温度')),
     );
+    // 姿态面板：左边导航球 + 速度，右边方向舵（紧凑布局）
     const nbWrap = h('div', { class: 'navball-wrap' });
     this.navball = new Navball(nbWrap);
-    this.navball.resize(200);
+    this.navball.resize(NAVBALL);
     const nav = h(
       'div',
       { class: 'nav-panel panel' },
-      (E.spdMode = h('div', {
-        class: 'speed-mode',
-        title: '点击切换速度参考系',
-        onclick: () => {
-          const m = this.sim.speedMode;
-          this.sim.speedMode = m === 'auto' ? 'orbit' : m === 'orbit' ? 'surface' : 'auto';
-        },
-      })),
-      (E.spd = h('div', { class: 'speed-val' })),
-      nbWrap,
-      (E.hdg = h('div', { class: 'hdg' })),
-      this.buildRudder(),
+      h(
+        'div',
+        { class: 'nav-col' },
+        h(
+          'div',
+          {
+            class: 'speed-line',
+            title: '点击切换速度参考系',
+            onclick: () => {
+              const m = this.sim.speedMode;
+              this.sim.speedMode = m === 'auto' ? 'orbit' : m === 'orbit' ? 'surface' : 'auto';
+            },
+          },
+          (E.spdMode = h('span', { class: 'speed-mode' })),
+          (E.spd = h('span', { class: 'speed-val' })),
+        ),
+        nbWrap,
+      ),
+      h('div', { class: 'nav-col' }, (E.hdg = h('div', { class: 'hdg' })), this.buildRudder()),
     );
     const sas = h('div', { class: 'sas-grid panel' });
-    const sasBtn = (mode: SasMode | 'toggle', label: string, full = false) => {
+    const sasBtn = (mode: SasMode | 'toggle', label: string, cls = '') => {
       const b = h(
         'button',
         {
-          class: full ? 'full' : '',
+          class: cls,
           onclick: () => {
             this.cb.click();
             if (mode === 'toggle') this.sim.toggleSas();
@@ -164,26 +179,46 @@ export class FlightHUD {
       this.sasButtons.set(mode, b);
       sas.appendChild(b);
     };
-    sasBtn('toggle', 'SAS 姿态稳定 (T)', true);
+    sasBtn('toggle', 'SAS 稳定 (T)');
+    sas.appendChild(
+      h(
+        'button',
+        {
+          class: 'more',
+          title: '更多姿态模式（法向 / 径向）',
+          onclick: () => {
+            this.cb.click();
+            sas.classList.toggle('expanded');
+          },
+        },
+        '更多',
+      ),
+    );
     sasBtn('stability', '保持');
     sasBtn('maneuver', '机动方向');
     sasBtn('prograde', '顺行');
     sasBtn('retrograde', '逆行');
-    sasBtn('normal', '法向');
-    sasBtn('antinormal', '反法向');
-    sasBtn('radialOut', '径向外');
-    sasBtn('radialIn', '径向内');
+    sasBtn('normal', '法向', 'adv');
+    sasBtn('antinormal', '反法向', 'adv');
+    sasBtn('radialOut', '径向外', 'adv');
+    sasBtn('radialIn', '径向内', 'adv');
     this.root.appendChild(h('div', { class: 'hud-bottom' }, gauges, nav, sas));
 
-    // 左下：分级
+    // 左下：弹道剖面 + 分级
+    this.profile = new TrajectoryProfile();
     this.stageList = h('div', { class: 'stage-list' });
     this.root.appendChild(
       h(
         'div',
-        { class: 'hud-bl panel' },
-        h('h3', null, '分级序列（空格键）'),
-        this.stageList,
-        h('div', { style: { marginTop: '8px' } }, row('本级 Δv', 'sdv'), row('推重比', 'twr'), row('质量', 'mass')),
+        { class: 'hud-bl' },
+        this.profile.el,
+        h(
+          'div',
+          { class: 'stage-panel panel' },
+          h('h3', null, '分级（空格键）'),
+          this.stageList,
+          h('div', { class: 'stage-stats' }, row('本级 Δv', 'sdv'), row('推重比', 'twr'), row('质量', 'mass')),
+        ),
       ),
     );
 
@@ -382,6 +417,8 @@ export class FlightHUD {
     const sim = this.sim;
     const tel = sim.telemetry;
     const V = sim.vessel;
+    this.clock += dt;
+    this.profile.update(sim, this.scene.history.ghost(), dt);
     // 导航球（每帧）
     const vel = tel.speedModeUsed === 'surface' ? tel.vSurfVec : tel.vOrbVec;
     const bp = tel.up.clone().multiplyScalar(tel.alt + tel.body.radius);
@@ -422,12 +459,12 @@ export class FlightHUD {
               : `${tel.body.name} · 亚轨道`;
     setText(E.situ, situ);
     setText(E.alt, fmtDist(tel.alt));
-    setText(E.radar, fmtDist(Math.max(0, tel.radarAlt)));
     setText(E.vv, fmtSpeed(tel.vVert));
     setText(E.hv, fmtSpeed(tel.vHoriz));
-    setText(E.mach, tel.density > 0 ? `${tel.mach.toFixed(2)} / ${(tel.dynPressure / 1000).toFixed(1)} kPa` : '—');
     setText(E.g, `${tel.gforce.toFixed(2)} g`);
-    setText(E.pres, tel.pressure > 0 ? `${(tel.pressure / 1000).toFixed(2)} kPa` : '真空');
+    const step = nextStep(sim);
+    setText(E.guide, step ? step.text : '');
+    E.guide.className = `guide ${step ? step.kind : 'hidden'}`;
 
     // 时间加速
     const mx = sim.maxWarpIndex();
@@ -441,12 +478,26 @@ export class FlightHUD {
     const o = tel.orbit;
     setText(E.orbTitle, `${tel.body.name}轨道`);
     const ground = sim.landed;
+    const moon = tel.body.id === 'moon';
+    setText(E.apK, moon ? '远月点' : '远地点');
+    setText(E.peK, moon ? '近月点' : '近地点');
+    setText(E.tapK, moon ? '到达远月点' : '到达远地点');
     setText(E.ap, ground ? '—' : o.hyperbolic ? '逃逸' : fmtDist(o.apAlt));
     setText(E.pe, ground ? '—' : fmtDist(o.peAlt));
     setText(E.tap, ground || o.hyperbolic ? '—' : fmtTime(o.timeToAp));
-    setText(E.tpe, !ground && isFinite(o.timeToPe) && o.timeToPe > 0 ? fmtTime(o.timeToPe) : '—');
-    setText(E.per, !ground && isFinite(o.period) ? fmtTime(o.period) : '—');
-    setText(E.inc, `${((o.inc * 180) / Math.PI).toFixed(1)}°`);
+    // 远/近拱点在最近约 1 秒内的变化：绿色 ▲ 升高，红色 ▼ 降低
+    const hist = this.apsisHist;
+    hist.push({ at: this.clock, ap: o.apAlt, pe: o.peAlt });
+    while (hist.length > 2 && hist[1].at < this.clock - 1) hist.shift();
+    const ref = hist[0];
+    const trend = (el: HTMLElement, cur: number, old: number) => {
+      const d = cur - old;
+      const show = !ground && isFinite(d) && Math.abs(d) > Math.max(20, Math.abs(cur) * 0.001);
+      setText(el, show ? ` ${d > 0 ? '▲' : '▼'}${fmtDist(Math.abs(d))}` : '');
+      el.className = `dlt ${show ? (d > 0 ? 'd-up' : 'd-down') : ''}`;
+    };
+    trend(E.apD, o.apAlt, ref.ap);
+    trend(E.peD, o.peAlt, ref.pe);
     const mk = [...sim.missions.done].join(',');
     if (this.missionBox.dataset.k !== mk) {
       this.missionBox.dataset.k = mk;
@@ -505,8 +556,11 @@ export class FlightHUD {
   private renderStages(): void {
     const V = this.sim.vessel;
     this.stageList.innerHTML = '';
+    let shown = 0;
     V.stages.forEach((st, i) => {
-      if (i < V.stageIndex - 1) return;
+      // 只显示接下来的三级
+      if (i < V.stageIndex || shown >= 3) return;
+      shown++;
       const parts: string[] = [];
       const eng = new Map<string, number>();
       for (const k of st.ignite) {
@@ -523,6 +577,7 @@ export class FlightHUD {
         h('div', { class: `stage-card ${cls}` }, h('div', { class: 't' }, `第 ${i + 1} 级 · ${st.label}`), h('div', { class: 'd' }, parts.join('　') || '—')),
       );
     });
+    if (!shown) this.stageList.appendChild(h('div', { class: 'stage-card done' }, h('div', { class: 'd' }, '分级已全部完成')));
   }
 
   // ---------------------------------------------------------------- 机动规划

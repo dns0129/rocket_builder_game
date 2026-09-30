@@ -1,6 +1,7 @@
 import * as THREE from 'three';
-import { EARTH, MOON, SUN_DIR, atmoDensity, bodyPosition, bodyRotation, dominantBody, surfaceVelocity, toBodyFixed } from '../physics/bodies';
+import { EARTH, MOON, MOON_ORBIT, SUN_DIR, atmoDensity, bodyPosition, bodyRotation, bodyVelocity, dominantBody, surfaceVelocity, toBodyFixed } from '../physics/bodies';
 import type { FlightSim, FlightEvent } from '../game/flight';
+import type { Prediction } from '../game/predictor';
 import { Planets, SUN_INTENSITY, sharedUniforms } from './planets';
 import type { PlanetMaps } from './planetBake';
 import { TerrainPatch } from './terrainPatch';
@@ -8,12 +9,17 @@ import { LaunchPad } from './launchpad';
 import { VesselView } from './vesselView';
 import { Particles, ReentryGlow } from './effects';
 import { SeparationFx } from './separation';
-import { MapView } from './mapView';
+import { MapView, type MapBasis, type MapFocus } from './mapView';
+import { FlightTrajectory, PredictionHistory, encounterAnchor } from './trajectoryView';
 import type { RenderEngine } from './engine';
 
 export type CamMode = 'orbit' | 'chase' | 'free';
 
 const UP = new THREE.Vector3(0, 1, 0);
+/** 二维地图相机的基准视场角：远处的长焦相机近似正投影，但保留大气辉光等透视效果 */
+const MAP_FOV = (10 * Math.PI) / 180;
+const MAP_MIN_EXTENT = 1_500;
+const MAP_MAX_EXTENT = 1.5e8;
 
 /** 飞行场景：浮动原点、相机、光照、特效与地图视图。 */
 export class FlightScene {
@@ -31,16 +37,31 @@ export class FlightScene {
   hemi: THREE.HemisphereLight;
   engineLight: THREE.PointLight;
   map: MapView;
+  traj: FlightTrajectory;
+  history = new PredictionHistory();
+  private trajOverlay: HTMLDivElement;
   mode: 'flight' | 'map' = 'flight';
   camMode: CamMode = 'orbit';
   origin = new THREE.Vector3();
   camYaw = 2.4;
   camPitch = 0.12;
   camDist = 30;
-  mapYaw = 0.5;
-  mapPitch = 0.6;
-  mapDist = 3e6;
-  mapFocus: 'auto' | 'earth' | 'moon' | 'vessel' = 'auto';
+  /** 二维地图：半个屏幕高度对应的距离（米）、平移量（视平面坐标）、视平面基向量 */
+  mapExtent = 3e6;
+  mapPan = new THREE.Vector2();
+  mapFocus: 'auto' | MapFocus = 'auto';
+  private mapNormal = new THREE.Vector3(0, 1, 0);
+  private mapRight = new THREE.Vector3(1, 0, 0);
+  private mapUp = new THREE.Vector3(0, 0, -1);
+  private mapSnap = true;
+  /** 自动视图：平移/缩放自动框住预测轨迹（手动拖动或缩放后关闭） */
+  private mapAutoFit = true;
+  /** 自动视图下的屏幕“上”方向（打开地图时飞船的当地竖直方向），为 null 时太阳在右侧 */
+  private mapUpRef: THREE.Vector3 | null = null;
+  private fitPred: Prediction | null | undefined = undefined;
+  private fitPan = new THREE.Vector2();
+  private fitExtent = 0;
+  private mapBasis: MapBasis | null = null;
   time = 0;
   private sim: FlightSim;
   private engine: RenderEngine;
@@ -87,11 +108,19 @@ export class FlightScene {
     this.scene.add(this.engineLight);
 
     this.map = new MapView(mapOverlay);
+    this.map.onFocus = (f) => this.setMapFocus(f);
     this.scene.add(this.map.group);
+    // 飞行视图的轨迹标签（远地点、落点）放在界面层之下
+    this.trajOverlay = document.createElement('div');
+    this.trajOverlay.className = 'traj-overlay';
+    mapOverlay.parentElement?.insertBefore(this.trajOverlay, mapOverlay.nextSibling);
+    this.traj = new FlightTrajectory(this.trajOverlay);
+    this.scene.add(this.traj.group);
     engine.onResize((w, h) => {
       this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
       this.map.setResolution(w, h);
+      this.traj.setResolution(w, h);
     });
 
     // 环境反射：天空/地面渐变
@@ -150,53 +179,203 @@ export class FlightScene {
 
   orbitCamera(dx: number, dy: number): void {
     if (this.mode === 'map') {
-      this.mapYaw -= dx * 0.005;
-      this.mapPitch = Math.max(-1.5, Math.min(1.5, this.mapPitch + dy * 0.005));
+      // 二维地图：拖动即平移
+      const mpp = (2 * this.mapExtent) / Math.max(1, this.engine.height);
+      this.mapPan.x -= dx * mpp;
+      this.mapPan.y += dy * mpp;
+      if (dx || dy) this.mapAutoFit = false;
     } else {
       this.camYaw -= dx * 0.005;
       this.camPitch = Math.max(-1.45, Math.min(1.45, this.camPitch + dy * 0.005));
     }
   }
 
-  zoom(delta: number): void {
+  /** 滚轮缩放；地图中以光标所在点为中心缩放。 */
+  zoom(delta: number, sx?: number, sy?: number): void {
     const f = Math.exp(delta * 0.0012);
-    if (this.mode === 'map') this.mapDist = Math.max(this.mapMinDist(), Math.min(4e8, this.mapDist * f));
-    else {
+    if (this.mode === 'map') {
+      const e0 = this.mapExtent;
+      const e1 = Math.max(MAP_MIN_EXTENT, Math.min(MAP_MAX_EXTENT, e0 * f));
+      if (sx !== undefined && sy !== undefined) {
+        const w = this.engine.width;
+        const h = this.engine.height;
+        const u = ((sx / w) * 2 - 1) * e0 * (w / h);
+        const v = (1 - (sy / h) * 2) * e0;
+        const k = e1 / e0;
+        this.mapPan.x += u * (1 - k);
+        this.mapPan.y += v * (1 - k);
+      }
+      this.mapExtent = e1;
+      this.mapAutoFit = false;
+    } else {
       const b = this.sim.vessel.bounds();
       const size = Math.max(b.maxY - b.minY, b.radius * 2);
       this.camDist = Math.max(size * 0.6, Math.min(20_000, this.camDist * f));
     }
   }
 
-  private mapFocusBody(): 'earth' | 'moon' | 'vessel' {
+  mapFocusBody(): MapFocus {
     if (this.mapFocus !== 'auto') return this.mapFocus;
     return this.sim.telemetry.body.id;
   }
 
-  private mapMinDist(): number {
-    const f = this.mapFocusBody();
-    if (f === 'earth') return EARTH.radius * 1.3;
-    if (f === 'moon') return MOON.radius * 1.4;
-    return 200;
+  cycleMapFocus(): void {
+    const order: MapFocus[] = ['earth', 'moon', 'vessel'];
+    this.setMapFocus(order[(order.indexOf(this.mapFocusBody()) + 1) % 3]);
   }
 
-  cycleMapFocus(): void {
-    const order: ('earth' | 'moon' | 'vessel')[] = ['earth', 'moon', 'vessel'];
-    const cur = this.mapFocusBody();
-    this.mapFocus = order[(order.indexOf(cur) + 1) % 3];
-    this.mapDist = this.mapFocus === 'earth' ? EARTH.radius * 5 : this.mapFocus === 'moon' ? MOON.radius * 6 : 50_000;
+  /** 是否在天体表面附近做亚轨道飞行（上升段、再入、着陆）。 */
+  private nearGround(): boolean {
+    const tel = this.sim.telemetry;
+    return tel.orbit.peAlt < (tel.body.atmosphere?.height ?? 8_000) && tel.alt < tel.body.radius * 0.6 && !tel.orbit.hyperbolic;
+  }
+
+  /** 切换地图焦点；'auto' 为自动视图：始终框住整条预测轨迹。 */
+  setMapFocus(f: MapFocus | 'auto'): void {
+    this.mapPan.set(0, 0);
+    this.fitPred = undefined;
+    if (f === 'auto') {
+      this.mapFocus = 'auto';
+      this.mapAutoFit = true;
+      // 上升段：让打开地图时的当地竖直方向朝上，弹道像二维火箭游戏一样从地平线升起
+      const tel = this.sim.telemetry;
+      this.mapUpRef = this.nearGround() ? tel.up.clone() : null;
+    } else {
+      this.mapFocus = f;
+      this.mapAutoFit = false;
+      this.mapUpRef = null;
+    }
+    this.mapExtent = this.defaultMapExtent(this.mapFocusBody());
+  }
+
+  /** 自动视图的目标：框住飞船、预测轨迹（上升段还包括已飞过的航迹）。 */
+  private computeFit(): void {
+    const sim = this.sim;
+    const t = sim.t;
+    const f = this.mapFocusBody();
+    const center = f === 'vessel' ? sim.vessel.r.clone() : bodyPosition(f === 'earth' ? EARTH : MOON, t, new THREE.Vector3());
+    const R = this.mapRight;
+    const U = this.mapUp;
+    let x0 = Infinity;
+    let x1 = -Infinity;
+    let y0 = Infinity;
+    let y1 = -Infinity;
+    const add = (x: number, y: number, z: number) => {
+      const dx = x - center.x;
+      const dy = y - center.y;
+      const dz = z - center.z;
+      const u = dx * R.x + dy * R.y + dz * R.z;
+      const v = dx * U.x + dy * U.y + dz * U.z;
+      x0 = Math.min(x0, u);
+      x1 = Math.max(x1, u);
+      y0 = Math.min(y0, v);
+      y1 = Math.max(y1, v);
+    };
+    const V = sim.vessel.r;
+    add(V.x, V.y, V.z);
+    const base = new THREE.Vector3();
+    const pred = sim.destroyed ? null : sim.prediction;
+    if (pred) {
+      let visitedMoon = false;
+      for (const seg of pred.segments) {
+        // 奔月途中：框到月球相遇段为止（之后的飞掠弹道不计入）
+        if (seg.body.id === 'earth' && visitedMoon && sim.telemetry.body.id === 'earth') break;
+        if (seg.body.id === 'moon') visitedMoon = true;
+        const anchor = encounterAnchor(pred, seg);
+        bodyPosition(seg.body, anchor ?? t, base);
+        const n = seg.times.length;
+        const stride = Math.max(1, Math.floor(n / 400));
+        for (let i = 0; i < n; i += stride) add(seg.pts[i * 3] + base.x, seg.pts[i * 3 + 1] + base.y, seg.pts[i * 3 + 2] + base.z);
+      }
+    }
+    const tr = sim.trail.last;
+    if (tr && this.nearGround() && tr.body === sim.telemetry.body) {
+      bodyPosition(tr.body, t, base);
+      const n = tr.times.length;
+      const stride = Math.max(1, Math.floor(n / 400));
+      for (let i = 0; i < n; i += stride) add(tr.pts[i * 3] + base.x, tr.pts[i * 3 + 1] + base.y, tr.pts[i * 3 + 2] + base.z);
+    }
+    const aspect = this.engine.width / Math.max(1, this.engine.height);
+    // 屏幕四周都有界面面板，多留一些边距
+    const ext = Math.max((y1 - y0) / 2, (x1 - x0) / 2 / aspect) * 1.6;
+    const min = sim.landed ? 60_000 : 20_000;
+    this.fitExtent = Math.max(min, Math.min(MAP_MAX_EXTENT, ext));
+    this.fitPan.set((x0 + x1) / 2, (y0 + y1) / 2);
+  }
+
+  private defaultMapExtent(f: MapFocus): number {
+    const tel = this.sim.telemetry;
+    if (f === 'vessel') {
+      const top = Math.max(tel.alt, isFinite(tel.orbit.apAlt) && tel.orbit.apAlt > 0 ? tel.orbit.apAlt : 0);
+      return Math.max(25_000, Math.min(tel.body.radius * 1.2, top * 1.4 + 30_000));
+    }
+    const body = f === 'earth' ? EARTH : MOON;
+    const o = tel.orbit;
+    if (tel.body === body && !o.hyperbolic && isFinite(o.ap)) return Math.max(body.radius * 1.35, Math.min(MAP_MAX_EXTENT, o.ap * 1.2));
+    if (f === 'earth' && (tel.body.id === 'moon' || o.hyperbolic || o.ap > MOON_ORBIT.a * 0.3)) return MOON_ORBIT.a * 1.15;
+    return body.radius * (f === 'earth' ? 1.6 : 3);
   }
 
   setMode(m: 'flight' | 'map'): void {
     this.mode = m;
     this.map.setVisible(m === 'map');
+    this.traj.setVisible(m === 'flight');
     if (m === 'map') {
-      this.mapFocus = 'auto';
-      const tel = this.sim.telemetry;
-      const r = tel.alt + tel.body.radius;
-      this.mapDist = Math.max(this.mapMinDist(), Math.min(4e8, r * 3.2));
-      if (tel.body.id === 'earth' && tel.orbit.ap > MOON_ORBIT_A * 0.3) this.mapDist = 1.1e8;
+      this.mapSnap = true;
+      this.setMapFocus('auto');
     }
+  }
+
+  /** 地图视平面：法向取飞船相对焦点天体的轨道角动量方向（平滑过渡），屏幕“上”方向随焦点而定。 */
+  private updateMapBasis(dt: number): MapBasis {
+    const sim = this.sim;
+    const V = sim.vessel;
+    const tel = sim.telemetry;
+    const f = this.mapFocusBody();
+    const ref = f === 'vessel' ? tel.body : f === 'earth' ? EARTH : MOON;
+    const rel = V.r.clone().sub(bodyPosition(ref, sim.t, new THREE.Vector3()));
+    const vrel = V.v.clone().sub(bodyVelocity(ref, sim.t, new THREE.Vector3()));
+    const hv = rel.clone().cross(vrel);
+    const n = this.mapNormal;
+    const snap = this.mapSnap;
+    const target = n.clone();
+    if (vrel.length() > 1 && hv.length() > 0.05 * rel.length() * vrel.length()) {
+      target.copy(hv).normalize();
+      if (!snap && target.dot(n) < 0) target.negate();
+    } else if (snap && Math.abs(n.y) < 0.5) target.set(0, 1, 0);
+    const k = snap ? 1 : 1 - Math.exp(-dt * 2.5);
+    n.applyQuaternion(new THREE.Quaternion().slerp(new THREE.Quaternion().setFromUnitVectors(n, target), k)).normalize();
+    // 屏幕右方：跟随飞船时让当地“上”朝上；自动视图的上升段保持打开地图时的竖直方向；看天体时让太阳在右侧
+    const want = new THREE.Vector3();
+    if (f === 'vessel') want.copy(rel).normalize().cross(n);
+    else if (this.mapUpRef) want.copy(this.mapUpRef).cross(n);
+    else want.copy(SUN_DIR);
+    want.addScaledVector(n, -want.dot(n));
+    if (want.lengthSq() < 0.01) want.set(1, 0, 0).addScaledVector(n, -n.x);
+    want.normalize();
+    const r = this.mapRight.addScaledVector(n, -this.mapRight.dot(n));
+    if (r.lengthSq() < 1e-6 || snap) r.copy(want);
+    else {
+      r.normalize();
+      const ang = Math.atan2(new THREE.Vector3().crossVectors(r, want).dot(n), r.dot(want));
+      r.applyAxisAngle(n, ang * (1 - Math.exp(-dt * 3)));
+    }
+    r.normalize();
+    this.mapUp.crossVectors(n, r).normalize();
+    // 自动视图：预测轨迹更新时重新计算目标，平滑地移过去
+    if (this.mapAutoFit) {
+      const pred = this.sim.prediction;
+      if (pred !== this.fitPred || snap) {
+        this.fitPred = pred;
+        this.computeFit();
+      }
+      const kf = snap ? 1 : 1 - Math.exp(-dt * 2.5);
+      this.mapPan.lerp(this.fitPan, kf);
+      this.mapExtent += (this.fitExtent - this.mapExtent) * kf;
+    }
+    this.map.setFocusButton(this.mapAutoFit ? 'auto' : this.mapFocusBody());
+    this.mapSnap = false;
+    return { right: this.mapRight, up: this.mapUp, normal: n, extent: this.mapExtent };
   }
 
   // ---------------------------------------------------------------- 每帧
@@ -392,8 +571,11 @@ export class FlightScene {
     this.planets.cloudMat.uniforms.uFade.value = THREE.MathUtils.smoothstep(dc, 300, 2500);
     this.planets.clouds.visible = true;
 
-    // 地图
-    this.map.update(sim.prediction, t, origin, V.r.clone().sub(origin), this.camera, this.engine.width, this.engine.height);
+    // 轨迹：飞行视图与二维地图
+    this.history.update(sim.prediction, this.time);
+    const ghost = this.history.ghost();
+    if (this.mode === 'map') this.map.update(sim, ghost, origin, this.camera, this.engine.width, this.engine.height, this.mapBasis!, dtReal);
+    else this.traj.update(sim, ghost, origin, this.camera, this.engine.width, this.engine.height);
   }
 
   private smokeLight = new THREE.Color(1, 1, 1);
@@ -528,13 +710,18 @@ export class FlightScene {
     const tel = sim.telemetry;
     const cam = this.camera;
     if (this.mode === 'map') {
-      const d = this.mapDist;
-      const p = new THREE.Vector3(Math.cos(this.mapPitch) * Math.cos(this.mapYaw), Math.sin(this.mapPitch), Math.cos(this.mapPitch) * Math.sin(this.mapYaw)).multiplyScalar(d);
-      cam.position.copy(p);
-      cam.up.set(0, 1, 0);
-      cam.lookAt(0, 0, 0);
+      // 远处的长焦相机沿视平面法向俯视：平面内的轨迹没有透视变形，相当于二维地图
+      const b = (this.mapBasis = this.updateMapBasis(dt));
+      const ext = this.mapExtent;
+      const d = Math.max(ext / Math.tan(MAP_FOV / 2), 2.5e6);
+      const target = b.right.clone().multiplyScalar(this.mapPan.x).addScaledVector(b.up, this.mapPan.y);
+      cam.position.copy(target).addScaledVector(b.normal, d);
+      cam.up.copy(b.up);
+      cam.lookAt(target);
+      cam.fov = (2 * Math.atan(ext / d) * 180) / Math.PI;
       cam.near = Math.max(1, d * 0.001);
     } else {
+      cam.fov = 55;
       let up: THREE.Vector3;
       let a: THREE.Vector3;
       let b: THREE.Vector3;
@@ -593,7 +780,8 @@ export class FlightScene {
     if (this.envRT) this.envRT.dispose();
     this.pmrem.dispose();
     this.map.setVisible(false);
+    this.map.dispose();
+    this.traj.dispose();
+    this.trajOverlay.remove();
   }
 }
-
-const MOON_ORBIT_A = 38_440_000;

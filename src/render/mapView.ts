@@ -1,165 +1,373 @@
 import * as THREE from 'three';
-import { Line2 } from 'three/examples/jsm/lines/Line2.js';
-import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
-import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
-import { MOON, MOON_ORBIT, bodyPosition } from '../physics/bodies';
+import type { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
+import { EARTH, MOON, MOON_ORBIT, type BodyId, bodyPosition } from '../physics/bodies';
+import type { FlightSim } from '../game/flight';
 import type { Prediction } from '../game/predictor';
+import { DynLine, PolyBuilder, fadeLineMaterial } from './lines';
+import { ScreenLabels } from './labels';
+import { TRAJ, apsisName, deltaHtml, encounterAnchor, segColor, segImpactT, segmentAt } from './trajectoryView';
 import { fmtDist, fmtTime } from '../ui/format';
 
-interface Marker {
-  el: HTMLDivElement;
-  pos: THREE.Vector3; // 世界坐标（相对原点）
-  visible: boolean;
+/** 二维地图的视平面：right/up 为屏幕方向，normal 指向观察者；extent 为半个屏幕高度对应的距离（米）。 */
+export interface MapBasis {
+  right: THREE.Vector3;
+  up: THREE.Vector3;
+  normal: THREE.Vector3;
+  extent: number;
 }
 
-/** 地图视图：轨迹线、月球轨道、拱点与交会标记。 */
+export type MapFocus = 'earth' | 'moon' | 'vessel';
+
+const BODY_IDS: BodyId[] = ['earth', 'moon'];
+const UP = new THREE.Vector3(0, 1, 0);
+
+/** 屏幕空间星空（二维地图的背景，叠加在大气散射天空上）。 */
+const STAR_FRAG = /* glsl */ `
+float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+void main() {
+  vec3 col = vec3(0.0);
+  for (int l = 0; l < 2; l++) {
+    float s = l == 0 ? 3.0 : 7.0;
+    vec2 q = gl_FragCoord.xy / s;
+    vec2 cell = floor(q);
+    float h = hash(cell + float(l) * 17.0);
+    if (h > (l == 0 ? 0.965 : 0.992)) {
+      vec2 c = vec2(hash(cell + 3.1), hash(cell + 7.7));
+      float d = length(fract(q) - c) * s;
+      float b = pow(hash(cell + 11.3), 3.0) * (l == 0 ? 0.35 : 1.4);
+      vec3 tint = mix(vec3(0.75, 0.85, 1.0), vec3(1.0, 0.9, 0.75), hash(cell + 5.9));
+      col += tint * b * smoothstep(1.3, 0.0, d);
+    }
+  }
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+/**
+ * 二维地图：相机始终垂直于飞船的轨道平面俯视，只能平移与缩放（不再三维旋转），
+ * 但地球、月球、大气辉光仍用飞行视图同一套三维着色器渲染，保持原来的质感。
+ * 画面内容：已飞过的航迹、预测轨迹（带流动光点）、1 秒前的幽灵轨迹、月球轨道、影响球、大气层边界，
+ * 以及远/近拱点（含变化量）、落点、进出影响球、机动节点等标记。
+ */
 export class MapView {
   group = new THREE.Group();
-  private lines: Line2[] = [];
-  private mats: Record<string, LineMaterial> = {};
+  private overlay: HTMLDivElement;
+  private labels: ScreenLabels;
+  private pb = new PolyBuilder();
+  private trail: Record<BodyId, DynLine>;
+  private pred: Record<BodyId, DynLine>;
+  private ghost: Record<BodyId, DynLine>;
+  private tip: DynLine;
+  private flowMats: LineMaterial[] = [];
+  private flowOffset = 0;
   private moonOrbit: THREE.LineLoop;
   private soiRing: THREE.LineLoop;
-  private overlay: HTMLDivElement;
-  private markers: Marker[] = [];
-  private markerPool: HTMLDivElement[] = [];
-  private lastPred: Prediction | null = null;
+  private atmoRing: THREE.LineLoop;
+  private encRing: THREE.LineLoop;
+  private stars: THREE.Mesh;
+  private lastTrailVer = -1;
+  private lastPred: Prediction | null | undefined = undefined;
+  private lastGhost: Prediction | null | undefined = undefined;
+  private toolbar: HTMLDivElement;
+  private scaleBar: HTMLDivElement;
+  private scaleText: HTMLSpanElement;
+  private focusBtns = new Map<MapFocus | 'auto', HTMLButtonElement>();
+  onFocus: (f: MapFocus | 'auto') => void = () => {};
   visible = false;
 
   constructor(overlay: HTMLDivElement) {
     this.overlay = overlay;
-    const mk = (color: number, width: number, dashed = false) => {
-      const m = new LineMaterial({ color, linewidth: width, worldUnits: false, dashed, transparent: true, opacity: 0.95, depthTest: true });
-      m.dashSize = 3e5;
-      m.gapSize = 2e5;
-      return m;
-    };
-    this.mats = {
-      earth: mk(0x57c7ff, 2.2),
-      moon: mk(0xc49bff, 2.2),
-      node: mk(0xffb040, 2.2),
-      nodeMoon: mk(0xff8a3d, 2.2),
-    };
+    this.labels = new ScreenLabels(overlay);
+    const mkSet = (make: () => DynLine) => ({ earth: make(), moon: make() }) as Record<BodyId, DynLine>;
+    this.trail = mkSet(() => new DynLine([fadeLineMaterial({ width: 2.6, depthTest: false })], 50));
+    this.ghost = mkSet(() => new DynLine([fadeLineMaterial({ width: 2, depthTest: false })], 52));
+    this.pred = mkSet(() => {
+      const flow = fadeLineMaterial({ width: 3.4, depthTest: false, dashed: true });
+      flow.color.setScalar(2.6);
+      this.flowMats.push(flow);
+      return new DynLine([fadeLineMaterial({ width: 11, opacity: 0.14, depthTest: false }), fadeLineMaterial({ width: 3.2, depthTest: false }), flow], 54);
+    });
+    this.tip = new DynLine([fadeLineMaterial({ width: 2.6, depthTest: false })], 51);
+    for (const id of BODY_IDS) for (const l of [this.trail[id], this.ghost[id], this.pred[id]]) l.addTo(this.group);
+    this.tip.addTo(this.group);
+
     const pts: THREE.Vector3[] = [];
     for (let i = 0; i < 256; i++) {
       const a = (i / 256) * Math.PI * 2;
       pts.push(new THREE.Vector3(Math.cos(a), 0, -Math.sin(a)));
     }
     const g = new THREE.BufferGeometry().setFromPoints(pts);
-    this.moonOrbit = new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color: 0x8a8f99, transparent: true, opacity: 0.45 }));
+    this.moonOrbit = new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color: 0x8a8f99, transparent: true, opacity: 0.4, depthTest: false }));
     this.moonOrbit.scale.setScalar(MOON_ORBIT.a);
-    this.moonOrbit.frustumCulled = false;
-    this.soiRing = new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color: 0xc49bff, transparent: true, opacity: 0.25 }));
+    // 影响球与大气层的轮廓：画在视平面内的圆（球体从任何方向看都是圆）
+    const ring = (color: number, opacity: number, dashed: boolean) => {
+      const cp: THREE.Vector3[] = [];
+      for (let i = 0; i < 256; i++) {
+        const a = (i / 256) * Math.PI * 2;
+        cp.push(new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
+      }
+      const m = dashed
+        ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, depthTest: false, dashSize: 0.025, gapSize: 0.02 })
+        : new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthTest: false });
+      const l = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(cp), m);
+      if (dashed) l.computeLineDistances();
+      return l;
+    };
+    this.soiRing = ring(0xc49bff, 0.35, true);
     this.soiRing.scale.setScalar(MOON.soi);
-    this.soiRing.frustumCulled = false;
-    this.group.add(this.moonOrbit, this.soiRing);
+    this.atmoRing = ring(0x6fb8ff, 0.4, true);
+    this.atmoRing.scale.setScalar(EARTH.radius + (EARTH.atmosphere?.height ?? 0));
+    // 相遇时月球的位置（虚线圆）
+    this.encRing = ring(0xc49bff, 0.7, true);
+    this.encRing.scale.setScalar(MOON.radius);
+    for (const o of [this.moonOrbit, this.soiRing, this.atmoRing, this.encRing]) {
+      o.frustumCulled = false;
+      o.renderOrder = 45;
+      this.group.add(o);
+    }
+
+    const starMat = new THREE.ShaderMaterial({
+      vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }',
+      fragmentShader: STAR_FRAG,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      transparent: true,
+    });
+    this.stars = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), starMat);
+    this.stars.frustumCulled = false;
+    this.stars.renderOrder = -999.5;
+    this.group.add(this.stars);
     this.group.visible = false;
+
+    // 工具栏：切换焦点 + 比例尺
+    const btn = (f: MapFocus | 'auto', label: string, title: string) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener('click', () => this.onFocus(f));
+      this.focusBtns.set(f, b);
+      return b;
+    };
+    this.toolbar = document.createElement('div');
+    this.toolbar.className = 'map-toolbar panel';
+    this.toolbar.append(
+      btn('auto', '自动', '自动缩放，始终框住整条预测轨迹'),
+      btn('earth', '地球', '以地球为中心（Tab 切换）'),
+      btn('moon', '月球', '以月球为中心'),
+      btn('vessel', '飞船', '跟随飞船'),
+    );
+    this.scaleBar = document.createElement('div');
+    this.scaleBar.className = 'map-scale';
+    this.scaleText = document.createElement('span');
+    const sw = document.createElement('div');
+    sw.className = 'map-scale-wrap';
+    sw.append(this.scaleBar, this.scaleText);
+    this.toolbar.append(sw);
+    const hint = document.createElement('span');
+    hint.className = 'map-hint';
+    hint.textContent = '拖动平移 · 滚轮缩放';
+    this.toolbar.append(hint);
+    overlay.appendChild(this.toolbar);
   }
 
   setResolution(w: number, h: number): void {
-    for (const m of Object.values(this.mats)) m.resolution.set(w, h);
+    for (const set of [this.trail, this.ghost, this.pred]) for (const id of BODY_IDS) for (const o of set[id].objects) o.material.resolution.set(w, h);
+    for (const o of this.tip.objects) o.material.resolution.set(w, h);
   }
 
   setVisible(v: boolean): void {
     this.visible = v;
     this.group.visible = v;
     this.overlay.style.display = v ? 'block' : 'none';
+    if (!v) this.labels.begin();
   }
 
-  private line(i: number): Line2 {
-    while (this.lines.length <= i) {
-      const l = new Line2(new LineGeometry(), this.mats.earth);
-      l.frustumCulled = false;
-      l.renderOrder = 50;
-      this.group.add(l);
-      this.lines.push(l);
-    }
-    return this.lines[i];
+  setFocusButton(f: MapFocus | 'auto'): void {
+    for (const [k, b] of this.focusBtns) b.classList.toggle('on', k === f);
   }
 
-  update(pred: Prediction | null, t: number, origin: THREE.Vector3, vesselPos: THREE.Vector3, camera: THREE.Camera, w: number, h: number): void {
-    if (!this.visible) return;
-    const earthW = new THREE.Vector3().sub(origin);
-    const moonW = bodyPosition(MOON, t, new THREE.Vector3()).sub(origin);
-    this.moonOrbit.position.copy(earthW);
-    this.soiRing.position.copy(moonW);
-    let li = 0;
-    this.clearMarkers();
-    if (pred) {
-      const rebuild = pred !== this.lastPred;
-      this.lastPred = pred;
-      for (const seg of pred.segments) {
-        const base = seg.body.id === 'moon' ? moonW : earthW;
-        const n = seg.pts.length / 3;
-        if (n < 2) continue;
-        const l = this.line(li++);
-        l.visible = true;
-        l.position.copy(base);
-        if (rebuild) {
-          const arr: number[] = [];
-          const stride = Math.max(1, Math.floor(n / 1500));
-          for (let i = 0; i < n; i += stride) arr.push(seg.pts[i * 3], seg.pts[i * 3 + 1], seg.pts[i * 3 + 2]);
-          if ((n - 1) % stride !== 0) arr.push(seg.pts[(n - 1) * 3], seg.pts[(n - 1) * 3 + 1], seg.pts[(n - 1) * 3 + 2]);
-          const g = new LineGeometry();
-          g.setPositions(arr);
-          l.geometry.dispose();
-          l.geometry = g;
-          l.material = seg.afterNode ? (seg.body.id === 'moon' ? this.mats.nodeMoon : this.mats.node) : seg.body.id === 'moon' ? this.mats.moon : this.mats.earth;
+  // ---------------------------------------------------------------- 重建几何（数据变化时）
+
+  private rebuildTrail(sim: FlightSim): void {
+    const segs = sim.trail.segments;
+    const total = Math.max(1, sim.trail.count);
+    for (const id of BODY_IDS) {
+      const pb = this.pb.clear();
+      let gi = 0;
+      for (const s of segs) {
+        const n = s.times.length;
+        if (s.body.id !== id) {
+          gi += n;
+          continue;
+        }
+        for (let i = 0; i < n; i++, gi++) {
+          const a = 0.3 + 0.65 * (gi / total);
+          if (i === 0 && pb.n) {
+            const L = pb.n - 1;
+            pb.push(pb.pts[L * 3], pb.pts[L * 3 + 1], pb.pts[L * 3 + 2], TRAJ.coast, 0);
+            pb.push(s.pts[0], s.pts[1], s.pts[2], TRAJ.coast, 0);
+          }
+          pb.push(s.pts[i * 3], s.pts[i * 3 + 1], s.pts[i * 3 + 2], s.powered[i] ? TRAJ.powered : TRAJ.coast, a);
         }
       }
+      pb.flush(this.trail[id]);
+    }
+  }
+
+  private rebuildPred(pred: Prediction | null, lines: Record<BodyId, DynLine>, alpha: number, flat: boolean): void {
+    const c = new THREE.Color();
+    const off = new THREE.Vector3();
+    for (const id of BODY_IDS) {
+      const pb = this.pb.clear();
+      if (pred) {
+        for (const seg of pred.segments) {
+          // 将来的月球相遇段换算到地心系，画在相遇时月球的位置
+          const anchor = encounterAnchor(pred, seg);
+          if ((anchor !== null ? 'earth' : seg.body.id) !== id) continue;
+          if (anchor !== null) bodyPosition(MOON, anchor, off);
+          else off.set(0, 0, 0);
+          const n = seg.times.length;
+          const impactT = segImpactT(pred, seg);
+          const stride = Math.max(1, Math.floor(n / 2000));
+          for (let i = 0; i < n; i = i === n - 1 ? n : Math.min(n - 1, i + stride)) {
+            segColor(seg, i, impactT, c);
+            if (flat) c.copy(TRAJ.ghost);
+            if (i === 0 && pb.n) {
+              const L = pb.n - 1;
+              pb.push(pb.pts[L * 3], pb.pts[L * 3 + 1], pb.pts[L * 3 + 2], c, 0);
+              pb.push(seg.pts[0] + off.x, seg.pts[1] + off.y, seg.pts[2] + off.z, c, 0);
+            }
+            pb.push(seg.pts[i * 3] + off.x, seg.pts[i * 3 + 1] + off.y, seg.pts[i * 3 + 2] + off.z, c, alpha);
+          }
+        }
+        const N = pb.n;
+        for (let i = 0; i < N; i++) if (pb.alpha[i] > 0) pb.alpha[i] *= 1 - 0.5 * (i / Math.max(1, N - 1));
+      }
+      pb.flush(lines[id]);
+    }
+  }
+
+  // ---------------------------------------------------------------- 每帧
+
+  update(sim: FlightSim, ghost: Prediction | null, origin: THREE.Vector3, camera: THREE.Camera, w: number, h: number, view: MapBasis, dt: number): void {
+    this.labels.begin();
+    if (!this.visible) return;
+    const t = sim.t;
+    const pred = sim.destroyed ? null : sim.prediction;
+    const bodyW: Record<BodyId, THREE.Vector3> = {
+      earth: bodyPosition(EARTH, t, new THREE.Vector3()).sub(origin),
+      moon: bodyPosition(MOON, t, new THREE.Vector3()).sub(origin),
+    };
+
+    if (sim.trail.version !== this.lastTrailVer) {
+      this.lastTrailVer = sim.trail.version;
+      this.rebuildTrail(sim);
+    }
+    if (pred !== this.lastPred) {
+      this.lastPred = pred;
+      this.rebuildPred(pred, this.pred, 1, false);
+    }
+    const g = pred ? ghost : null;
+    if (g !== this.lastGhost) {
+      this.lastGhost = g;
+      this.rebuildPred(g, this.ghost, 0.45, true);
+    }
+    for (const id of BODY_IDS) for (const set of [this.trail, this.ghost, this.pred]) set[id].setPosition(bodyW[id]);
+
+    // 航迹末端连到飞船当前位置
+    const V = sim.vessel;
+    const vesselW = V.r.clone().sub(origin);
+    const last = sim.trail.last;
+    if (last && last.times.length) {
+      const n = last.times.length - 1;
+      const bw = bodyW[last.body.id];
+      const col = sim.telemetry.thrust > 0 ? TRAJ.powered : TRAJ.coast;
+      this.tip.set(2, [last.pts[n * 3] + bw.x, last.pts[n * 3 + 1] + bw.y, last.pts[n * 3 + 2] + bw.z, vesselW.x, vesselW.y, vesselW.z], [col.r, col.g, col.b, col.r, col.g, col.b], [0.95, 0.95]);
+    } else this.tip.visible = false;
+
+    // 预测轨迹上流动的光点，指示运动方向
+    const ext = view.extent;
+    const period = ext * 0.1;
+    this.flowOffset = (this.flowOffset - ext * 0.12 * dt) % period;
+    for (const m of this.flowMats) {
+      m.dashSize = ext * 0.014;
+      m.gapSize = period - ext * 0.014;
+      m.dashOffset = this.flowOffset;
+    }
+
+    // 月球轨道、影响球、大气层边界
+    this.moonOrbit.position.copy(bodyW.earth);
+    const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(view.right, view.up, view.normal));
+    this.soiRing.position.copy(bodyW.moon);
+    this.soiRing.quaternion.copy(q);
+    this.atmoRing.position.copy(bodyW.earth);
+    this.atmoRing.quaternion.copy(q);
+    const encSeg = pred?.segments.find((sg) => encounterAnchor(pred, sg) !== null) ?? null;
+    this.encRing.visible = !!encSeg;
+    if (encSeg) {
+      this.encRing.position.copy(bodyPosition(MOON, encSeg.times[0], new THREE.Vector3())).add(bodyW.earth);
+      this.encRing.quaternion.copy(q);
+    }
+    const mpp = (2 * ext) / Math.max(1, h); // 每像素米数
+    // 放大到能分辨出 70 km 大气层时才显示其边界
+    (this.atmoRing.material as THREE.LineDashedMaterial).opacity = THREE.MathUtils.clamp(((EARTH.atmosphere?.height ?? 0) / mpp - 3) / 10, 0, 0.45);
+
+    // ---------------------------------------------------------------- 标记
+    if (pred) {
       const seen = new Set<string>();
+      const anchorOf = (body: typeof MOON, time: number) => {
+        const sg = body.id === 'moon' ? segmentAt(pred, time, body) : null;
+        return sg ? encounterAnchor(pred, sg) : null;
+      };
       for (const e of pred.events) {
-        const base = e.body.id === 'moon' ? moonW : earthW;
-        const p = e.pos.clone().add(base);
+        const an = anchorOf(e.body, e.t);
+        const p = an !== null ? e.pos.clone().add(bodyPosition(MOON, an, new THREE.Vector3())).add(bodyW.earth) : e.pos.clone().add(bodyW[e.body.id]);
         const key = `${e.type}-${e.body.id}-${e.afterNode}`;
         if (e.type === 'ap' || e.type === 'pe') {
           if (seen.has(key)) continue;
           seen.add(key);
-          const nm = e.body.id === 'moon' ? (e.type === 'ap' ? '远月点' : '近月点') : e.type === 'ap' ? '远地点' : '近地点';
-          this.addMarker(p, `<b>${nm}</b> ${fmtDist(e.alt)}<br><small>${fmtTime(e.t - t)}</small>`, e.afterNode ? 'mk-node' : e.type === 'ap' ? 'mk-ap' : 'mk-pe');
+          const d = e.afterNode ? '' : deltaHtml(e, g, t);
+          this.labels.add(p, `<b>${apsisName(e.type, e.body)}</b> ${fmtDist(e.alt)}${d}<br><small>${fmtTime(e.t - t)}</small>`, e.afterNode ? 'mk-node' : e.type === 'ap' ? 'mk-ap' : 'mk-pe');
         } else if (e.type === 'soiEnter') {
-          this.addMarker(p, `<b>进入月球 SOI</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-soi');
+          this.labels.add(p, `<b>进入月球影响球</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-soi');
         } else if (e.type === 'soiExit') {
-          this.addMarker(p, `<b>离开月球 SOI</b>`, 'mk-soi');
+          this.labels.add(p, `<b>离开月球影响球</b>`, 'mk-soi');
         } else if (e.type === 'impact') {
-          this.addMarker(p, `<b>✖ 撞击${e.body.name}</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-impact');
+          this.labels.add(p, `<b>✖ 撞击${e.body.name}</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-impact');
         } else if (e.type === 'node') {
-          this.addMarker(p, `<b>◆ 机动节点</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-nodept');
+          this.labels.add(p, `<b>◆ 机动节点</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-nodept');
         }
       }
     }
-    for (let i = li; i < this.lines.length; i++) this.lines[i].visible = false;
-    this.addMarker(vesselPos.clone(), '▲', 'mk-vessel');
-    this.addMarker(earthW.clone(), '地球', 'mk-body');
-    this.addMarker(moonW.clone(), '月球', 'mk-body');
-    this.layoutMarkers(camera, w, h);
-  }
-
-  private clearMarkers(): void {
-    for (const m of this.markers) {
-      m.el.style.display = 'none';
-      this.markerPool.push(m.el);
+    // 飞船图标：箭头指向机头方向（机头垂直于屏幕时改用速度方向）
+    const fwd = UP.clone().applyQuaternion(V.q);
+    let sx = fwd.dot(view.right);
+    let sy = fwd.dot(view.up);
+    if (Math.hypot(sx, sy) < 0.25) {
+      const vr = sim.telemetry.vOrbVec;
+      sx = vr.dot(view.right);
+      sy = vr.dot(view.up);
     }
-    this.markers = [];
+    const rot = (Math.atan2(sx, sy) * 180) / Math.PI;
+    this.labels.add(vesselW, '<svg viewBox="-12 -12 24 24"><path d="M0,-10 L6,7 L0,3.5 L-6,7 Z"/></svg>', 'mk-vessel', rot);
+    this.labels.add(bodyW.earth.clone().addScaledVector(view.up, -EARTH.radius * 1.1), '地球', 'mk-body');
+    this.labels.add(bodyW.moon.clone().addScaledVector(view.up, -MOON.radius * 1.2), '月球', 'mk-body');
+    if (encSeg) this.labels.add(this.encRing.position.clone().addScaledVector(view.up, MOON.radius * 1.3), `月球（相遇时）<br><small>${fmtTime(encSeg.times[0] - t)} 后</small>`, 'mk-body mk-enc');
+    this.labels.layout(camera, w, h);
+
+    // 比例尺
+    const target = mpp * 110;
+    const pow = Math.pow(10, Math.floor(Math.log10(target)));
+    const nice = [1, 2, 5, 10].map((k) => k * pow).reduce((a, b) => (Math.abs(b - target) < Math.abs(a - target) ? b : a));
+    this.scaleBar.style.width = `${(nice / mpp).toFixed(0)}px`;
+    this.scaleText.textContent = fmtDist(nice).replace('.00', '');
   }
 
-  private addMarker(pos: THREE.Vector3, html: string, cls: string): void {
-    const el = this.markerPool.pop() ?? document.createElement('div');
-    if (!el.parentElement) this.overlay.appendChild(el);
-    el.className = `map-marker ${cls}`;
-    if (el.innerHTML !== html) el.innerHTML = html;
-    this.markers.push({ el, pos, visible: true });
-  }
-
-  private layoutMarkers(camera: THREE.Camera, w: number, h: number): void {
-    const v = new THREE.Vector3();
-    for (const m of this.markers) {
-      v.copy(m.pos).project(camera);
-      if (v.z > 1 || v.z < -1) {
-        m.el.style.display = 'none';
-        continue;
-      }
-      m.el.style.display = 'block';
-      m.el.style.transform = `translate(${((v.x + 1) / 2) * w}px, ${((1 - v.y) / 2) * h}px)`;
-    }
+  dispose(): void {
+    for (const id of BODY_IDS) for (const set of [this.trail, this.ghost, this.pred]) set[id].dispose();
+    this.tip.dispose();
+    this.labels.dispose();
+    this.toolbar.remove();
   }
 }
