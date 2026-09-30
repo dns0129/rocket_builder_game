@@ -1,16 +1,20 @@
 import * as THREE from 'three';
-import { EARTH, bodyRotation, fromBodyFixed } from '../physics/bodies';
+import { EARTH, LAUNCH_SITE, bodyRotation, dirFromLatLon, fromBodyFixed } from '../physics/bodies';
 import { concreteTexture } from './textures';
 
 /** 发射场：混凝土发射台、发射塔（桁架）、储罐、照明塔，以及远处的总装厂房。 */
 export class LaunchPad {
   group = new THREE.Group();
   private bfQuat = new THREE.Quaternion();
-  private bfPos = new THREE.Vector3(EARTH.radius, 0, 0);
+  private bfPos = new THREE.Vector3();
 
   constructor(rocketHeight: number, rocketRadius: number) {
-    // 局部坐标：+Y 向上（天体固连 +X），+Z 向北（+Y），+X 向西（+Z）
-    const m = new THREE.Matrix4().makeBasis(new THREE.Vector3(0, 0, 1), new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0));
+    // 局部坐标：+Y 向上，+Z 向北，+X 向西（均为发射场处的天体固连方向）
+    const up = dirFromLatLon(LAUNCH_SITE.lat, LAUNCH_SITE.lon);
+    const north = new THREE.Vector3(0, 1, 0).addScaledVector(up, -up.y).normalize();
+    const west = new THREE.Vector3().crossVectors(up, north).normalize();
+    this.bfPos.copy(up).multiplyScalar(EARTH.radius);
+    const m = new THREE.Matrix4().makeBasis(west, up, north);
     this.bfQuat.setFromRotationMatrix(m);
     const std = (p: THREE.MeshStandardMaterialParameters) => new THREE.MeshStandardMaterial(p);
     const concrete = std({ map: concreteTexture(), roughness: 0.92, metalness: 0 });

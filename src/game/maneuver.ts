@@ -1,5 +1,6 @@
 import { Vector3 } from 'three';
-import { EARTH, MOON, MOON_ORBIT, type Body, bodyPosition, bodyVelocity, dominantBody, moonAngle } from '../physics/bodies';
+import { EARTH, MOON, MOON_ORBIT, type Body, bodyPosition, bodyVelocity, dominantBody, moonPosition, moonVelocity } from '../physics/bodies';
+import { adaptiveStep, rk4Step } from '../physics/integrate';
 import { computeOrbit, visViva } from '../physics/orbit';
 import { predict, type NodeSpec } from './predictor';
 
@@ -52,17 +53,13 @@ export function solveChangeApsis(s: StateVec, at: 'ap' | 'pe', targetAlt: number
   return { node: { t: s.t + tBurn, dv: new Vector3(dv, 0, 0) }, msg: '调整轨道高度' };
 }
 
-function angleOf(p: Vector3): number {
-  return Math.atan2(-p.z, p.x);
-}
-
-function wrap2pi(x: number): number {
-  const T = Math.PI * 2;
-  x %= T;
-  return x < 0 ? x + T : x;
-}
-
-/** 奔月转移（地月转移轨道注入）：先用霍曼转移估算，再用三体数值积分精修，使近月点高度约为 targetAlt。 */
+/**
+ * 奔月转移（地月转移轨道注入）。
+ * 1. 发射窗口：月球在赤道面内公转，而从文昌发射的停泊轨道有约 19.6° 倾角，
+ *    所以必须在轨道与赤道面的交点（节点）附近点火，并且此时月球恰好运行到对面。
+ *    在未来一个月球周期内扫描，找到最早满足条件的时刻（赤道轨道每圈都有窗口）。
+ * 2. 从窗口前半圈的状态出发，用三体数值积分精修点火时刻、顺行与法向 Δv，使近月点高度约为 targetAlt。
+ */
 export function solveTLI(s: StateVec, targetAlt = 60_000): SolveResult {
   const body = dominantBody(s.r, s.t);
   if (body.id !== 'earth') return { node: null, msg: '需要先处于地球轨道上。' };
@@ -74,60 +71,122 @@ export function solveTLI(s: StateVec, targetAlt = 60_000): SolveResult {
   const aT = (r0 + MOON_ORBIT.a) / 2;
   const tTrans = Math.PI * Math.sqrt((aT * aT * aT) / EARTH.mu);
   const nS = Math.sqrt(EARTH.mu / (o.a * o.a * o.a));
-  const nM = MOON_ORBIT.n;
-  const th0 = angleOf(r);
-  const thM0 = moonAngle(s.t);
-  const synodic = (2 * Math.PI) / (nS - nM);
-  let dt = wrap2pi(thM0 + nM * tTrans - Math.PI - th0) / (nS - nM);
-  while (dt < 90) dt += synodic;
-  const dv0 = Math.sqrt(EARTH.mu * (2 / r0 - 1 / aT)) - v.length();
+  const Ts = (2 * Math.PI) / nS;
   const target = MOON.radius + targetAlt;
 
-  const cost = (tb: number, dv: number) => {
-    const p = predict(s.r, s.v, s.t, [{ t: s.t + tb, dv: new Vector3(dv, 0, 0) }], { maxSteps: 1500, eta: 0.03, maxTime: tTrans * 1.8 + tb });
+  // ---- 1. 发射窗口扫描（停泊轨道按圆轨道近似）
+  const hHat = o.h.clone().normalize();
+  const rHat = r.clone().normalize();
+  const qHat = new Vector3().crossVectors(hHat, rHat);
+  const mp = new Vector3();
+  const errAt = (tb: number) => {
+    const a = nS * tb;
+    const c = Math.cos(a);
+    const sn = Math.sin(a);
+    // 点火点对面的方向（霍曼转移的远地点方向）
+    const ax = -(rHat.x * c + qHat.x * sn);
+    const ay = -(rHat.y * c + qHat.y * sn);
+    const az = -(rHat.z * c + qHat.z * sn);
+    moonPosition(s.t + tb + tTrans, mp).normalize();
+    return Math.acos(Math.max(-1, Math.min(1, ax * mp.x + ay * mp.y + az * mp.z)));
+  };
+  const step = Ts / 360;
+  const tEnd = MOON_ORBIT.period + 2 * Ts;
+  const thr = (2.5 * Math.PI) / 180;
+  let bestTb = -1;
+  let bestErr = Infinity;
+  let firstTb = -1;
+  let prev = errAt(120);
+  for (let tb = 120 + step; tb < tEnd; tb += step) {
+    const e = errAt(tb);
+    if (e < bestErr) {
+      bestErr = e;
+      bestTb = tb;
+    }
+    // 第一个足够好的局部极小值
+    if (firstTb < 0 && prev < thr && e > prev) firstTb = tb - step;
+    if (firstTb >= 0) break;
+    prev = e;
+  }
+  const tb0 = firstTb >= 0 ? firstTb : bestTb;
+
+  // ---- 2. 数值推进到窗口前约半圈
+  const lead = Math.min(tb0 - 1, 0.35 * Ts);
+  const t1 = s.t + tb0 - lead;
+  const r1 = s.r.clone();
+  const v1 = s.v.clone();
+  let t = s.t;
+  for (let guard = 0; t < t1 - 1e-6 && guard < 2_000_000; guard++) {
+    const h = Math.min(t1 - t, adaptiveStep(r1, t, 0.01));
+    rk4Step(r1, v1, t, h);
+    t += h;
+  }
+  const rb = r1.clone().sub(bodyPosition(EARTH, t, new Vector3())).length();
+  const dv0 = Math.sqrt(EARTH.mu * (2 / rb - 1 / aT)) - Math.sqrt(EARTH.mu / rb);
+
+  // ---- 3. 三体精修：点火时刻、顺行 Δv、法向 Δv
+  const cost = (dtb: number, dv: number, dn: number) => {
+    const p = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(dv, dn, 0) }], { maxSteps: 1500, eta: 0.03, maxTime: lead + dtb + tTrans * 1.8 });
     let c = Math.abs(p.moonMinDist - target);
     if (p.moonMinDist < MOON.radius) c += 3e6; // 撞月
-    return c;
+    return c + Math.abs(dn) * 30;
   };
-  let bestT = dt;
-  let bestDv = dv0;
-  let best = cost(bestT, bestDv);
-  let stepT = 240;
-  let stepDv = 24;
-  for (let iter = 0; iter < 7; iter++) {
+  let bT = 0;
+  let bDv = dv0;
+  let bN = 0;
+  let best = cost(bT, bDv, bN);
+  let sT = 240;
+  let sDv = 24;
+  let sN = 30;
+  for (let iter = 0; iter < 8; iter++) {
     let improved = true;
     let guard = 0;
     while (improved && guard++ < 30) {
       improved = false;
-      for (const [dT, dD] of [
-        [stepT, 0],
-        [-stepT, 0],
-        [0, stepDv],
-        [0, -stepDv],
-        [stepT, stepDv],
-        [-stepT, -stepDv],
-        [stepT, -stepDv],
-        [-stepT, stepDv],
+      for (const [dT, dD, dN] of [
+        [sT, 0, 0],
+        [-sT, 0, 0],
+        [0, sDv, 0],
+        [0, -sDv, 0],
+        [sT, sDv, 0],
+        [-sT, -sDv, 0],
+        [sT, -sDv, 0],
+        [-sT, sDv, 0],
+        [0, 0, sN],
+        [0, 0, -sN],
       ]) {
-        const nt = bestT + dT;
-        if (nt < 60) continue;
-        const c = cost(nt, bestDv + dD);
+        const nt = bT + dT;
+        if (lead + nt < 30) continue;
+        const c = cost(nt, bDv + dD, bN + dN);
         if (c < best) {
           best = c;
-          bestT = nt;
-          bestDv += dD;
+          bT = nt;
+          bDv += dD;
+          bN += dN;
           improved = true;
         }
       }
     }
-    stepT /= 2.5;
-    stepDv /= 2.5;
+    sT /= 2.5;
+    sDv /= 2.5;
+    sN /= 2.5;
   }
-  const ok = best < 400_000;
+  const nodeT = t + lead + bT;
+  const miss = best - Math.abs(bN) * 30;
+  const ok = miss < 400_000;
+  const wait = nodeT - s.t;
+  const waitTxt = wait > 1.5 * Ts ? `，发射窗口在 ${fmtWait(wait)} 后（可用时间加速）` : '';
   return {
-    node: { t: s.t + bestT, dv: new Vector3(bestDv, 0, 0) },
-    msg: ok ? `奔月转移：Δv ${bestDv.toFixed(0)} m/s，预计近月点 ${((best + target - MOON.radius) / 1000).toFixed(0)} km` : '未找到精确的月球交会，已给出近似方案，请手动微调。',
+    node: { t: nodeT, dv: new Vector3(bDv, bN, 0) },
+    msg: ok
+      ? `奔月转移：Δv ${Math.hypot(bDv, bN).toFixed(0)} m/s，预计近月点 ${((miss + target - MOON.radius) / 1000).toFixed(0)} km${waitTxt}`
+      : `未找到精确的月球交会，已给出近似方案，请手动微调${waitTxt}。`,
   };
+}
+
+function fmtWait(s: number): string {
+  const h = s / 3600;
+  return h >= 24 ? `${(h / 24).toFixed(1)} 天` : h >= 1 ? `${h.toFixed(1)} 小时` : `${(s / 60).toFixed(0)} 分钟`;
 }
 
 /** 月球捕获：在近月点减速进入环月轨道。 */
@@ -162,72 +221,174 @@ export function solveCapture(s: StateVec, currentPrediction?: { events: { type: 
   return { node: { t: ev.t, dv: new Vector3(vc - vPe, 0, 0) }, msg: `月球捕获：在近月点减速 ${(vPe - vc).toFixed(0)} m/s` };
 }
 
-/** 返回地球：从环月轨道出发，使地球近地点落在大气层内（约 35 km）。 */
+/**
+ * 返回地球：从环月轨道出发，使地球近地点落在大气层内（约 35 km）。
+ * 1. 逃逸渐近线需大致指向月球公转速度的反方向（相对地球几乎“停住”，才会落回地球）。
+ *    环月轨道有倾角时，这个方向大约每半个月才落进轨道面一次，所以先扫描返回窗口。
+ * 2. 从窗口前约 1/3 圈的数值状态出发，用三体积分精修点火时刻、顺行与法向 Δv。
+ */
 export function solveReturn(s: StateVec, targetAlt = 35_000): SolveResult {
   const body = dominantBody(s.r, s.t);
   if (body.id !== 'moon') return { node: null, msg: '需要先处于环月轨道上。' };
   const { r, v } = relState(s, MOON);
   const o = computeOrbit(r, v, MOON);
   if (o.hyperbolic) return { node: null, msg: '当前已是逃逸轨道。' };
-  const period = o.period;
+  const T = o.period;
+  // 所需双曲线剩余速度：月球轨道速度减去“远地点在月球轨道、近地点在大气层”的椭圆远地点速度
+  const rpE = EARTH.radius + targetAlt;
+  const vMoon = Math.sqrt(EARTH.mu / MOON_ORBIT.a);
+  const vApo = Math.sqrt((2 * EARTH.mu * rpE) / (MOON_ORBIT.a * (MOON_ORBIT.a + rpE)));
+  const vInf = vMoon - vApo;
   const rr = r.length();
-  const vInf = 262;
   const dvEst = Math.sqrt((2 * MOON.mu) / rr + vInf * vInf) - v.length();
-  const cost = (tb: number, dv: number) => {
-    const p = predict(s.r, s.v, s.t, [{ t: s.t + tb, dv: new Vector3(dv, 0, 0) }], { maxSteps: 1800, eta: 0.03, maxTime: tb + 5 * 86400 / 3.16 });
-    if (p.impact && p.impact.body.id === 'moon') return 5e7;
-    if (!p.earthPeAfterMoon) {
-      // 未返回：按与地球的最近距离给出连续代价
-      return 2e7 + (p.impact ? 0 : 1e6);
-    }
-    return Math.abs(p.earthPeAfterMoon.alt - targetAlt);
+  // 渐近线位于点火点前方 nuInf 处；飞出影响球期间月球继续公转
+  const nuInf = Math.acos(-1 / (1 + (rr * vInf * vInf) / MOON.mu));
+  const tExit = (0.8 * MOON.soi) / vInf;
+  const cosNu = Math.cos(nuInf);
+  const sinNu = Math.sin(nuInf);
+  const mv = new Vector3();
+  /** 以 (rHat, qHat) 所在平面的圆轨道近似，返回 tb 后点火时渐近线与理想方向的夹角。 */
+  const makeErr = (rHat: Vector3, qHat: Vector3, n: number, tRef: number) => (tb: number) => {
+    const a = n * tb;
+    const c = Math.cos(a);
+    const sn = Math.sin(a);
+    // 点火点 p = r̂c + q̂s；h×p = q̂c − r̂s；渐近线 = p·cosν + (h×p)·sinν
+    const ax = (rHat.x * c + qHat.x * sn) * cosNu + (qHat.x * c - rHat.x * sn) * sinNu;
+    const ay = (rHat.y * c + qHat.y * sn) * cosNu + (qHat.y * c - rHat.y * sn) * sinNu;
+    const az = (rHat.z * c + qHat.z * sn) * cosNu + (qHat.z * c - rHat.z * sn) * sinNu;
+    moonVelocity(tRef + tb + tExit, mv).normalize();
+    return Math.acos(Math.max(-1, Math.min(1, -(ax * mv.x + ay * mv.y + az * mv.z))));
   };
+
+  // ---- 1. 返回窗口扫描（最多约半个月）
+  const hHat = o.h.clone().normalize();
+  const rHat0 = r.clone().normalize();
+  const errAt = makeErr(rHat0, new Vector3().crossVectors(hHat, rHat0), (2 * Math.PI) / T, s.t);
+  const step = T / 180;
+  const tEnd = MOON_ORBIT.period * 0.55 + 2 * T;
+  const thr = (8 * Math.PI) / 180;
+  let bestTb = 60;
+  let bestErr = Infinity;
+  let firstTb = -1;
+  let prev = errAt(60);
+  for (let tb = 60 + step; tb < tEnd; tb += step) {
+    const e = errAt(tb);
+    if (e < bestErr) {
+      bestErr = e;
+      bestTb = tb;
+    }
+    if (prev < thr && e > prev) {
+      firstTb = tb - step;
+      break;
+    }
+    prev = e;
+  }
+  const tb0 = firstTb >= 0 ? firstTb : bestTb;
+
+  // ---- 2. 数值推进到窗口前约 1/3 圈，再用当地的密切轨道重新对准点火时刻
+  const t1 = s.t + Math.max(0, tb0 - 0.35 * T);
+  const r1 = s.r.clone();
+  const v1 = s.v.clone();
+  let t = s.t;
+  for (let guard = 0; t < t1 - 1e-6 && guard < 3_000_000; guard++) {
+    const h = Math.min(t1 - t, adaptiveStep(r1, t, 0.01));
+    rk4Step(r1, v1, t, h);
+    t += h;
+  }
+  const loc = relState({ r: r1, v: v1, t }, MOON);
+  const o1 = computeOrbit(loc.r, loc.v, MOON);
+  const rHat1 = loc.r.clone().normalize();
+  const err1 = makeErr(rHat1, new Vector3().crossVectors(o1.h.clone().normalize(), rHat1), (2 * Math.PI) / o1.period, t);
+  let lead = 30;
+  let e1 = Infinity;
+  for (let tb = 30; tb < 30 + o1.period; tb += o1.period / 720) {
+    const e = err1(tb);
+    if (e < e1) {
+      e1 = e;
+      lead = tb;
+    }
+  }
+
+  // ---- 3. 三体精修：点火时刻、顺行 Δv、法向 Δv
+  const cost = (dtb: number, dv: number, dn: number) => {
+    const p = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(dv, dn, 0) }], { maxSteps: 2000, eta: 0.03, maxTime: lead + dtb + (5 * 86400) / 3.16 });
+    if (p.impact && p.impact.body.id === 'moon') return 5e7;
+    let c: number;
+    if (p.earthPeAfterMoon) {
+      c = Math.abs(p.earthPeAfterMoon.alt - targetAlt);
+    } else {
+      // 尚未到达近地点（或直接撞地）：用飞出月球影响球时的二体近地点作为连续代价
+      const ex = p.events.find((e) => e.type === 'soiExit' && e.afterNode && e.vel);
+      if (!ex || !ex.vel) return 4e7 + Math.abs(dv - dvEst) * 1e4;
+      c = Math.abs(computeOrbit(ex.pos, ex.vel, EARTH).pe - rpE);
+    }
+    return c + Math.abs(dn) * 30;
+  };
+  let bT = 0;
+  let bDv = dvEst;
+  let bN = 0;
   let best = Infinity;
-  let bestT = 0;
-  let bestDv = dvEst;
-  const N = 24;
-  for (let i = 0; i < N; i++) {
-    const tb = 60 + (period * i) / N;
-    for (const k of [-40, 0, 40, 80, 140]) {
-      const c = cost(tb, dvEst + k);
-      if (c < best) {
-        best = c;
-        bestT = tb;
-        bestDv = dvEst + k;
+  for (const dT of [-T / 8, -T / 16, 0, T / 16, T / 8]) {
+    if (lead + dT < 20) continue;
+    for (const dD of [-30, 0, 30, 80]) {
+      for (const dN of [-60, 0, 60]) {
+        const c = cost(dT, dvEst + dD, dN);
+        if (c < best) {
+          best = c;
+          bT = dT;
+          bDv = dvEst + dD;
+          bN = dN;
+        }
       }
     }
   }
-  let stepT = period / N / 2;
-  let stepDv = 20;
-  for (let iter = 0; iter < 8; iter++) {
+  let sT = T / 32;
+  let sDv = 16;
+  let sN = 24;
+  for (let iter = 0; iter < 9; iter++) {
     let improved = true;
     let guard = 0;
     while (improved && guard++ < 30) {
       improved = false;
-      for (const [dT, dD] of [
-        [stepT, 0],
-        [-stepT, 0],
-        [0, stepDv],
-        [0, -stepDv],
+      for (const [dT, dD, dN] of [
+        [sT, 0, 0],
+        [-sT, 0, 0],
+        [0, sDv, 0],
+        [0, -sDv, 0],
+        [sT, sDv, 0],
+        [-sT, -sDv, 0],
+        [sT, -sDv, 0],
+        [-sT, sDv, 0],
+        [0, 0, sN],
+        [0, 0, -sN],
       ]) {
-        const nt = bestT + dT;
-        if (nt < 30) continue;
-        const c = cost(nt, bestDv + dD);
+        const nt = bT + dT;
+        if (lead + nt < 20) continue;
+        const c = cost(nt, bDv + dD, bN + dN);
         if (c < best) {
           best = c;
-          bestT = nt;
-          bestDv += dD;
+          bT = nt;
+          bDv += dD;
+          bN += dN;
           improved = true;
         }
       }
     }
-    stepT /= 2.5;
-    stepDv /= 2.5;
+    sT /= 2.5;
+    sDv /= 2.5;
+    sN /= 2.5;
   }
-  const ok = best < 30_000;
+  const nodeT = t + lead + bT;
+  const miss = best - Math.abs(bN) * 30;
+  const dvTot = Math.hypot(bDv, bN);
+  const ok = miss < 30_000 && dvTot < dvEst + 300;
+  const wait = nodeT - s.t;
+  const waitTxt = wait > 1.5 * T ? `，返回窗口在 ${fmtWait(wait)} 后（可用时间加速）` : '';
   return {
-    node: { t: s.t + bestT, dv: new Vector3(bestDv, 0, 0) },
-    msg: ok ? `返回地球：Δv ${bestDv.toFixed(0)} m/s，再入近地点约 ${((targetAlt + (best < 1e6 ? 0 : 0)) / 1000).toFixed(0)} km` : '未找到理想返回轨道，已给出近似方案，请手动微调。',
+    node: { t: nodeT, dv: new Vector3(bDv, bN, 0) },
+    msg: ok
+      ? `返回地球：Δv ${dvTot.toFixed(0)} m/s，再入近地点约 ${(targetAlt / 1000).toFixed(0)} km${waitTxt}`
+      : `未找到理想返回轨道，已给出近似方案，请手动微调${waitTxt}。`,
   };
 }
 

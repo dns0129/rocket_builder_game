@@ -126,8 +126,10 @@ void main() {
   if (cov < 0.02) discard;
   vec3 upW = normalize(uModelRot * normalize(vLocal));
   float muS = dot(upW, uSunDir);
-  vec3 sunT = sunTransmittance(muS) * smoothstep(-0.08, 0.04, muS);
-  float lit = clamp(muS * 0.7 + 0.35, 0.0, 1.0);
+  // 晨昏线附近的云只在很窄的一条带内被夕阳染色，且不过分饱和
+  vec3 sunT = sunTransmittance(muS) * smoothstep(-0.02, 0.08, muS);
+  sunT = mix(sunT, vec3(dot(sunT, vec3(0.2126, 0.7152, 0.0722))), 0.45);
+  float lit = clamp(muS * 0.8 + 0.15, 0.0, 1.0);
   vec3 col = vec3(0.92) * (uSunLight * RECIPROCAL_PI * lit * sunT) + vec3(0.03, 0.04, 0.06) * smoothstep(-0.2, 0.3, muS);
   // 从云层下方看：云底较暗，越厚越暗
   float camR = length(uCamPos - uEarthCenter);

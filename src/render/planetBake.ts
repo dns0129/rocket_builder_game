@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { NOISE_GLSL } from '../physics/noise';
 import { MOON_TERRAIN_GLSL } from '../physics/terrain';
-import { EARTH, MOON } from '../physics/bodies';
+import { EARTH, LAUNCH_SITE, MOON, dirFromLatLon } from '../physics/bodies';
 
 /**
  * 在 GPU 上一次性烘焙程序化星球贴图（等距柱状投影）。
@@ -25,13 +25,7 @@ vec3 dirFromLatLon(float lat, float lon) {
 vec3 srgb(vec3 c) { return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2)); }
 `;
 
-const EARTH_FRAG = /* glsl */ `
-${COMMON}
-${NOISE_GLSL}
-layout(location = 0) out vec4 oColor;
-layout(location = 1) out vec4 oAux;
-layout(location = 2) out vec4 oNormal;
-
+const FBM_GLSL = /* glsl */ `
 float fbm(vec3 p, int oct, uint seed) {
   float s = 0.0;
   float a = 0.5;
@@ -43,16 +37,36 @@ float fbm(vec3 p, int oct, uint seed) {
   }
   return s;
 }
+// 发射场坐标系：发射场方向旋转到 (1,0,0)
+uniform mat3 uSiteRot;
+// 程序化云层（赤道辐合带、副热带少云、西风带多云），发射场上空较晴朗
+float cloudCover(vec3 d, float alat) {
+  vec3 wq = vec3(fbm(d * 2.2, 3, 501u), fbm(d * 2.2 + vec3(7.1), 3, 503u), fbm(d * 2.2 + vec3(3.3), 3, 507u));
+  float cn = fbm(d * 3.2 + wq * 1.6, 8, 511u) * 0.5 + 0.5;
+  float band = 0.5 + 0.22 * exp(-pow(alat / 0.12, 2.0)) - 0.2 * exp(-pow((alat - 0.42) / 0.14, 2.0)) + 0.14 * exp(-pow((alat - 0.95) / 0.2, 2.0));
+  float cov = smoothstep(0.62 - band * 0.28, 0.8 - band * 0.2, cn);
+  vec3 kk = uSiteRot * d - vec3(1.0, 0.0, 0.0);
+  return cov * (1.0 - 0.85 * exp(-dot(kk, kk) / 0.05));
+}
+`;
+
+const EARTH_FRAG = /* glsl */ `
+${COMMON}
+${NOISE_GLSL}
+${FBM_GLSL}
+layout(location = 0) out vec4 oColor;
+layout(location = 1) out vec4 oAux;
+layout(location = 2) out vec4 oNormal;
 
 // 发射场周边：小范围整平
 float launchMask(vec3 d) {
-  vec3 k = d - vec3(1.0, 0.0, 0.0);
+  vec3 k = uSiteRot * d - vec3(1.0, 0.0, 0.0);
   return exp(-dot(k, k) / 0.004);
 }
 // 发射场以西的大陆（发射场位于东海岸，残骸落入东边的海洋）
 float homeContinent(vec3 d) {
   vec3 c = dirFromLatLon(0.05, -0.12);
-  vec3 k = d - c;
+  vec3 k = uSiteRot * d - c;
   return exp(-dot(k, k) / 0.07);
 }
 
@@ -63,7 +77,7 @@ float elevation(vec3 d) {
   float e = c * 1.25 - 0.05;
   e += 0.6 * homeContinent(d);
   // 发射场以东保证是海
-  vec3 ke = d - dirFromLatLon(0.0, 0.2);
+  vec3 ke = uSiteRot * d - dirFromLatLon(0.0, 0.2);
   e -= 0.4 * exp(-dot(ke, ke) / 0.01);
   float lm = launchMask(d);
   e = mix(e, 0.05, lm * 0.97);
@@ -153,17 +167,136 @@ void main() {
     lights = hab * smoothstep(0.55, 0.8, cl * 0.6 + big * 0.55);
     lights = max(lights, lm * 0.6);
   }
-  // 云
-  vec3 wq = vec3(fbm(d * 2.2, 3, 501u), fbm(d * 2.2 + vec3(7.1), 3, 503u), fbm(d * 2.2 + vec3(3.3), 3, 507u));
-  float cn = fbm(d * 3.2 + wq * 1.6, 8, 511u) * 0.5 + 0.5;
-  float band = 0.5 + 0.22 * exp(-pow(alat / 0.12, 2.0)) - 0.2 * exp(-pow((alat - 0.42) / 0.14, 2.0)) + 0.14 * exp(-pow((alat - 0.95) / 0.2, 2.0));
-  float cov = smoothstep(0.62 - band * 0.28, 0.8 - band * 0.2, cn);
-  vec3 kk = d - vec3(1.0, 0.0, 0.0);
-  cov *= 1.0 - 0.85 * exp(-dot(kk, kk) / 0.05);
+  float cov = cloudCover(d, alat);
   float hn = max(e, 0.0);
   oAux = vec4(lights, cov, clamp(hn, 0.0, 1.0), 1.0);
 }
 `;
+
+// ---------------------------------------------------------------- 真实地球贴图
+
+/** 反照率 + 水体遮罩（来自 NASA Blue Marble 与水体遮罩图）。 */
+const EARTH_REAL_COLOR_FRAG = /* glsl */ `
+${COMMON}
+uniform sampler2D uDay;
+uniform sampler2D uWater;
+uniform float uWaterIsWhite;
+layout(location = 0) out vec4 oColor;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = texture(uDay, uv).rgb;
+  float w = texture(uWater, uv).r;
+  if (uWaterIsWhite < 0.5) w = 1.0 - w;
+  float wm = smoothstep(0.3, 0.7, w);
+  // 蓝色大理石中植被区域偏暗，线性空间里只提亮暗色陆地（沙漠、冰原保持原样）
+  vec3 lin = pow(c, vec3(2.2));
+  float l = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+  lin *= mix(1.0, 1.6, (1.0 - smoothstep(0.06, 0.3, l)) * (1.0 - wm));
+  c = pow(lin, vec3(1.0 / 2.2));
+  oColor = vec4(c, wm);
+}
+`;
+
+/** 城市灯光（NASA Black Marble）、云（程序化）、高程与法线（地形起伏图）。 */
+const EARTH_REAL_AUX_FRAG = /* glsl */ `
+${COMMON}
+${NOISE_GLSL}
+${FBM_GLSL}
+uniform sampler2D uNight;
+uniform sampler2D uTopo;
+uniform vec2 uTopoRes;
+uniform float uHScale;
+layout(location = 0) out vec4 oAux;
+layout(location = 1) out vec4 oNormal;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float lon = (uv.x - 0.5) * 2.0 * PI;
+  float lat = (uv.y - 0.5) * PI;
+  vec3 d = dirFromLatLon(lat, lon);
+  vec3 nl = texture(uNight, uv).rgb;
+  // 城市灯光偏暖黄；夜图中陆地的暗蓝底色不算灯光
+  float lum = max(nl.r, nl.g) - nl.b * 0.35;
+  float lights = smoothstep(0.1, 0.65, lum);
+  float cov = cloudCover(d, abs(lat));
+  vec2 tx = 1.0 / uTopoRes;
+  float e = texture(uTopo, uv).r;
+  float eE = texture(uTopo, uv + vec2(tx.x, 0.0)).r;
+  float eW = texture(uTopo, uv - vec2(tx.x, 0.0)).r;
+  float eN = texture(uTopo, uv + vec2(0.0, tx.y)).r;
+  float eS = texture(uTopo, uv - vec2(0.0, tx.y)).r;
+  float dx = 2.0 * (2.0 * PI * ${EARTH.radius.toFixed(1)} / uTopoRes.x) * max(cos(lat), 0.05);
+  float dy = 2.0 * (PI * ${EARTH.radius.toFixed(1)} / uTopoRes.y);
+  vec3 n = normalize(vec3(-(eE - eW) * uHScale / dx, -(eN - eS) * uHScale / dy, 1.0));
+  oNormal = vec4(n * 0.5 + 0.5, 1.0);
+  oAux = vec4(lights, cov, e, 1.0);
+}
+`;
+
+interface EarthSources {
+  day: THREE.Texture;
+  night: THREE.Texture;
+  water: THREE.Texture;
+  topo: THREE.Texture;
+}
+
+/** 真实地球贴图的相对路径（开发时位于 public/，构建后与页面同目录）。 */
+export const EARTH_TEXTURE_FILES = {
+  day: 'textures/earth/day.jpg',
+  night: 'textures/earth/night.jpg',
+  water: 'textures/earth/water.png',
+  topo: 'textures/earth/topo.png',
+};
+/** 水体遮罩中水面为白色。 */
+const WATER_IS_WHITE = true;
+
+function loadTexture(url: string): Promise<THREE.Texture | null> {
+  return new Promise((resolve) => {
+    new THREE.TextureLoader().load(
+      url,
+      (t) => {
+        t.colorSpace = THREE.NoColorSpace;
+        t.wrapS = THREE.RepeatWrapping;
+        t.wrapT = THREE.ClampToEdgeWrapping;
+        t.minFilter = THREE.LinearMipmapLinearFilter;
+        t.magFilter = THREE.LinearFilter;
+        t.anisotropy = 8;
+        resolve(t);
+      },
+      undefined,
+      () => resolve(null),
+    );
+  });
+}
+
+async function loadEarthSources(onProgress: (f: number) => void): Promise<EarthSources | null> {
+  let done = 0;
+  const entries = Object.entries(EARTH_TEXTURE_FILES) as [keyof EarthSources, string][];
+  const results = await Promise.all(
+    entries.map(async ([k, url]) => {
+      const t = await loadTexture(url);
+      onProgress(++done / entries.length);
+      return [k, t] as const;
+    }),
+  );
+  const out: Partial<EarthSources> = {};
+  for (const [k, t] of results) {
+    if (!t) {
+      console.warn(`地球贴图 ${EARTH_TEXTURE_FILES[k]} 加载失败，改用程序化生成的地球。`);
+      for (const [, t2] of results) t2?.dispose();
+      return null;
+    }
+    out[k] = t;
+  }
+  return out as EarthSources;
+}
+
+/** 发射场坐标系旋转矩阵：把发射场方向转到 (1,0,0)，北向转到 (0,1,0)。 */
+function siteRotation(): THREE.Matrix3 {
+  const up = dirFromLatLon(LAUNCH_SITE.lat, LAUNCH_SITE.lon);
+  const north = new THREE.Vector3(0, 1, 0).addScaledVector(up, -up.y).normalize();
+  const east = new THREE.Vector3().crossVectors(north, up).normalize();
+  return new THREE.Matrix3().set(up.x, up.y, up.z, north.x, north.y, north.z, -east.x, -east.y, -east.z);
+}
 
 const MOON_FRAG = /* glsl */ `
 ${COMMON}
@@ -232,36 +365,104 @@ export async function bakePlanets(
   renderer: THREE.WebGLRenderer,
   quality: 'low' | 'medium' | 'high',
   onProgress: (f: number) => void,
-): Promise<PlanetMaps> {
-  const ew = quality === 'high' ? 4096 : quality === 'medium' ? 2048 : 1024;
-  const mw = quality === 'high' ? 2048 : quality === 'medium' ? 2048 : 1024;
-  const earthRT = makeTarget(ew, ew / 2, 3);
-  const moonRT = makeTarget(mw, mw / 2, 2);
+): Promise<PlanetMaps & { realEarth: boolean }> {
+  // 进度：前 35% 下载真实地球贴图，其余为 GPU 烘焙
+  const src = await loadEarthSources((f) => onProgress(f * 0.35));
+  const bakeProgress = (f: number) => onProgress(0.35 + f * 0.65);
+  const maxTex = renderer.capabilities.maxTextureSize;
+  const mw = quality === 'low' ? 1024 : 2048;
   const scene = new THREE.Scene();
   const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
   quad.frustumCulled = false;
   scene.add(quad);
-  const earthMat = new THREE.RawShaderMaterial({
-    glslVersion: THREE.GLSL3,
-    vertexShader: VERT,
-    fragmentShader: EARTH_FRAG,
-    uniforms: { uRes: { value: new THREE.Vector2(ew, ew / 2) } },
+  const siteRot = { value: siteRotation() };
+
+  const jobs: { rt: THREE.WebGLRenderTarget; mat: THREE.RawShaderMaterial; w: number; h: number }[] = [];
+  let earthColor: THREE.Texture;
+  let earthAux: THREE.Texture;
+  let earthNormal: THREE.Texture;
+  let readSource: THREE.Texture;
+  if (src) {
+    // 真实地球：颜色分辨率跟随原图（受画质与显卡上限约束），辅助图用一半分辨率
+    const srcW = (src.day.image as { width: number }).width;
+    const cw = Math.min(srcW, maxTex, quality === 'low' ? 2048 : 4096);
+    const colorW = Math.pow(2, Math.floor(Math.log2(cw)));
+    const auxW = Math.max(1024, colorW / 2);
+    const topoImg = src.topo.image as { width: number; height: number };
+    const colorRT = makeTarget(colorW, colorW / 2, 1);
+    const auxRT = makeTarget(auxW, auxW / 2, 2);
+    jobs.push({
+      rt: colorRT,
+      w: colorW,
+      h: colorW / 2,
+      mat: new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: VERT,
+        fragmentShader: EARTH_REAL_COLOR_FRAG,
+        uniforms: {
+          uRes: { value: new THREE.Vector2(colorW, colorW / 2) },
+          uDay: { value: src.day },
+          uWater: { value: src.water },
+          uWaterIsWhite: { value: WATER_IS_WHITE ? 1 : 0 },
+        },
+      }),
+    });
+    jobs.push({
+      rt: auxRT,
+      w: auxW,
+      h: auxW / 2,
+      mat: new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: VERT,
+        fragmentShader: EARTH_REAL_AUX_FRAG,
+        uniforms: {
+          uRes: { value: new THREE.Vector2(auxW, auxW / 2) },
+          uNight: { value: src.night },
+          uTopo: { value: src.topo },
+          uTopoRes: { value: new THREE.Vector2(topoImg.width, topoImg.height) },
+          uHScale: { value: 2500 },
+          uSiteRot: siteRot,
+        },
+      }),
+    });
+    earthColor = colorRT.textures[0];
+    [earthAux, earthNormal] = auxRT.textures;
+    readSource = earthColor;
+  } else {
+    const ew = quality === 'high' ? 4096 : quality === 'medium' ? 2048 : 1024;
+    const earthRT = makeTarget(ew, ew / 2, 3);
+    jobs.push({
+      rt: earthRT,
+      w: ew,
+      h: ew / 2,
+      mat: new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: VERT,
+        fragmentShader: EARTH_FRAG,
+        uniforms: { uRes: { value: new THREE.Vector2(ew, ew / 2) }, uSiteRot: siteRot },
+      }),
+    });
+    [earthColor, earthAux, earthNormal] = earthRT.textures;
+    readSource = earthColor;
+  }
+  const moonRT = makeTarget(mw, mw / 2, 2);
+  jobs.push({
+    rt: moonRT,
+    w: mw,
+    h: mw / 2,
+    mat: new THREE.RawShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      vertexShader: VERT,
+      fragmentShader: MOON_FRAG,
+      uniforms: { uRes: { value: new THREE.Vector2(mw, mw / 2) }, uMaxLevel: { value: quality === 'low' ? 3 : 4 } },
+    }),
   });
-  const moonMat = new THREE.RawShaderMaterial({
-    glslVersion: THREE.GLSL3,
-    vertexShader: VERT,
-    fragmentShader: MOON_FRAG,
-    uniforms: { uRes: { value: new THREE.Vector2(mw, mw / 2) }, uMaxLevel: { value: quality === 'low' ? 3 : 4 } },
-  });
+
   const prevTarget = renderer.getRenderTarget();
   const prevAuto = renderer.autoClear;
   renderer.autoClear = false;
   const strips = quality === 'low' ? 4 : 16;
-  const jobs: { rt: THREE.WebGLRenderTarget; mat: THREE.Material; w: number; h: number }[] = [
-    { rt: earthRT, mat: earthMat, w: ew, h: ew / 2 },
-    { rt: moonRT, mat: moonMat, w: mw, h: mw / 2 },
-  ];
   const total = jobs.length * strips;
   let done = 0;
   for (const job of jobs) {
@@ -274,7 +475,7 @@ export async function bakePlanets(
       job.rt.scissorTest = true;
       renderer.render(scene, cam);
       done++;
-      onProgress(done / total);
+      bakeProgress(done / total);
       await new Promise((r) => requestAnimationFrame(() => r(null)));
     }
     job.rt.scissorTest = false;
@@ -283,11 +484,11 @@ export async function bakePlanets(
   renderer.autoClear = prevAuto;
 
   // 读回水体遮罩（降采样）供物理判断溅落
-  const readW = Math.min(ew, 1024);
+  const readW = 2048;
   const readH = readW / 2;
   const small = new THREE.WebGLRenderTarget(readW, readH, { type: THREE.UnsignedByteType, depthBuffer: false });
   const copyMat = new THREE.ShaderMaterial({
-    uniforms: { map: { value: earthRT.textures[0] } },
+    uniforms: { map: { value: readSource } },
     vertexShader: 'varying vec2 vUv; void main(){ vUv = position.xy*0.5+0.5; gl_Position = vec4(position.xy,0.0,1.0); }',
     fragmentShader: 'uniform sampler2D map; varying vec2 vUv; void main(){ gl_FragColor = texture2D(map, vUv); }',
   });
@@ -301,13 +502,12 @@ export async function bakePlanets(
   for (let i = 0; i < readW * readH; i++) waterMask[i] = px[i * 4 + 3];
   small.dispose();
   copyMat.dispose();
-  earthMat.dispose();
-  moonMat.dispose();
+  for (const j of jobs) j.mat.dispose();
   quad.geometry.dispose();
+  if (src) for (const t of Object.values(src)) t.dispose();
 
-  const [earthColor, earthAux, earthNormal] = earthRT.textures;
   const [moonColor, moonNormal] = moonRT.textures;
-  return { earthColor, earthAux, earthNormal, moonColor, moonNormal, waterMask, waterW: readW, waterH: readH };
+  return { earthColor, earthAux, earthNormal, moonColor, moonNormal, waterMask, waterW: readW, waterH: readH, realEarth: !!src };
 }
 
 export function sampleWater(maps: PlanetMaps, dir: THREE.Vector3): boolean {

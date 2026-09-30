@@ -111,6 +111,50 @@ export function orbitPositionAt(o: OrbitInfo, nu: number, out = new Vector3()): 
   return out.copy(P).multiplyScalar(r * Math.cos(nu)).addScaledVector(Q, r * Math.sin(nu));
 }
 
+/**
+ * 二体开普勒外推（仅椭圆轨道），原地更新相对中心天体的 r, v。
+ * 用于把轨迹预测快速推进到很远之后的机动节点（地图显示用）。
+ */
+export function keplerPropagate(r: Vector3, v: Vector3, mu: number, dt: number): boolean {
+  const rl = r.length();
+  const h = new Vector3().crossVectors(r, v);
+  const hl = h.length();
+  const energy = v.lengthSq() / 2 - mu / rl;
+  if (energy >= 0 || hl < 1e-6) return false;
+  const a = -mu / (2 * energy);
+  const eVec = new Vector3().crossVectors(v, h).divideScalar(mu).sub(r.clone().divideScalar(rl));
+  let e = eVec.length();
+  let P: Vector3;
+  let nu0: number;
+  if (e < 1e-7) {
+    e = 0;
+    P = r.clone().divideScalar(rl);
+    nu0 = 0;
+  } else {
+    P = eVec.clone().divideScalar(e);
+    nu0 = Math.acos(Math.max(-1, Math.min(1, P.dot(r) / rl)));
+    if (r.dot(v) < 0) nu0 = 2 * Math.PI - nu0;
+  }
+  const Q = new Vector3().crossVectors(h, P).normalize();
+  const n = Math.sqrt(mu / (a * a * a));
+  const E0 = 2 * Math.atan2(Math.sqrt(1 - e) * Math.sin(nu0 / 2), Math.sqrt(1 + e) * Math.cos(nu0 / 2));
+  const M = E0 - e * Math.sin(E0) + n * dt;
+  let E = M;
+  for (let i = 0; i < 30; i++) {
+    const f = E - e * Math.sin(E) - M;
+    const d = f / (1 - e * Math.cos(E));
+    E -= d;
+    if (Math.abs(d) < 1e-12) break;
+  }
+  const nu = 2 * Math.atan2(Math.sqrt(1 + e) * Math.sin(E / 2), Math.sqrt(1 - e) * Math.cos(E / 2));
+  const p = (hl * hl) / mu;
+  const rr = a * (1 - e * Math.cos(E));
+  const vk = Math.sqrt(mu / p);
+  r.copy(P).multiplyScalar(rr * Math.cos(nu)).addScaledVector(Q, rr * Math.sin(nu));
+  v.copy(P).multiplyScalar(-vk * Math.sin(nu)).addScaledVector(Q, vk * (e + Math.cos(nu)));
+  return true;
+}
+
 /** 圆轨道速度。 */
 export function circularSpeed(mu: number, r: number): number {
   return Math.sqrt(mu / r);

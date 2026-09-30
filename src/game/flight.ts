@@ -9,8 +9,10 @@ import {
   bodyPosition,
   bodyRotation,
   bodyVelocity,
+  dirFromLatLon,
   dominantBody,
   fromBodyFixed,
+  LAUNCH_SITE,
   gravityAccel,
   machDragFactor,
   speedOfSound,
@@ -162,9 +164,12 @@ export class FlightSim {
   private setupScenario(sc: Scenario): void {
     const V = this.vessel;
     if (sc === 'pad') {
-      const up = new Vector3(1, 0, 0);
-      const west = new Vector3(0, 0, 1);
-      const south = new Vector3(0, -1, 0);
+      // 发射场的当地地平坐标（惯性系，t = 0）
+      const up = fromBodyFixed(EARTH, 0, dirFromLatLon(LAUNCH_SITE.lat, LAUNCH_SITE.lon)).normalize();
+      const north = new Vector3(0, 1, 0).addScaledVector(up, -up.y).normalize();
+      const east = new Vector3().crossVectors(north, up).normalize();
+      const west = east.clone().negate();
+      const south = north.clone().negate();
       V.q.setFromRotationMatrix(new Matrix4().makeBasis(south, up, west));
       const b = V.bounds();
       V.r.copy(up).multiplyScalar(EARTH.radius + (V.com.y - b.minY) - 0.01);
@@ -295,7 +300,7 @@ export class FlightSim {
     if (a < 3000 * s + 2000) return PHYS_WARP_MAX;
     if (a < 20_000 * s) return 5;
     if (a < 60_000 * s) return 6;
-    if (a < 250_000 * s) return 7;
+    // 等待奔月发射窗口可能需要数天，近地轨道也允许 ×10000
     if (a < 2_000_000 * s) return 8;
     return 9;
   }

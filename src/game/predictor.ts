@@ -1,7 +1,7 @@
 import { Vector3 } from 'three';
 import { EARTH, MOON, MOON_ORBIT, type Body, bodyPosition, bodyVelocity, dominantBody } from '../physics/bodies';
 import { adaptiveStep, rk4Step } from '../physics/integrate';
-import { computeOrbit } from '../physics/orbit';
+import { computeOrbit, keplerPropagate } from '../physics/orbit';
 
 export interface NodeSpec {
   t: number;
@@ -110,8 +110,39 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
   let prevRdot = NaN;
   let apsisCount = 0;
   let sinceNodeOrSoi = 0;
+  // 远期机动节点：先画一整圈当前轨道，再用开普勒外推跳到节点前半圈
+  const tStart = t;
+  const closedPeriod = (() => {
+    bodyPosition(body, t, _bp);
+    bodyVelocity(body, t, _bv);
+    const o = computeOrbit(_rel.subVectors(r, _bp), _vrel.subVectors(v, _bv), body);
+    const limit = body.id === 'moon' ? MOON.soi : MOON_ORBIT.a - MOON.soi * 1.5;
+    return !o.hyperbolic && o.ap < limit ? o.period : Infinity;
+  })();
+  let jumped = false;
 
   for (let step = 0; step < maxSteps; step++) {
+    if (!jumped && pending.length && isFinite(closedPeriod) && t - tStart >= closedPeriod && pending[0].t - t > 0.6 * closedPeriod) {
+      jumped = true;
+      const target = pending[0].t - 0.5 * closedPeriod;
+      bodyPosition(body, t, _bp);
+      bodyVelocity(body, t, _bv);
+      const rr = r.clone().sub(_bp);
+      const vv = v.clone().sub(_bv);
+      if (keplerPropagate(rr, vv, body.mu, target - t)) {
+        t = target;
+        bodyPosition(body, t, _bp);
+        bodyVelocity(body, t, _bv);
+        r.copy(rr).add(_bp);
+        v.copy(vv).add(_bv);
+        seg = { body, pts: [], times: [], afterNode };
+        segments.push(seg);
+        pushPoint();
+        prevRdot = NaN;
+        sinceNodeOrSoi = 0;
+        continue;
+      }
+    }
     let h = adaptiveStep(r, t, eta);
     h = Math.min(h, Math.max(1, horizon / 60));
     let hitNode = false;
@@ -136,7 +167,7 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
 
     if (nb !== body) {
       pushPoint();
-      events.push({ type: nb.id === 'moon' ? 'soiEnter' : 'soiExit', t, body: nb, pos: _rel.clone(), alt: dist - nb.radius, afterNode });
+      events.push({ type: nb.id === 'moon' ? 'soiEnter' : 'soiExit', t, body: nb, pos: _rel.clone(), vel: _vrel.clone(), alt: dist - nb.radius, afterNode });
       body = nb;
       if (nb.id === 'moon') visitedMoon = true;
       seg = { body, pts: [], times: [], afterNode };

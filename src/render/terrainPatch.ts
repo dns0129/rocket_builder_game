@@ -11,6 +11,20 @@ import { groundDetail } from './textures';
  * 半径按几何级数增长，越靠近中心越精细（天然的 LOD）。
  * 顶点在 CPU 上以双精度计算、相对网格中心存储，避免远离原点时的浮点抖动。
  */
+/**
+ * 近处地表调色：卫星图 1 像素约 1 km，植被区域在近处显得灰暗发青，容易被看成海面。
+ * 只对暗色陆地提亮、加一点暖色和饱和度，远处逐渐过渡回原图。
+ */
+const EARTH_NEAR_GRADE = /* glsl */ `
+        {
+          float nearF = (1.0 - smoothstep(3000.0, 20000.0, vDist)) * (1.0 - waterMask);
+          vec3 cc = diffuseColor.rgb;
+          float l = dot(cc, vec3(0.2126, 0.7152, 0.0722));
+          float k = 1.0 - smoothstep(0.06, 0.3, l);
+          vec3 veg = max(vec3(l) + (cc - vec3(l)) * 1.3, 0.0) * vec3(1.35, 1.05, 0.7) * 1.9;
+          diffuseColor.rgb = mix(cc, veg, nearF * k);
+        }`;
+
 export class TerrainPatch {
   mesh: THREE.Mesh;
   body: Body | null = null;
@@ -201,7 +215,7 @@ function makeGroundMaterial(map: THREE.Texture, detail: THREE.Texture, detailNor
         diffuseColor.rgb *= mix(vec3(1.0), det, detFade * (1.0 - waterMask));
         diffuseColor.rgb *= mix(vec3(1.0), det2, (0.35 + 0.4 * detFade) * (1.0 - waterMask));
         diffuseColor.rgb *= mix(vec3(1.0), det3, 0.55 * (1.0 - waterMask));
-        ${earth ? '' : 'diffuseColor.rgb *= 1.05;'}`,
+        ${earth ? EARTH_NEAR_GRADE : 'diffuseColor.rgb *= 1.05;'}`,
       )
       .replace(
         '#include <roughnessmap_fragment>',

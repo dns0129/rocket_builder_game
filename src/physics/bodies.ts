@@ -80,6 +80,22 @@ export const MOON_ORBIT = {
 
 export const BODIES: Body[] = [EARTH, MOON];
 
+const DEG = Math.PI / 180;
+
+/**
+ * 发射场：海南文昌（取略靠内陆的位置，保证在 1:10 地球的贴图上落在陆地）。
+ * 纬度 19.6°，向正东发射得到约 19.6° 倾角的停泊轨道。
+ */
+export const LAUNCH_SITE = { name: '文昌航天发射场', lat: 19.6 * DEG, lon: 110.8 * DEG };
+
+/** 经纬度 -> 天体固连系单位向量（经度向东为正，对应 -Z 方向）。 */
+export function dirFromLatLon(lat: number, lon: number, out = new Vector3()): Vector3 {
+  return out.set(Math.cos(lat) * Math.cos(lon), Math.sin(lat), -Math.cos(lat) * Math.sin(lon));
+}
+
+/** t=0 时地球的自转角：让发射场位于惯性系方位角 0 处（太阳位于其东侧，当地为上午）。 */
+const EARTH_ROT0 = -LAUNCH_SITE.lon;
+
 /** 太阳方向（惯性系，固定）。发射场在 t=0 时处于上午。 */
 export const SUN_DIR = new Vector3(Math.cos(0.75), 0.18, -Math.sin(0.75)).normalize();
 
@@ -108,7 +124,7 @@ export function bodyVelocity(body: Body, t: number, out = new Vector3()): Vector
 
 /** 天体自转角：天体固连系 -> 惯性系 为绕 Y 轴旋转该角度。 */
 export function bodyRotation(body: Body, t: number): number {
-  if (body.id === 'earth') return body.rotationRate * t;
+  if (body.id === 'earth') return body.rotationRate * t + EARTH_ROT0;
   // 月球 +X 轴始终指向地球
   return moonAngle(t) + Math.PI;
 }

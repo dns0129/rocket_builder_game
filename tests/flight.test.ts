@@ -98,8 +98,10 @@ describe('full lunar mission', () => {
     sim.refreshPrediction();
     log('after TLI: moonMin', ((sim.prediction!.moonMinDist - MOON.radius) / 1000).toFixed(0), 'km', 'stage', sim.vessel.stageIndex);
     // 中途修正
+    // 滑行一段时间（按游戏时间计）再做中途修正
+    const tCoast = sim.t + 20_000;
     sim.setWarp(8);
-    run(sim, 100, 1 / 30);
+    run(sim, 600, 1 / 30, () => sim.t > tCoast);
     sim.warpIndex = 0;
     execCorrection(sim, 'moon', 40_000);
     log('after MCC: moonMin', ((sim.prediction!.moonMinDist - MOON.radius) / 1000).toFixed(1), 'km');
