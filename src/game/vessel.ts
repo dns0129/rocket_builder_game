@@ -1,5 +1,5 @@
 import { Quaternion, Vector3 } from 'three';
-import { G0 } from '../physics/bodies';
+import { G0, type Body } from '../physics/bodies';
 import { getPart } from '../rocket/parts';
 import type { Layout, PlacedPart, RocketDesign, StagePlan } from '../rocket/design';
 import { layoutDesign, nodeMasses } from '../rocket/design';
@@ -16,6 +16,7 @@ export interface RuntimePart {
   throttleEff: number; // 当前实际节流 0..1
   thrustNow: number; // 当前推力 N
   center: Vector3; // 船体系质心位置
+  igniteDelay?: number; // 分离后延迟点火的剩余时间 s（先让废弃级拉开距离）
 }
 
 export interface ContactPoint {
@@ -348,7 +349,7 @@ export class Vessel {
       const e = rp.p.def.engine;
       rp.thrustNow = 0;
       rp.throttleEff = 0;
-      if (!e || !rp.ignited || rp.flameout || !enabled) continue;
+      if (!e || !rp.ignited || rp.flameout || !enabled || (rp.igniteDelay ?? 0) > 0) continue;
       let thr: number;
       if (!e.throttleable) thr = 1;
       else thr = this.throttle <= 0 ? 0 : e.minThrottle + (1 - e.minThrottle) * this.throttle;
@@ -594,6 +595,16 @@ export class Debris {
   age = 0;
   alive = true;
   id: number;
+  /** stage：级间分离的下面级；booster：捆绑助推器 */
+  kind: 'stage' | 'booster' = 'stage';
+  /** 分离火箭：剩余工作时间 s、加速度 m/s²、推力方向（残骸船体系） */
+  motorT = 0;
+  motorAcc = 0;
+  motorDir = new Vector3(0, -1, 0);
+  /** 在地面上分离（例如月面起飞）时，下面级静止在原地：天体固连坐标与姿态 */
+  rest: Body | null = null;
+  restPos = new Vector3();
+  restQ = new Quaternion();
   static nextId = 1;
   constructor(parts: RuntimePart[]) {
     this.parts = parts;

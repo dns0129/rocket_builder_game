@@ -7,6 +7,7 @@ import { TerrainPatch } from './terrainPatch';
 import { LaunchPad } from './launchpad';
 import { VesselView } from './vesselView';
 import { Particles, ReentryGlow } from './effects';
+import { SeparationFx } from './separation';
 import { MapView } from './mapView';
 import type { RenderEngine } from './engine';
 
@@ -25,6 +26,7 @@ export class FlightScene {
   debrisViews = new Map<number, THREE.Group>();
   particles = new Particles();
   glow = new ReentryGlow();
+  sepFx: SeparationFx;
   sun: THREE.DirectionalLight;
   hemi: THREE.HemisphereLight;
   engineLight: THREE.PointLight;
@@ -48,6 +50,8 @@ export class FlightScene {
   private envTimer = 99;
   private envRT: THREE.WebGLRenderTarget | null = null;
   private emitAcc = new Map<string, number>();
+  /** 上一帧正在工作的发动机（用于点火闪光） */
+  private firing = new Set<string>();
   private vesselHidden = false;
   shake = 0;
 
@@ -67,6 +71,7 @@ export class FlightScene {
     this.vesselView = new VesselView(sim.vessel.layout);
     this.scene.add(this.vesselView.group);
     this.particles.addTo(this.scene);
+    this.sepFx = new SeparationFx(this.scene, this.particles, sim);
     this.scene.add(this.glow.mesh);
     this.camDist = Math.max(12, height * 1.6);
 
@@ -112,14 +117,16 @@ export class FlightScene {
           const g = this.vesselView.detach(d.parts.map((p) => p.key));
           this.scene.add(g);
           this.debrisViews.set(d.id, g);
+          this.sepFx.onDecouple(d, g, this.vesselView);
         }
-        this.shake = Math.max(this.shake, 0.25);
+        this.shake = Math.max(this.shake, 0.45);
       } else if (e.type === 'debrisGone' && e.debrisId !== undefined) {
         const g = this.debrisViews.get(e.debrisId);
         if (g) {
           this.scene.remove(g);
           this.debrisViews.delete(e.debrisId);
         }
+        this.sepFx.onDebrisGone(e.debrisId);
       } else if (e.type === 'explosion' && e.pos) {
         const body = dominantBody(e.pos, sim.t);
         const alt = e.pos.distanceTo(bodyPosition(body, sim.t, new THREE.Vector3())) - body.radius;
@@ -200,6 +207,8 @@ export class FlightScene {
     const tel = sim.telemetry;
     const t = sim.t;
     this.time += dtReal;
+    // 粒子与模拟使用同一时间步长（低帧率时模拟会限制步长，否则烟雾会跑到火箭前面）
+    const fxDt = Math.min(sim.lastSimDt, 0.25);
 
     // 浮动原点
     const earthPos = new THREE.Vector3();
@@ -277,6 +286,7 @@ export class FlightScene {
       g.position.copy(o).sub(origin);
       g.quaternion.copy(d.q);
     }
+    this.sepFx.update(fxDt, this.time, origin);
 
     // 尾焰、灯光、烟
     const pAlt = tel.alt;
@@ -291,6 +301,20 @@ export class FlightScene {
       if (!rp) continue;
       const eng = rp.p.def.engine;
       const thr = rp.thrustNow > 0 ? rp.throttleEff : 0;
+      // 尾翼方向舵随控制指令偏转（最大 20°）
+      if (pv.visual.flaps.length) {
+        const off = pv.placed.radial ? pv.placed.angle : 0;
+        const k = Math.min(1, dtReal * 12);
+        for (const f of pv.visual.flaps) {
+          const a = f.angle + off;
+          const target = 0.35 * Math.max(-1, Math.min(1, -(cmd.x * Math.cos(a) + cmd.z * Math.sin(a)) - 0.5 * cmd.y));
+          f.rot.rotation.x += (target - f.rot.rotation.x) * k;
+        }
+      }
+      // 点火瞬间的闪光
+      if (thr > 0 && !this.firing.has(key)) this.ignitionFlash(pv, rp.thrustNow, V.v, body);
+      if (thr > 0) this.firing.add(key);
+      else this.firing.delete(key);
       for (let i = 0; i < pv.plumes.length; i++) {
         pv.plumes[i].update(thr, pRatio, this.time + i * 1.7);
         const bell = pv.visual.bells[i];
@@ -305,7 +329,7 @@ export class FlightScene {
         }
       }
       totalThrust += rp.thrustNow;
-      if (thr > 0 && eng) this.emitExhaust(key, rp.thrustNow, eng.plume, pv, dtReal * Math.min(sim.warp, 4), body);
+      if (thr > 0 && eng) this.emitExhaust(key, rp.thrustNow, eng.plume, pv, fxDt, body);
     }
     if (lightW > 0) {
       lightPos.divideScalar(lightW);
@@ -337,7 +361,7 @@ export class FlightScene {
     const windBody = body;
     const windTmp = new THREE.Vector3();
     this.particles.update(
-      dtReal * Math.min(sim.warp, 4),
+      fxDt,
       origin,
       (x, y, z, out) => {
         windTmp.set(x, y, z);
@@ -373,6 +397,23 @@ export class FlightScene {
   }
 
   private smokeLight = new THREE.Color(1, 1, 1);
+
+  private ignitionFlash(pv: { plumes: { group: THREE.Object3D; radius: number }[] }, thrust: number, vel: THREE.Vector3, body: typeof EARTH): void {
+    const fwd = UP.clone().applyQuaternion(this.sim.vessel.q);
+    const tel = this.sim.telemetry;
+    const inAir = !!body.atmosphere && tel.density > 0.01;
+    const p = new THREE.Vector3();
+    for (const pl of pv.plumes) {
+      pl.group.getWorldPosition(p);
+      p.add(this.origin);
+      const r = pl.radius;
+      for (let i = 0; i < 14; i++) {
+        const jitter = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(r * 14);
+        this.particles.emit({ pos: p.clone(), vel: vel.clone().addScaledVector(fwd, -(10 + Math.random() * 30)).add(jitter), life: 0.25 + Math.random() * 0.3, size0: r * 1.6, size1: r * 4, color: new THREE.Color(10, 7, 3.5), alpha: 1, drag: inAir ? 2 : 0, glow: true, cool: true });
+      }
+    }
+    this.shake = Math.max(this.shake, Math.min(0.4, 0.1 + thrust / 4e6));
+  }
 
   private emitExhaust(key: string, thrust: number, kind: string, pv: { visual: { bells: { pivot: THREE.Object3D; radius: number }[] } }, dt: number, body: typeof EARTH): void {
     const sim = this.sim;

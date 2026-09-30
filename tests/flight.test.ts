@@ -52,6 +52,79 @@ describe('orbital mechanics', () => {
   });
 });
 
+describe('steering and staging', () => {
+  it('rudder sets the tilt angle directly', () => {
+    const sim = new FlightSim(templateDesign('lunar'));
+    sim.vessel.throttle = 1;
+    sim.stage();
+    run(sim, 12);
+    expect(sim.destroyed).toBe(false);
+    const deg = Math.PI / 180;
+    sim.setRudder(20 * deg);
+    run(sim, 10);
+    log('rudder 20 -> tilt', (sim.tiltAngle() / deg).toFixed(1), 'alt', sim.telemetry.alt.toFixed(0));
+    expect(Math.abs(sim.tiltAngle() / deg - 20)).toBeLessThan(2);
+    sim.setRudder(-10 * deg);
+    run(sim, 12);
+    log('rudder -10 -> tilt', (sim.tiltAngle() / deg).toFixed(1));
+    expect(Math.abs(sim.tiltAngle() / deg + 10)).toBeLessThan(2);
+    expect(sim.rudderActive).toBe(true);
+  });
+
+  it('separated stage falls behind before the upper stage ignites', () => {
+    const sim = new FlightSim(templateDesign('lunar'));
+    sim.autopilot.engage('ascent');
+    run(sim, 60);
+    // 在大气层内手动分级：分离第一级并点燃第二级
+    sim.stage();
+    const sep = sim.drainEvents().some((e) => e.type === 'decouple') && sim.debris.some((d) => d.kind === 'stage');
+    expect(sep).toBe(true);
+    const d = sim.debris.find((x) => x.kind === 'stage')!;
+    const V = sim.vessel;
+    const pending = V.parts.filter((rp) => (rp.igniteDelay ?? 0) > 0);
+    expect(pending.length).toBeGreaterThan(0);
+    expect(V.parts.reduce((a, rp) => a + rp.thrustNow, 0)).toBe(0);
+    const fwd = () => new Vector3(0, 1, 0).applyQuaternion(V.q);
+    const gap0 = V.r.clone().sub(d.r).dot(fwd());
+    run(sim, 0.5);
+    const gapHalf = V.r.clone().sub(d.r).dot(fwd());
+    run(sim, 1.0);
+    const thrust = V.parts.reduce((a, rp) => a + rp.thrustNow, 0);
+    const gap1 = V.r.clone().sub(d.r).dot(fwd());
+    log('separation gap', gap0.toFixed(2), gapHalf.toFixed(2), gap1.toFixed(2), 'thrust after delay', (thrust / 1000).toFixed(0), 'kN');
+    expect(gapHalf).toBeGreaterThan(gap0 + 0.3);
+    expect(gap1).toBeGreaterThan(gapHalf);
+    expect(thrust).toBeGreaterThan(0);
+    expect(sim.destroyed).toBe(false);
+  });
+});
+
+describe('landed separation', () => {
+  it('a stage separated on the ground stays where it is', () => {
+    const sim = new FlightSim(templateDesign('lunar'));
+    sim.vessel.throttle = 0;
+    run(sim, 1);
+    expect(sim.landed).toBe(true);
+    // 油门为零时逐级激活，直到在发射台上分离出第一级
+    for (let i = 0; i < 3 && !sim.debris.length; i++) {
+      run(sim, 1); // 每次按下空格后箭体重新落稳
+      expect(sim.landed).toBe(true);
+      sim.stage();
+    }
+    const d = sim.debris.find((x) => x.kind === 'stage');
+    expect(d?.rest?.id).toBe('earth');
+    expect(sim.ullageT).toBe(0);
+    const p0 = d!.restPos.clone();
+    run(sim, 3);
+    expect(d!.alive).toBe(true);
+    expect(d!.restPos.distanceTo(p0)).toBe(0);
+    // 惯性系位置随地球自转，但相对地面不动
+    const vs = d!.v.length();
+    log('rest debris speed (earth rotation)', vs.toFixed(1));
+    expect(vs).toBeGreaterThan(50);
+  });
+});
+
 describe('ascent', () => {
   for (const id of ['orbiter', 'lunar']) {
     it(`${id} reaches orbit with the ascent autopilot`, () => {

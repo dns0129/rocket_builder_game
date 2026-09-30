@@ -39,12 +39,12 @@ export class Autopilot {
     sim.emit({ type: 'msg', msg: `飞行辅助：${mode === 'ascent' ? '自动入轨' : mode === 'node' ? '执行机动' : '自动着陆'}`, level: 'info' });
   }
 
-  disengage(msg?: string): void {
+  disengage(msg?: string, keepThrottle = false): void {
     if (this.mode === 'off') return;
     this.mode = 'off';
     this.targetDir = null;
     this.status = '';
-    this.sim.vessel.throttle = 0;
+    if (!keepThrottle) this.sim.vessel.throttle = 0;
     if (msg) this.sim.emit({ type: 'msg', msg, level: 'good' });
   }
 

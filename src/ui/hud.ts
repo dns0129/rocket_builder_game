@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { FlightSim, SasMode } from '../game/flight';
-import { WARP_LEVELS, PHYS_WARP_MAX } from '../game/flight';
+import { WARP_LEVELS, PHYS_WARP_MAX, RUDDER_MAX } from '../game/flight';
 import { MISSIONS } from '../game/missions';
 import { solveCapture, solveChangeApsis, solveCircularize, solveCorrection, solveReturn, solveTLI, type SolveResult } from '../game/maneuver';
 import type { FlightScene } from '../render/flightScene';
@@ -35,6 +35,15 @@ export class FlightHUD {
   private sasButtons = new Map<string, HTMLButtonElement>();
   private apButtons = new Map<string, HTMLButtonElement>();
   private pips: HTMLDivElement[] = [];
+  private rud!: {
+    svg: SVGSVGElement;
+    fill: SVGPathElement;
+    knob: SVGCircleElement;
+    link: SVGLineElement;
+    rocket: SVGGElement;
+    ap: SVGPathElement;
+    label: HTMLElement;
+  };
 
   constructor(parent: HTMLElement, sim: FlightSim, scene: FlightScene, cb: HudCallbacks) {
     this.sim = sim;
@@ -136,6 +145,7 @@ export class FlightHUD {
       (E.spd = h('div', { class: 'speed-val' })),
       nbWrap,
       (E.hdg = h('div', { class: 'hdg' })),
+      this.buildRudder(),
     );
     const sas = h('div', { class: 'sas-grid panel' });
     const sasBtn = (mode: SasMode | 'toggle', label: string, full = false) => {
@@ -236,6 +246,121 @@ export class FlightHUD {
     this.root.appendChild(this.planner);
   }
 
+  /**
+   * 方向舵：半圆刻度盘，0° 竖直向上，右侧向东、左侧向西。
+   * 拖动橙色旋钮（或按 ← / →）直接设定火箭倾角，中间的小火箭显示实际姿态。
+   */
+  private buildRudder(): HTMLElement {
+    const NS = 'http://www.w3.org/2000/svg';
+    const el = <K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string | number>, parent?: Element) => {
+      const e = document.createElementNS(NS, tag);
+      for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+      parent?.appendChild(e);
+      return e;
+    };
+    const svg = el('svg', { viewBox: '0 0 200 100', class: 'rudder-dial' });
+    el('path', { d: arcPath(-90, 90), class: 'rud-track' }, svg);
+    for (let a = -90; a <= 90; a += 15) {
+      const major = a % 45 === 0;
+      const [x1, y1] = dialPt(a, major ? 58 : 62);
+      const [x2, y2] = dialPt(a, 68);
+      el('line', { x1, y1, x2, y2, class: major ? 'rud-tick major' : 'rud-tick' }, svg);
+    }
+    for (const a of [-90, -45, 0, 45, 90]) {
+      const [x, y] = dialPt(a, 47);
+      const t = el('text', { x, y: y + 3.5, class: 'rud-num' }, svg);
+      t.textContent = String(Math.abs(a));
+    }
+    const w = el('text', { x: 12, y: 97, class: 'rud-dir' }, svg);
+    w.textContent = '西';
+    const e = el('text', { x: 188, y: 97, class: 'rud-dir' }, svg);
+    e.textContent = '东';
+    const fill = el('path', { d: '', class: 'rud-fill' }, svg);
+    const link = el('line', { x1: DIAL.cx, y1: DIAL.cy, x2: DIAL.cx, y2: DIAL.cy - DIAL.r, class: 'rud-link' }, svg);
+    const rocket = el('g', { class: 'rud-rocket' }, svg);
+    el('path', { d: 'M0 -30 L5 -21 L5 -6 L9 0 L-9 0 L-5 -6 L-5 -21 Z' }, rocket);
+    const ap = el('path', { d: 'M0 0 L-5 -9 L5 -9 Z', class: 'rud-ap' }, svg);
+    const knob = el('circle', { cx: DIAL.cx, cy: DIAL.cy - DIAL.r, r: 8.5, class: 'rud-knob' }, svg);
+    el('circle', { cx: DIAL.cx, cy: DIAL.cy, r: 3, class: 'rud-hub' }, svg);
+
+    const setFromPointer = (ev: PointerEvent) => {
+      const r = svg.getBoundingClientRect();
+      const x = ((ev.clientX - r.left) / r.width) * 200;
+      const y = ((ev.clientY - r.top) / r.height) * 100;
+      let a = Math.atan2(x - DIAL.cx, DIAL.cy - y);
+      a = Math.max(-RUDDER_MAX, Math.min(RUDDER_MAX, a));
+      // 取整到 1°，竖直附近吸附
+      let deg = Math.round((a * 180) / Math.PI);
+      if (Math.abs(deg) <= 2) deg = 0;
+      this.sim.setRudder((deg * Math.PI) / 180);
+    };
+    svg.addEventListener('pointerdown', (ev) => {
+      svg.setPointerCapture(ev.pointerId);
+      this.cb.click();
+      setFromPointer(ev);
+    });
+    svg.addEventListener('pointermove', (ev) => {
+      if (ev.buttons) setFromPointer(ev);
+    });
+    const step = (deg: number) => () => {
+      this.cb.click();
+      this.sim.nudgeRudder((deg * Math.PI) / 180);
+    };
+    const label = h('div', {
+      class: 'rudder-lbl',
+      title: '点击开关方向舵（开启时从当前姿态开始）',
+      onclick: () => {
+        this.cb.click();
+        if (this.sim.rudderActive) this.sim.setSas('stability');
+        else this.sim.setRudder(this.sim.tiltAngle());
+      },
+    });
+    this.rud = { svg, fill, knob, link, rocket, ap, label };
+    return h(
+      'div',
+      { class: 'rudder', title: '方向舵：拖动旋钮或按 ← / → 直接设定火箭倾角' },
+      svg,
+      h('div', { class: 'rudder-row' }, h('button', { onclick: step(-5), title: '向西 5°' }, '◀'), label, h('button', { onclick: step(5), title: '向东 5°' }, '▶')),
+    );
+  }
+
+  private updateRudder(): void {
+    const sim = this.sim;
+    const R = this.rud;
+    const deg = (x: number) => (x * 180) / Math.PI;
+    const actual = Math.max(-100, Math.min(100, deg(sim.tiltAngle())));
+    R.rocket.setAttribute('transform', `translate(${DIAL.cx} ${DIAL.cy}) rotate(${actual.toFixed(1)})`);
+    const active = sim.rudderActive;
+    const cmd = deg(sim.rudderAngle);
+    R.svg.classList.toggle('on', active);
+    if (active) {
+      const [kx, ky] = dialPt(cmd, DIAL.r);
+      R.knob.setAttribute('cx', kx.toFixed(1));
+      R.knob.setAttribute('cy', ky.toFixed(1));
+      R.link.setAttribute('x2', kx.toFixed(1));
+      R.link.setAttribute('y2', ky.toFixed(1));
+      R.fill.setAttribute('d', Math.abs(cmd) > 0.5 ? arcPath(0, cmd) : '');
+    } else {
+      // 未启用时旋钮停在实际姿态处，拖动即可接管
+      const [kx, ky] = dialPt(Math.max(-90, Math.min(90, actual)), DIAL.r);
+      R.knob.setAttribute('cx', kx.toFixed(1));
+      R.knob.setAttribute('cy', ky.toFixed(1));
+      R.fill.setAttribute('d', '');
+    }
+    // 飞行辅助的目标倾角（蓝色三角）
+    const ap = sim.autopilot.mode !== 'off' ? sim.autopilot.targetDir : null;
+    if (ap) {
+      const tel = sim.telemetry;
+      const a = Math.max(-90, Math.min(90, deg(Math.atan2(ap.dot(tel.east), ap.dot(tel.up)))));
+      const [x, y] = dialPt(a, DIAL.r + 12);
+      R.ap.setAttribute('transform', `translate(${x.toFixed(1)} ${y.toFixed(1)}) rotate(${a.toFixed(1)})`);
+      R.ap.style.display = '';
+    } else R.ap.style.display = 'none';
+    const dirTxt = (d: number) => (Math.abs(d) < 0.5 ? '竖直 0°' : `${d > 0 ? '东' : '西'} ${Math.abs(d).toFixed(0)}°`);
+    setText(R.label, active ? `方向舵 ${dirTxt(cmd)}` : `方向舵 关 · ${dirTxt(actual)}`);
+    R.label.classList.toggle('on', active);
+  }
+
   togglePlanner(v?: boolean): void {
     this.plannerOpen = v ?? !this.plannerOpen;
     this.planner.style.display = this.plannerOpen ? '' : 'none';
@@ -276,6 +401,7 @@ export class FlightHUD {
     const E = this.els;
     (E.thrFill as HTMLElement).style.height = `${V.throttle * 100}%`;
     (E.fuelFill as HTMLElement).style.height = `${V.stageFuelFraction() * 100}%`;
+    this.updateRudder();
     (E.heatFill as HTMLElement).style.height = `${Math.min(100, Math.max(0, ((tel.temp - 250) / Math.max(1, tel.tempMax - 250)) * 100))}%`;
 
     this.textTimer -= dt;
@@ -540,4 +666,20 @@ export class FlightHUD {
   dispose(): void {
     this.root.remove();
   }
+}
+
+/** 方向舵刻度盘几何：圆心在底部中央，0° 指向正上方，正角度向右（东）。 */
+const DIAL = { cx: 100, cy: 86, r: 70 };
+
+function dialPt(deg: number, r: number): [number, number] {
+  const a = (deg * Math.PI) / 180;
+  return [DIAL.cx + r * Math.sin(a), DIAL.cy - r * Math.cos(a)];
+}
+
+function arcPath(from: number, to: number): string {
+  const [x1, y1] = dialPt(from, DIAL.r);
+  const [x2, y2] = dialPt(to, DIAL.r);
+  const sweep = to > from ? 1 : 0;
+  const large = Math.abs(to - from) > 180 ? 1 : 0;
+  return `M${x1.toFixed(1)} ${y1.toFixed(1)} A${DIAL.r} ${DIAL.r} 0 ${large} ${sweep} ${x2.toFixed(1)} ${y2.toFixed(1)}`;
 }

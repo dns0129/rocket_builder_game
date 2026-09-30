@@ -58,6 +58,7 @@ class App {
   last = performance.now();
   quality: Quality;
   realTime = 0;
+  private lastSepSound = -1;
   /** 调试与自动化测试用 */
   readonly __THREE = THREE;
 
@@ -106,7 +107,7 @@ class App {
     this.flight = { sim, scene, hud, design, scenario, maxAlt: 0, maxSpeed: 0, destroyedAt: null, victoryShown: false };
     if (scenario === 'pad') {
       hud.toast('按 空格键 点火升空！（或使用右下角“自动入轨”）', 'info');
-      hud.toast('W/S 俯仰 · A/D 偏航 · Q/E 滚转 · Shift/↓ 油门', 'info');
+      hud.toast('← / → 方向舵（直接设定倾角）· W/S 俯仰 · A/D 偏航 · Q/E 滚转 · Shift/↓ 油门', 'info');
     } else {
       hud.toast(scenario === 'llo' ? '环月轨道：先降低近月点，再用“自动着陆”或手动着陆' : '地球轨道练习：打开“机动规划”尝试奔月', 'info');
     }
@@ -265,6 +266,9 @@ class App {
     sim.input.pitch = ax('KeyS', 'KeyW');
     sim.input.yaw = ax('KeyD', 'KeyA');
     sim.input.roll = ax('KeyE', 'KeyQ');
+    // ← / →：方向舵，每秒转 35°
+    const steer = ax('ArrowRight', 'ArrowLeft');
+    if (steer !== 0) sim.nudgeRudder(((steer * 35 * Math.PI) / 180) * dt);
     const thr = (k.has('ShiftLeft') || k.has('ShiftRight') || k.has('ArrowUp') ? 1 : 0) - (k.has('ArrowDown') || k.has('ControlLeft') ? 1 : 0);
     if (thr !== 0) {
       sim.vessel.throttle = Math.max(0, Math.min(1, sim.vessel.throttle + thr * dt * 0.8));
@@ -290,7 +294,10 @@ class App {
     this.applyKeys(dt);
     sim.paused = !!this.modal;
     sim.update(dt);
-    for (const e of sim.drainEvents()) this.onEvent(e.type, e.msg, e.level, e.size);
+    const events = sim.drainEvents();
+    for (const e of events) this.onEvent(e.type, e.msg, e.level, e.size);
+    // 分离、爆炸等事件也要交给三维场景（生成残骸模型与特效）
+    f.scene.handleEvents(events);
     const tel = sim.telemetry;
     if (!sim.destroyed) {
       f.maxAlt = Math.max(f.maxAlt, tel.body.id === 'earth' ? tel.alt : f.maxAlt);
@@ -309,8 +316,14 @@ class App {
     if (msg && type !== 'destroyed') f.hud.toast(msg, level);
     switch (type) {
       case 'stage':
+        this.sound.stage();
+        break;
       case 'decouple':
-        if (type === 'stage') this.sound.stage();
+        // 同一次分级可能同时抛离多个助推器，只播放一次
+        if (this.realTime - this.lastSepSound > 0.2) {
+          this.lastSepSound = this.realTime;
+          this.sound.separation();
+        }
         break;
       case 'ignite':
         this.sound.ignite();
@@ -464,6 +477,7 @@ class App {
           ...k('Shift ↑', '增加油门'),
           ...k('↓ Ctrl', '减小油门'),
           ...k('Z X', '油门全开 / 关闭'),
+          ...k('← →', '方向舵：向西 / 向东倾斜，火箭自动转到设定角度并保持（也可拖动导航球下方的刻度盘）'),
           ...k('W S', '俯仰（W 低头，S 抬头）'),
           ...k('A D', '偏航'),
           ...k('Q E', '滚转'),
@@ -483,7 +497,7 @@ class App {
         h(
           'ol',
           null,
-          h('li', null, '从海南文昌（北纬 19.6°）起飞，竖直爬升到约 1 km 后按 W 慢慢向东（航向 090）倾斜，沿“顺行”标记做重力转弯，约 45 km 时接近水平。'),
+          h('li', null, '从海南文昌（北纬 19.6°）起飞，竖直爬升到约 1 km 后，按 → 或拖动导航球下方的“方向舵”刻度盘，让火箭慢慢向东倾斜（约 10 km 时 30°，约 45 km 时接近 80°）；火箭会自动转到设定角度并保持。也可以用 W 手动倾斜，沿“顺行”标记做重力转弯。'),
           h('li', null, '远地点到达约 100 km 时关闭发动机，滑行到大气层外，在远地点附近点火“圆化”进入轨道（近地点 > 70 km）。'),
           h('li', null, '打开地图（M）→ 机动规划 →“奔月转移”。停泊轨道有约 19.6° 倾角，要等月球转到合适位置（发射窗口），可以放心用时间加速，然后“执行机动”。途中用“修正近月点”微调。'),
           h('li', null, '进入月球影响球后用“月球捕获”在近月点减速；再“降低近月点”，并在低空按逆行方向减速着陆。'),

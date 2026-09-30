@@ -117,6 +117,12 @@ export class EnginePlume {
     this.group.visible = false;
   }
 
+  dispose(): void {
+    this.mi.dispose();
+    this.mo.dispose();
+    (this.flare.material as THREE.SpriteMaterial).dispose();
+  }
+
   /** throttle 0..1，pressure 0..1（相对海平面），time 秒。 */
   update(throttle: number, pressure: number, time: number): void {
     if (throttle <= 0.001) {
@@ -234,6 +240,8 @@ class ParticlePool {
   drag: Float32Array;
   rot: Float32Array;
   cool: Uint8Array;
+  /** 刚发射的粒子：本帧不积分（发射位置已是当前时刻，否则会领先一帧） */
+  fresh: Uint8Array;
   mesh: THREE.InstancedMesh;
   aPos: THREE.InstancedBufferAttribute;
   aCol: THREE.InstancedBufferAttribute;
@@ -252,6 +260,7 @@ class ParticlePool {
     this.drag = new Float32Array(max);
     this.rot = new Float32Array(max);
     this.cool = new Uint8Array(max);
+    this.fresh = new Uint8Array(max);
     const g = new THREE.PlaneGeometry(1, 1);
     this.aPos = new THREE.InstancedBufferAttribute(new Float32Array(max * 3), 3).setUsage(THREE.DynamicDrawUsage) as THREE.InstancedBufferAttribute;
     this.aCol = new THREE.InstancedBufferAttribute(new Float32Array(max * 4), 4).setUsage(THREE.DynamicDrawUsage) as THREE.InstancedBufferAttribute;
@@ -297,6 +306,7 @@ class ParticlePool {
     this.drag[i] = p.drag;
     this.rot[i] = Math.random() * Math.PI * 2;
     this.cool[i] = p.cool ? 1 : 0;
+    this.fresh[i] = 1;
   }
 
   update(dt: number, origin: THREE.Vector3, windAt: (x: number, y: number, z: number, out: THREE.Vector3) => void, light: THREE.Color): void {
@@ -309,14 +319,19 @@ class ParticlePool {
       this.age[i] += dt;
       if (this.age[i] >= this.life[i]) continue;
       const k = i * 3;
-      windAt(this.px[k], this.px[k + 1], this.px[k + 2], w);
-      const f = Math.min(1, this.drag[i] * dt);
-      this.vx[k] += (w.x - this.vx[k]) * f;
-      this.vx[k + 1] += (w.y - this.vx[k + 1]) * f;
-      this.vx[k + 2] += (w.z - this.vx[k + 2]) * f;
-      this.px[k] += this.vx[k] * dt;
-      this.px[k + 1] += this.vx[k + 1] * dt;
-      this.px[k + 2] += this.vx[k + 2] * dt;
+      if (this.fresh[i]) {
+        this.fresh[i] = 0;
+        this.age[i] -= dt;
+      } else {
+        windAt(this.px[k], this.px[k + 1], this.px[k + 2], w);
+        const f = Math.min(1, this.drag[i] * dt);
+        this.vx[k] += (w.x - this.vx[k]) * f;
+        this.vx[k + 1] += (w.y - this.vx[k + 1]) * f;
+        this.vx[k + 2] += (w.z - this.vx[k + 2]) * f;
+        this.px[k] += this.vx[k] * dt;
+        this.px[k + 1] += this.vx[k + 1] * dt;
+        this.px[k + 2] += this.vx[k + 2] * dt;
+      }
       // 压缩存活粒子
       if (j !== i) {
         this.px[j * 3] = this.px[k];
@@ -336,6 +351,7 @@ class ParticlePool {
         this.drag[j] = this.drag[i];
         this.rot[j] = this.rot[i];
         this.cool[j] = this.cool[i];
+        this.fresh[j] = 0;
       }
       const t = this.age[j] / this.life[j];
       pos[j * 3] = this.px[j * 3] - origin.x;

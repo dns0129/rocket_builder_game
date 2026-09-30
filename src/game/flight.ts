@@ -31,8 +31,14 @@ import { MissionTracker } from './missions';
 
 export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000];
 export const PHYS_WARP_MAX = 3;
+/** 方向舵最大倾角：±90°（水平向西 / 向东） */
+export const RUDDER_MAX = Math.PI / 2;
+/** 级间分离后上面级延迟点火的时间 s（期间沉底发动机工作，下面级靠反推火箭拉开距离） */
+export const IGNITION_DELAY = 0.8;
+/** 沉底发动机提供的加速度 m/s² */
+const ULLAGE_ACC = 1.2;
 
-export type SasMode = 'stability' | 'prograde' | 'retrograde' | 'normal' | 'antinormal' | 'radialOut' | 'radialIn' | 'maneuver';
+export type SasMode = 'stability' | 'prograde' | 'retrograde' | 'normal' | 'antinormal' | 'radialOut' | 'radialIn' | 'maneuver' | 'rudder';
 export type SpeedMode = 'auto' | 'surface' | 'orbit';
 export type Scenario = 'pad' | 'leo' | 'llo';
 
@@ -90,6 +96,7 @@ const UP = new Vector3(0, 1, 0);
 const _v1 = new Vector3();
 const _v2 = new Vector3();
 const _v3 = new Vector3();
+const _v4 = new Vector3();
 const _q1 = new Quaternion();
 
 export class FlightSim {
@@ -104,6 +111,12 @@ export class FlightSim {
   controlCmd = new Vector3(); // 实际控制量（x 俯仰, y 滚转, z 偏航），用于喷管摆动显示
   sasOn = true;
   sasMode: SasMode = 'stability';
+  /** 方向舵设定的倾角（弧度）：0 竖直向上，正值向东，负值向西 */
+  rudderAngle = 0;
+  /** 沉底发动机剩余工作时间 s */
+  ullageT = 0;
+  /** 上一次 update 实际推进的模拟时间 s（粒子特效与之同步） */
+  lastSimDt = 0;
   private sasHold: Quaternion | null = null;
   speedMode: SpeedMode = 'auto';
   landed = false;
@@ -216,9 +229,9 @@ export class FlightSim {
     if (this.destroyed) return;
     const V = this.vessel;
     const origin = V.r.clone().sub(V.com.clone().applyQuaternion(V.q));
-    const mBefore = V.mass;
     const res = V.activateStage();
     if (!res) return;
+    const wasLanded = this.landed;
     if (this.landed) {
       this.landed = false;
       this.settle = 0;
@@ -228,29 +241,56 @@ export class FlightSim {
       this.met = 0;
     }
     const fwd = UP.clone().applyQuaternion(V.q);
-    let jettisonMass = 0;
+    // 分离弹簧/推杆给残骸的冲量；反作用力由剩余箭体承受
+    const impulse = new Vector3();
     for (const g of res.groups) {
       const d = new Debris(g);
       d.q.copy(V.q);
       d.w.copy(V.w);
       d.r.copy(origin).add(d.com.clone().applyQuaternion(V.q));
       d.v.copy(V.v);
+      const dv = new Vector3();
       const radial = g[0].p.radial;
       if (radial) {
-        const out = new Vector3(g[0].p.x, 0, g[0].p.z).normalize().applyQuaternion(V.q);
-        d.v.addScaledVector(out, 3).addScaledVector(fwd, -1);
-        d.w.add(new Vector3(g[0].p.z, 0, -g[0].p.x).normalize().multiplyScalar(0.4));
+        // 捆绑助推器：推杆把它向外推开，头部分离火箭推力更大，所以机头先向外偏转
+        d.kind = 'booster';
+        const outL = new Vector3(g[0].p.x, 0, g[0].p.z).normalize();
+        dv.copy(outL).applyQuaternion(V.q).multiplyScalar(2).addScaledVector(fwd, -0.4);
+        d.w.add(new Vector3(outL.z, 0, -outL.x).multiplyScalar(0.35));
+        d.motorDir.copy(outL);
+        d.motorAcc = 9;
+        d.motorT = 0.9;
+      } else if (wasLanded) {
+        // 在地面上分离（月面起飞）：下面级作为发射台留在原地
+        d.kind = 'stage';
+        const b = this.landedBody;
+        d.rest = b;
+        d.restPos.copy(toBodyFixed(b, this.t, d.r));
+        d.restQ.copy(_q1.setFromAxisAngle(UP, -bodyRotation(b, this.t))).multiply(d.q);
+        d.w.set(0, 0, 0);
       } else {
-        d.v.addScaledVector(fwd, -2);
+        // 下面级：分离弹簧 + 顶部反推火箭使其减速后退，并带一点随机翻滚
+        d.kind = 'stage';
+        dv.copy(fwd).multiplyScalar(-1.2);
+        d.w.add(new Vector3((Math.random() - 0.5) * 0.12, (Math.random() - 0.5) * 0.1, (Math.random() - 0.5) * 0.12));
+        d.motorDir.set(0, -1, 0);
+        d.motorAcc = 7;
+        d.motorT = 1.2;
       }
-      jettisonMass += d.mass;
+      d.v.add(dv);
+      impulse.addScaledVector(dv, d.mass);
       this.debris.push(d);
       this.emit({ type: 'decouple', debrisId: d.id, pos: d.r.clone() });
     }
-    if (jettisonMass > 0) {
-      V.v.addScaledVector(fwd, (2 * jettisonMass) / Math.max(1, mBefore - jettisonMass));
-    }
-    if (res.action.ignite.length) this.emit({ type: 'ignite' });
+    if (res.groups.length) V.v.addScaledVector(impulse, -1 / Math.max(1, V.mass));
+    // 分离的同时点火：先由沉底发动机工作，拉开距离后主发动机再点火
+    if (res.groups.length && res.action.ignite.length && !wasLanded) {
+      for (const k of res.action.ignite) {
+        const rp = V.byKey.get(k);
+        if (rp && !rp.flameout) rp.igniteDelay = IGNITION_DELAY;
+      }
+      this.ullageT = IGNITION_DELAY + 0.25;
+    } else if (res.action.ignite.length) this.emit({ type: 'ignite' });
     if (res.action.chutes.length) this.emit({ type: 'chuteArm', msg: '降落伞已启用：低于 7 km 且速度足够低时自动张开', level: 'info' });
     this.emit({ type: 'stage', msg: `第 ${V.stageIndex} 级：${res.action.label}`, level: 'info' });
   }
@@ -288,11 +328,41 @@ export class FlightSim {
     this.emit({ type: 'msg', msg: this.sasOn ? '姿态稳定 SAS 开启' : 'SAS 关闭', level: 'info' });
   }
 
+  /** 箭体在“竖直—正东”平面内的倾角（弧度）：0 竖直向上，正值偏东，负值偏西。 */
+  tiltAngle(): number {
+    const tel = this.telemetry;
+    const fwd = UP.clone().applyQuaternion(this.vessel.q);
+    return Math.atan2(fwd.dot(tel.east), fwd.dot(tel.up));
+  }
+
+  get rudderActive(): boolean {
+    return this.sasOn && this.sasMode === 'rudder' && this.autopilot.mode === 'off';
+  }
+
+  /**
+   * 方向舵：直接设定箭体倾角（0 竖直向上，+90° 水平向东，-90° 水平向西），
+   * 姿态控制系统（喷管摆动 + 尾翼 + 姿控）自动把火箭转过去并保持。
+   */
+  setRudder(angle: number): void {
+    if (this.destroyed) return;
+    if (this.autopilot.mode !== 'off') this.autopilot.disengage('手动操纵方向舵，飞行辅助已关闭（油门保持不变）', true);
+    this.rudderAngle = Math.max(-RUDDER_MAX, Math.min(RUDDER_MAX, angle));
+    this.sasOn = true;
+    this.sasMode = 'rudder';
+    this.sasHold = null;
+  }
+
+  /** 在当前设定（或当前实际倾角）基础上增减方向舵角度。 */
+  nudgeRudder(delta: number): void {
+    const base = this.rudderActive ? this.rudderAngle : this.tiltAngle();
+    this.setRudder(base + delta);
+  }
+
   maxWarpIndex(): number {
     if (this.destroyed) return WARP_LEVELS.length - 1;
     if (this.landed) return WARP_LEVELS.length - 1;
     const tel = this.telemetry;
-    if (this.vessel.parts.some((rp) => rp.thrustNow > 0)) return PHYS_WARP_MAX;
+    if (this.vessel.parts.some((rp) => rp.thrustNow > 0 || (rp.igniteDelay ?? 0) > 0) || this.ullageT > 0) return PHYS_WARP_MAX;
     if (this.autopilot.mode === 'ascent' || this.autopilot.mode === 'land') return PHYS_WARP_MAX;
     if (tel.inAtmosphere) return PHYS_WARP_MAX;
     const s = tel.body.radius / EARTH.radius;
@@ -328,6 +398,7 @@ export class FlightSim {
   // ---------------------------------------------------------------- 主循环
 
   update(dtReal: number): void {
+    this.lastSimDt = 0;
     if (this.paused) return;
     dtReal = Math.min(dtReal, 0.05);
     // 自动时间加速
@@ -351,6 +422,7 @@ export class FlightSim {
       this.warpIndex = this.maxWarpIndex();
     }
     const simDt = dtReal * this.warp;
+    this.lastSimDt = simDt;
     this.autopilot.update(dtReal);
 
     if (this.warpIndex > PHYS_WARP_MAX && !this.landed && !this.destroyed) {
@@ -506,12 +578,28 @@ export class FlightSim {
     const alt = dist - body.radius;
     const pressure = atmoPressure(body, alt);
     const rho = atmoDensity(body, alt);
+    let lit = false;
+    for (const rp of V.parts) {
+      if (rp.igniteDelay && rp.igniteDelay > 0) {
+        rp.igniteDelay -= h;
+        if (rp.igniteDelay <= 0) {
+          rp.igniteDelay = 0;
+          lit = true;
+        }
+      }
+    }
+    if (lit) this.emit({ type: 'ignite' });
     const thrust = V.computeThrust(pressure / 101325, true);
 
     const F = new Vector3();
     const tauB = new Vector3();
     const fwd = UP.clone().applyQuaternion(V.q);
     F.addScaledVector(fwd, thrust);
+    // 沉底发动机：小型固体火箭，给上面级一个向前的小加速度
+    if (this.ullageT > 0) {
+      F.addScaledVector(fwd, m * ULLAGE_ACC);
+      this.ullageT = Math.max(0, this.ullageT - h);
+    }
     this.lastThrustAccel.copy(fwd).multiplyScalar(thrust / m);
 
     // ------------------------------------------------ 气动
@@ -791,6 +879,14 @@ export class FlightSim {
     for (const d of this.debris) {
       if (!d.alive) continue;
       d.age += dt;
+      if (d.rest) {
+        // 静止在地面上：随天体自转
+        fromBodyFixed(d.rest, this.t, d.restPos, d.r);
+        surfaceVelocity(d.rest, this.t, d.r, d.v);
+        d.q.copy(_q1.setFromAxisAngle(UP, bodyRotation(d.rest, this.t))).multiply(d.restQ);
+        if (d.r.distanceTo(V.r) > 60_000) d.alive = false;
+        continue;
+      }
       if (rails || d.r.distanceTo(V.r) > 60_000 || d.age > 900) {
         d.alive = false;
         continue;
@@ -805,6 +901,10 @@ export class FlightSim {
         const rho = atmoDensity(body, alt);
         const g = gravityAccel(d.r, this.t, _v2);
         d.v.addScaledVector(g, h);
+        if (d.motorT > 0) {
+          d.v.addScaledVector(_v4.copy(d.motorDir).applyQuaternion(d.q), d.motorAcc * Math.min(h, d.motorT));
+          d.motorT -= h;
+        }
         if (rho > 0) {
           const vs = surfaceVelocity(body, this.t, d.r, _v3);
           const va = d.v.clone().sub(vs);
@@ -867,6 +967,10 @@ export class FlightSim {
       case 'maneuver': {
         const d = this.nodeBurnVector();
         return d && d.lengthSq() > 1e-6 ? d.clone().normalize() : null;
+      }
+      case 'rudder': {
+        const a = this.rudderAngle;
+        return tel.up.clone().multiplyScalar(Math.cos(a)).addScaledVector(tel.east, Math.sin(a)).normalize();
       }
       default:
         return null;

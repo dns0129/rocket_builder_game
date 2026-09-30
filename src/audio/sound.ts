@@ -141,6 +141,13 @@ export class SoundEngine {
     this.tone(70, 0.3, 0.5, 'sine');
   }
 
+  /** 分离：火工品爆炸的脆响 + 低频冲击 + 分离火箭的嘶声。 */
+  separation(): void {
+    this.burst(0.12, 2600, 1.3, 'highpass');
+    this.tone(52, 0.4, 0.6, 'sine');
+    this.burst(1.2, 1500, 0.28, 'bandpass');
+  }
+
   ignite(): void {
     this.burst(1.2, 400, 1.1);
   }

@@ -34,6 +34,7 @@ function createMaterials() {
     canopy: std({ map: canopyTexture(), roughness: 0.8, metalness: 0, side: THREE.DoubleSide }),
     line: new THREE.LineBasicMaterial({ color: 0xcccccc, transparent: true, opacity: 0.6 }),
     fin: std({ color: 0xdfe1e3, roughness: 0.45, metalness: 0.3 }),
+    rudder: std({ color: 0xd2462c, roughness: 0.5, metalness: 0.25 }),
     rcs: std({ color: 0x2c2d31, roughness: 0.5, metalness: 0.6 }),
   };
 }
@@ -49,6 +50,8 @@ export interface PartVisual {
   legs: { pivot: THREE.Object3D; deployed: number; stowed: number }[];
   canopy: THREE.Object3D | null;
   meshes: THREE.Mesh[];
+  /** 尾翼后缘的方向舵：rot 绕铰链（局部 X）转动；angle 为尾翼在零件内的方位角 */
+  flaps: { rot: THREE.Object3D; angle: number }[];
 }
 
 function lathe(profile: [number, number][], segs = 48): THREE.LatheGeometry {
@@ -382,14 +385,31 @@ function buildFins(v: PartVisual, parentDef: PartDef, count: number, accDef: Par
   const pr = Math.max(parentDef.diameter, parentDef.bottomDiameter) / 2;
   const root = accDef.height;
   const span = acc.reach;
+  const thick = 0.05 * (accDef.size === 'M' ? 1.6 : 1);
+  // 固定安定面在上，下方后缘是可偏转的方向舵（红色），铰链线与后缘平行
+  const flapH = root * 0.22;
+  const drop = root * 0.08;
   const shape = new THREE.Shape();
-  shape.moveTo(0, 0);
-  shape.lineTo(span, -root * 0.08);
+  shape.moveTo(0, flapH);
+  shape.lineTo(span, flapH - drop);
   shape.lineTo(span, root * 0.35);
   shape.lineTo(0, root);
-  shape.lineTo(0, 0);
-  const g = new THREE.ExtrudeGeometry(shape, { depth: 0.05 * (accDef.size === 'M' ? 1.6 : 1), bevelEnabled: true, bevelThickness: 0.01, bevelSize: 0.01, bevelSegments: 1 });
-  g.translate(0, 0, -0.025);
+  shape.lineTo(0, flapH);
+  const g = new THREE.ExtrudeGeometry(shape, { depth: thick, bevelEnabled: true, bevelThickness: 0.01, bevelSize: 0.01, bevelSegments: 1 });
+  g.translate(0, 0, -thick / 2);
+  // 方向舵：在铰链坐标系中是一个矩形，x 沿铰链，y 向下到后缘
+  const x0 = span * 0.1;
+  const slope = Math.atan2(-drop, span);
+  const hingeLen = (span - x0) / Math.cos(slope);
+  const flapShape = new THREE.Shape();
+  const fh = flapH * Math.cos(slope) * 0.96;
+  flapShape.moveTo(0, -0.01);
+  flapShape.lineTo(hingeLen, -0.01);
+  flapShape.lineTo(hingeLen, -fh);
+  flapShape.lineTo(0, -fh);
+  flapShape.lineTo(0, -0.01);
+  const fg = new THREE.ExtrudeGeometry(flapShape, { depth: thick * 0.8, bevelEnabled: true, bevelThickness: 0.008, bevelSize: 0.008, bevelSegments: 1 });
+  fg.translate(0, 0, -thick * 0.4);
   for (let i = 0; i < count; i++) {
     const a = (i / count) * Math.PI * 2 + Math.PI / 4;
     const holder = new THREE.Group();
@@ -397,11 +417,19 @@ function buildFins(v: PartVisual, parentDef: PartDef, count: number, accDef: Par
     holder.rotation.y = -a;
     v.group.add(holder);
     mesh(g, mats.fin, v, holder);
+    const hinge = new THREE.Group();
+    hinge.position.set(x0, flapH - drop * (x0 / span), 0);
+    hinge.rotation.z = slope;
+    holder.add(hinge);
+    const rot = new THREE.Group();
+    hinge.add(rot);
+    mesh(fg, mats.rudder, v, rot);
+    v.flaps.push({ rot, angle: a });
   }
 }
 
 export function buildPartVisual(node: PartNode, def: PartDef): PartVisual {
-  const v: PartVisual = { group: new THREE.Group(), bells: [], legs: [], canopy: null, meshes: [] };
+  const v: PartVisual = { group: new THREE.Group(), bells: [], legs: [], canopy: null, meshes: [], flaps: [] };
   switch (def.category) {
     case 'pod':
       if (def.id === 'probe_s') buildProbe(v, def);

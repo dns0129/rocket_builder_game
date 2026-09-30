@@ -669,6 +669,131 @@ input[type='text'] {
   font-size: 11px;
 }
 
+/* 方向舵 */
+.rudder {
+  width: 200px;
+  margin-top: 2px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.rudder-dial {
+  display: block;
+  width: 200px;
+  height: 100px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.rudder-dial:active {
+  cursor: grabbing;
+}
+
+.rud-track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.1);
+  stroke-width: 12;
+  stroke-linecap: round;
+}
+
+.rud-tick {
+  stroke: rgba(255, 255, 255, 0.28);
+  stroke-width: 1;
+}
+
+.rud-tick.major {
+  stroke: rgba(255, 255, 255, 0.55);
+  stroke-width: 1.5;
+}
+
+.rud-num {
+  fill: var(--muted);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  text-anchor: middle;
+}
+
+.rud-dir {
+  fill: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  text-anchor: middle;
+}
+
+.rud-fill {
+  fill: none;
+  stroke: var(--accent2);
+  stroke-width: 12;
+  stroke-linecap: round;
+  opacity: 0.55;
+}
+
+.rud-link {
+  stroke: var(--accent2);
+  stroke-width: 1.2;
+  stroke-dasharray: 3 3;
+  opacity: 0;
+}
+
+.rudder-dial.on .rud-link {
+  opacity: 0.8;
+}
+
+.rud-rocket path {
+  fill: #e8edf4;
+  stroke: #0b0f15;
+  stroke-width: 1;
+}
+
+.rud-knob {
+  fill: rgba(255, 174, 59, 0.25);
+  stroke: rgba(255, 174, 59, 0.7);
+  stroke-width: 2;
+}
+
+.rudder-dial.on .rud-knob {
+  fill: var(--accent2);
+  stroke: #fff;
+}
+
+.rud-hub {
+  fill: var(--accent2);
+}
+
+.rud-ap {
+  fill: var(--accent);
+}
+
+.rudder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.rudder-row button {
+  width: 32px;
+  padding: 3px 0;
+  font-size: 11px;
+}
+
+.rudder-lbl {
+  flex: 1;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  padding: 4px 2px;
+  border-radius: 6px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rudder-lbl.on {
+  color: var(--accent2);
+  background: rgba(255, 174, 59, 0.13);
+}
+
 .gauges {
   display: flex;
   gap: 8px;
@@ -809,7 +934,7 @@ input[type='text'] {
 .land-panel {
   position: absolute;
   left: 50%;
-  bottom: 312px;
+  bottom: 438px;
   transform: translateX(-50%);
   padding: 8px 14px;
   display: flex;
