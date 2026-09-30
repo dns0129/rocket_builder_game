@@ -321,11 +321,12 @@ export class FlightScene {
     if (this.glow.mesh.visible) {
       const b = V.bounds();
       const size = Math.max(b.maxY - b.minY, b.radius * 2);
-      this.glow.mesh.position.set(0, 0, 0);
-      this.glow.mesh.quaternion.setFromUnitVectors(UP, vAir.clone().normalize());
-      this.glow.mesh.scale.set(size * 0.7 + 1, size * 0.9, size * 0.7 + 1);
-      this.glow.mat.uniforms.uIntensity.value = gi * 2.2;
-      this.glow.mat.uniforms.uTime.value = this.time;
+      const vd = vAir.clone().normalize();
+      const w = b.radius * 1.35 + 0.3;
+      this.glow.mesh.position.copy(vd).multiplyScalar(size * 0.35);
+      this.glow.mesh.quaternion.setFromUnitVectors(UP, vd);
+      this.glow.mesh.scale.set(w, Math.max(w, size * 0.6), w);
+      this.glow.set(gi * 1.6, this.time);
       if (Math.random() < gi * 0.8) {
         const p = V.r.clone().addScaledVector(vAir.clone().normalize(), -size * 0.3).add(new THREE.Vector3((Math.random() - 0.5) * size * 0.4, (Math.random() - 0.5) * size * 0.4, (Math.random() - 0.5) * size * 0.4));
         this.particles.emit({ pos: p, vel: V.v.clone().addScaledVector(vAir, -0.02), life: 0.8, size0: size * 0.4, size1: size * 0.1, color: new THREE.Color(6, 2.2, 0.8), alpha: 0.9, drag: 3, glow: true, cool: true });
@@ -545,6 +546,7 @@ export class FlightScene {
   }
 
   dispose(): void {
+    this.patch.dispose();
     this.vesselView.dispose();
     this.particles.clear();
     if (this.envRT) this.envRT.dispose();

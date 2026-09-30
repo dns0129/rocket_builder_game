@@ -428,16 +428,30 @@ const PLASMA_FRAG = /* glsl */ `
 #include <logdepthbuf_pars_fragment>
 uniform float uIntensity;
 uniform float uTime;
+uniform float uWake;
 varying vec3 vN;
 varying vec3 vV;
 varying float vY;
+float hh(float x) { return fract(sin(x * 91.7) * 43758.5); }
 void main() {
   #include <logdepthbuf_fragment>
   float f = 1.0 - abs(dot(normalize(vN), normalize(vV)));
-  float front = smoothstep(-0.2, 1.0, vY);
-  float flick = 0.85 + 0.15 * sin(uTime * 40.0 + vY * 20.0);
-  vec3 col = mix(vec3(1.0, 0.35, 0.12), vec3(1.0, 0.75, 0.55), front);
-  gl_FragColor = vec4(col * (0.25 + pow(f, 2.0)) * front * uIntensity * flick, 1.0);
+  float flick = 0.8 + 0.2 * hh(floor(uTime * 30.0) + vY * 7.0);
+  vec3 hot = vec3(1.0, 0.82, 0.62);
+  vec3 warm = vec3(1.0, 0.32, 0.12);
+  vec3 col;
+  float a;
+  if (uWake > 0.5) {
+    // 尾迹：沿 -Y 延伸，逐渐变暗变红
+    float s = clamp(-vY, 0.0, 1.0);
+    col = mix(hot, warm, s) ;
+    a = pow(1.0 - s, 2.0) * (0.15 + pow(f, 2.5)) * 0.6;
+  } else {
+    float front = smoothstep(-0.1, 1.0, vY);
+    col = mix(warm, hot, front);
+    a = (0.04 + pow(f, 3.0) * 1.4) * (0.35 + 0.65 * front);
+  }
+  gl_FragColor = vec4(col * a * uIntensity * flick, 1.0);
 }
 `;
 
@@ -458,24 +472,43 @@ void main() {
 `;
 
 export class ReentryGlow {
-  mesh: THREE.Mesh;
+  mesh: THREE.Group;
   mat: THREE.ShaderMaterial;
+  private wakeMat: THREE.ShaderMaterial;
   constructor() {
-    this.mat = new THREE.ShaderMaterial({
-      vertexShader: PLASMA_VERT,
-      fragmentShader: PLASMA_FRAG,
-      uniforms: { uIntensity: { value: 0 }, uTime: { value: 0 } },
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      transparent: true,
-      side: THREE.DoubleSide,
-    });
-    // 沿 +Y 为迎风方向的“弓形激波”壳
-    const g = new THREE.SphereGeometry(1, 32, 24, 0, Math.PI * 2, 0, Math.PI * 0.62);
-    g.scale(1, 0.8, 1);
-    this.mesh = new THREE.Mesh(g, this.mat);
-    this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = 22;
+    const mk = (wake: number) =>
+      new THREE.ShaderMaterial({
+        vertexShader: PLASMA_VERT,
+        fragmentShader: PLASMA_FRAG,
+        uniforms: { uIntensity: { value: 0 }, uTime: { value: 0 }, uWake: { value: wake } },
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+        side: THREE.DoubleSide,
+      });
+    this.mat = mk(0);
+    this.wakeMat = mk(1);
+    // 迎风面（+Y）的弓形激波壳
+    const g = new THREE.SphereGeometry(1, 40, 20, 0, Math.PI * 2, 0, Math.PI * 0.55);
+    g.scale(1, 0.55, 1);
+    const shock = new THREE.Mesh(g, this.mat);
+    // 向 -Y 延伸的尾迹：y 从 0 到 -1，半径逐渐收拢
+    const wg = new THREE.CylinderGeometry(1.0, 0.35, 1, 32, 12, true).translate(0, -0.5, 0);
+    const wake = new THREE.Mesh(wg, this.wakeMat);
+    wake.scale.set(1, 6, 1);
+    this.mesh = new THREE.Group();
+    this.mesh.add(shock, wake);
+    for (const m of [shock, wake]) {
+      m.frustumCulled = false;
+      m.renderOrder = 22;
+    }
     this.mesh.visible = false;
+  }
+
+  set(intensity: number, time: number): void {
+    this.mat.uniforms.uIntensity.value = intensity;
+    this.mat.uniforms.uTime.value = time;
+    this.wakeMat.uniforms.uIntensity.value = intensity * 0.8;
+    this.wakeMat.uniforms.uTime.value = time;
   }
 }

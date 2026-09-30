@@ -16,6 +16,22 @@ import { MISSIONS } from './game/missions';
 const QUALITY_KEY = 'rocket-game-quality';
 const VOLUME_KEY = 'rocket-game-volume';
 
+function lsGet(k: string): string | null {
+  try {
+    return localStorage.getItem(k);
+  } catch {
+    return null;
+  }
+}
+
+function lsSet(k: string, v: string): void {
+  try {
+    localStorage.setItem(k, v);
+  } catch {
+    /* 存储不可用时忽略 */
+  }
+}
+
 interface Flight {
   sim: FlightSim;
   scene: FlightScene;
@@ -47,11 +63,11 @@ class App {
 
   constructor() {
     const canvas = document.getElementById('view') as HTMLCanvasElement;
-    const stored = localStorage.getItem(QUALITY_KEY) as Quality | null;
+    const stored = lsGet(QUALITY_KEY) as Quality | null;
     const touch = matchMedia('(pointer: coarse)').matches;
     this.quality = stored ?? (touch ? 'low' : 'medium');
     this.engine = new RenderEngine(canvas, this.quality);
-    const vol = parseFloat(localStorage.getItem(VOLUME_KEY) ?? '0.7');
+    const vol = parseFloat(lsGet(VOLUME_KEY) ?? '0.7');
     this.sound.volume = isFinite(vol) ? vol : 0.7;
   }
 
@@ -491,7 +507,7 @@ class App {
         {
           class: this.quality === v ? 'on' : '',
           onclick: () => {
-            localStorage.setItem(QUALITY_KEY, v);
+            lsSet(QUALITY_KEY, v);
             location.reload();
           },
         },
@@ -506,7 +522,7 @@ class App {
       oninput: (e: Event) => {
         const v = parseFloat((e.target as HTMLInputElement).value);
         this.sound.setVolume(v);
-        localStorage.setItem(VOLUME_KEY, String(v));
+        lsSet(VOLUME_KEY, String(v));
       },
     });
     this.openModal(

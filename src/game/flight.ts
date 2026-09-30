@@ -195,8 +195,10 @@ export class FlightSim {
       this.launched = true;
       this.metStarted = true;
       this.body = body;
-      // 预先激活第一级（点燃发动机，油门为零）
-      if (V.stages[0] && V.stages[0].ignite.length && V.stages[0].decoupleSection === null) {
+      // 预先激活第一级（点燃发动机，油门为零）。含固体助推器的级无法关机，留给玩家手动点火。
+      const st0 = V.stages[0];
+      const allThrottleable = st0 && st0.ignite.every((k) => V.byKey.get(k)?.p.def.engine?.throttleable);
+      if (st0 && st0.ignite.length && st0.decoupleSection === null && allThrottleable) {
         V.activateStage();
       }
       this.sasMode = 'stability';
