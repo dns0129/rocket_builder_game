@@ -81,7 +81,7 @@ export function craterLevel(px: number, py: number, pz: number, level: number): 
 export function moonMare(dx: number, dy: number, dz: number): number {
   const s = MOON.radius / 150000;
   const n = gnoise(dx * s, dy * s, dz * s, MARE_SEED) + 0.5 * gnoise(dx * s * 2.1, dy * s * 2.1, dz * s * 2.1, MARE_SEED + 1);
-  return smoothstep(0.12, -0.12, n + 0.18);
+  return smoothstep(0.12, -0.12, n + 0.42);
 }
 
 /**
@@ -196,7 +196,7 @@ vec2 craterLevel(vec3 p, int level) {
 float moonMare(vec3 d) {
   float s = MOON_R / 150000.0;
   float n = gnoise(d * s, ${MARE_SEED}u) + 0.5 * gnoise(d * s * 2.1, ${MARE_SEED + 1}u);
-  return smoothstep(0.12, -0.12, n + 0.18);
+  return smoothstep(0.12, -0.12, n + 0.42);
 }
 
 // 返回 x = 高度, y = 月海遮罩, z = 新鲜撞击坑亮度

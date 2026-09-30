@@ -178,8 +178,9 @@ export class FlightSim {
       const alt = sc === 'leo' ? 100_000 : 22_000;
       const bp = bodyPosition(body, 0, new Vector3());
       const bv = bodyVelocity(body, 0, new Vector3());
-      // 选择一个与太阳成一定角度的位置，保证画面有光照
-      const dir = new Vector3(0.3, 0, 0.95).normalize();
+      // 从日照面起步：沿轨道飞行一段后仍处在白天（太阳方位角约 0.75 rad）
+      const az = sc === 'leo' ? 0.45 : -0.5;
+      const dir = new Vector3(Math.cos(az), 0, -Math.sin(az));
       const rr = body.radius + alt;
       V.r.copy(bp).addScaledVector(dir, rr);
       const vc = Math.sqrt(body.mu / rr);
@@ -539,7 +540,9 @@ export class FlightSim {
       F.add(fB.applyQuaternion(V.q));
 
       // 再入加热（Sutton-Graves）
-      this.heatFlux = 1.83e-4 * Math.sqrt(rho / a.noseRadius) * speed * speed * speed;
+      // 机头朝前（上升段，有整流/细长外形）时加热较弱；尾部/隔热罩朝前的钝体再入取全值
+      const noseFirst = u > 0;
+      this.heatFlux = 1.83e-4 * Math.sqrt(rho / a.noseRadius) * speed * speed * speed * (noseFirst ? 0.5 : 1);
     } else {
       this.heatFlux = 0;
     }

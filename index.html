@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>火箭工坊 · 登月计划</title>
+    <meta name="description" content="造一枚火箭，飞向月球并安全返回。基于真实物理的火箭总装与飞行模拟。" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 4c8 8 12 20 12 32l6 10-10-2-2 8h-12l-2-8-10 2 6-10c0-12 4-24 12-32z' fill='%23f2f2ee'/%3E%3Cpath d='M26 52h12l-6 10z' fill='%23ff8a2a'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="map-overlay"></div>
+    <div id="ui"></div>
+    <div id="loading">
+      <div class="loading-inner">
+        <div class="loading-title">火箭工坊 <span>登月计划</span></div>
+        <div class="loading-sub" id="loading-text">正在生成地球与月球……</div>
+        <div class="loading-bar"><div id="loading-fill"></div></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
