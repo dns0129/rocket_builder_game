@@ -173,31 +173,28 @@ void main() {
 }
 `;
 
+// 天空最后绘制并固定在远平面（不写 gl_FragDepth），被地球、地面、火箭挡住的像素
+// 可以被显卡的提前深度测试直接剔除，不再执行昂贵的大气散射计算
 const SKY_VERT = /* glsl */ `
-#include <common>
-#include <logdepthbuf_pars_vertex>
 varying vec3 vDir;
 void main() {
   vDir = position;
   vec4 wp = modelMatrix * vec4(position, 1.0);
   gl_Position = projectionMatrix * viewMatrix * wp;
-  #include <logdepthbuf_vertex>
+  gl_Position.z = gl_Position.w * 0.99999;
 }
 `;
 
 const SKY_FRAG = /* glsl */ `
 #include <common>
-#include <logdepthbuf_pars_fragment>
 ${ATMOSPHERE_GLSL}
 ${LIGHT_GLSL}
 varying vec3 vDir;
-float hash13(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.zyx + 31.32); return fract((p.x + p.y) * p.z); }
 void main() {
-  #include <logdepthbuf_fragment>
   vec3 rd = normalize(vDir);
   vec3 ro = uCamPos - uEarthCenter;
   vec3 tr;
-  vec3 col = atmScatter(ro, rd, 1e30, uSunDir, tr, uAtmoSamples + 4, 5);
+  vec3 col = atmScatter(ro, rd, 1e30, uSunDir, tr, uAtmoSamples + 3, 4);
   // 银河
   vec3 gN = normalize(vec3(0.35, 0.82, 0.45));
   float gb = exp(-pow(dot(rd, gN) / 0.16, 2.0));
@@ -321,12 +318,12 @@ export class Planets {
       uniforms: { ...sharedUniforms },
       side: THREE.BackSide,
       depthWrite: false,
-      depthTest: false,
+      depthTest: true,
     });
     this.sky = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 32), this.skyMat);
     this.sky.scale.setScalar(1e9);
     this.sky.frustumCulled = false;
-    this.sky.renderOrder = -1000;
+    this.sky.renderOrder = 1000; // 不透明物体中最后绘制
 
     this.starMat = new THREE.ShaderMaterial({
       vertexShader: STAR_VERT,

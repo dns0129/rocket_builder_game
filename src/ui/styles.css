@@ -1,6 +1,6 @@
 :root {
   --bg: #07090d;
-  --panel: rgba(14, 19, 27, 0.72);
+  --panel: rgba(14, 19, 27, 0.84);
   --panel-solid: #111822;
   --panel-border: rgba(140, 180, 230, 0.16);
   --text: #e6edf5;
@@ -115,10 +115,10 @@ button:disabled {
   background: var(--panel);
   border: 1px solid var(--panel-border);
   border-radius: var(--radius);
-  backdrop-filter: blur(12px) saturate(1.2);
-  -webkit-backdrop-filter: blur(12px) saturate(1.2);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
 }
+
+/* 面板不再使用 backdrop-filter：三维画面每帧都在变，浏览器要为每块面板重新模糊背后的画面，显卡负担很大 */
 
 .panel h3 {
   margin: 0 0 8px;
@@ -574,6 +574,19 @@ input[type='text'] {
 
 .warp-pip.phys.on {
   background: var(--accent2);
+}
+
+.fps {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  min-width: 58px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.fps.low {
+  color: var(--warn);
 }
 
 .warp-label {

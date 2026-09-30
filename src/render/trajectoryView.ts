@@ -165,9 +165,11 @@ export class FlightTrajectory {
     const pb = this.pb.clear();
     const seg = sim.trail.last;
     if (seg && seg.body === body) {
+      // 最近 300 个点逐点画，更早的隔点抽稀（远处看不出差别，每帧少算很多）
       const n = seg.times.length;
-      const i0 = Math.max(0, n - 2000);
-      for (let i = i0; i < n; i++) {
+      const i0 = Math.max(0, n - 1500);
+      const dense = Math.max(i0, n - 300);
+      for (let i = i0; i < n; i += i < dense ? 3 : 1) {
         place(seg.pts[i * 3], seg.pts[i * 3 + 1], seg.pts[i * 3 + 2], seg.times[i], _p);
         const f = (i - i0) / Math.max(1, n - i0);
         pb.push(_p.x, _p.y, _p.z, seg.powered[i] ? TRAJ.powered : TRAJ.coast, 0.2 + 0.75 * f);
@@ -219,7 +221,14 @@ export class FlightTrajectory {
       line.visible = false;
       return;
     }
-    let budget = 1600;
+    // 点数多时隔点抽稀，但火箭附近的前 150 个点保持逐点
+    let total = 0;
+    for (const seg of pred.segments) {
+      if (seg.body !== body) break;
+      total += seg.times.length;
+    }
+    const stride = Math.max(1, Math.ceil(total / 900));
+    let budget = 1200;
     let first = true;
     for (const seg of pred.segments) {
       if (seg.body !== body || budget <= 0) break;
@@ -239,13 +248,13 @@ export class FlightTrajectory {
         place(seg.pts[k * 3], seg.pts[k * 3 + 1], seg.pts[k * 3 + 2], seg.times[k], _p);
         pb.push(_p.x, _p.y, _p.z, _c, 0);
       }
-      const end = Math.min(n, k + budget);
-      for (let i = k; i < end; i++) {
+      for (let i = k; i < n && budget > 0; ) {
         place(seg.pts[i * 3], seg.pts[i * 3 + 1], seg.pts[i * 3 + 2], seg.times[i], _p);
         segColor(seg, i, impactT, _c);
         pb.push(_p.x, _p.y, _p.z, flat ? TRAJ.ghost : _c, alpha);
+        budget--;
+        i = i === n - 1 ? n : Math.min(n - 1, i + (pb.n < 150 ? 1 : stride));
       }
-      budget -= end - k;
     }
     // 由近及远渐隐
     const N = pb.n;

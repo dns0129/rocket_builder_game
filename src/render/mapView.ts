@@ -127,9 +127,10 @@ export class MapView {
     }
 
     const starMat = new THREE.ShaderMaterial({
-      vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }',
+      // 放在远平面并做深度测试：只出现在没有星球遮挡的地方
+      vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0.99999, 1.0); }',
       fragmentShader: STAR_FRAG,
-      depthTest: false,
+      depthTest: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       transparent: true,

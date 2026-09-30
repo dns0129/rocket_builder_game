@@ -121,3 +121,57 @@ describe('prediction history', () => {
     expect(h.ghost()).toBeNull();
   });
 });
+
+describe('automatic resolution', () => {
+  it('lowers resolution when the GPU cannot keep up and recovers later', async () => {
+    const { ResolutionGovernor } = await import('../src/render/engine');
+    const g = new ResolutionGovernor(0.5);
+    // 显卡瓶颈：帧率 30，脚本只占 5 ms
+    for (let i = 0; i < 3; i++) g.step(30, 5);
+    expect(g.scale).toBeLessThan(0.6);
+    expect(g.scale).toBeGreaterThanOrEqual(0.5);
+    const low = g.scale;
+    for (let i = 0; i < 40; i++) g.step(60, 4);
+    expect(g.scale).toBeGreaterThan(low);
+    expect(g.scale).toBeLessThanOrEqual(1);
+  });
+
+  it('does not lower resolution when the frame time is spent in scripts', async () => {
+    const { ResolutionGovernor } = await import('../src/render/engine');
+    const g = new ResolutionGovernor(0.5);
+    for (let i = 0; i < 5; i++) g.step(30, 28);
+    expect(g.scale).toBe(1);
+  });
+
+  it('stops retrying a resolution that just dropped the frame rate', async () => {
+    const { ResolutionGovernor } = await import('../src/render/engine');
+    const g = new ResolutionGovernor(0.5);
+    g.step(44, 5); // 1 -> 0.9
+    const before = g.scale;
+    for (let i = 0; i < 20 && g.scale === before; i++) g.step(60, 4); // 等到它尝试恢复
+    const up = g.scale;
+    expect(up).toBeGreaterThan(before);
+    g.step(44, 5); // 升上去立刻掉帧
+    const down = g.scale;
+    expect(down).toBeLessThan(up);
+    for (let i = 0; i < 20; i++) g.step(60, 4);
+    expect(g.scale).toBeLessThan(up * 0.99 + 1e-9);
+  });
+
+  it('turns off effects once the resolution floor is reached, and restores them first', async () => {
+    const { ResolutionGovernor } = await import('../src/render/engine');
+    const g = new ResolutionGovernor(0.5);
+    for (let i = 0; i < 30; i++) g.step(25, 5);
+    expect(g.scale).toBe(0.5);
+    expect(g.detail).toBe(2);
+    let restoredEffectsAt = -1;
+    let scaledUpAt = -1;
+    for (let i = 0; i < 80; i++) {
+      g.step(60, 4);
+      if (g.detail === 0 && restoredEffectsAt < 0) restoredEffectsAt = i;
+      if (g.scale > 0.5 && scaledUpAt < 0) scaledUpAt = i;
+    }
+    expect(restoredEffectsAt).toBeGreaterThanOrEqual(0);
+    expect(scaledUpAt).toBeGreaterThan(restoredEffectsAt);
+  });
+});

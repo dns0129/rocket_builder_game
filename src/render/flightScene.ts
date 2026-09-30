@@ -30,7 +30,7 @@ export class FlightScene {
   pad: LaunchPad | null = null;
   vesselView: VesselView;
   debrisViews = new Map<number, THREE.Group>();
-  particles = new Particles();
+  particles: Particles;
   glow = new ReentryGlow();
   sepFx: SeparationFx;
   sun: THREE.DirectionalLight;
@@ -69,6 +69,7 @@ export class FlightScene {
   private envScene = new THREE.Scene();
   private envMat: THREE.ShaderMaterial;
   private envTimer = 99;
+  private envSig: number[] | null = null;
   private envRT: THREE.WebGLRenderTarget | null = null;
   private emitAcc = new Map<string, number>();
   /** 上一帧正在工作的发动机（用于点火闪光） */
@@ -79,6 +80,7 @@ export class FlightScene {
   constructor(engine: RenderEngine, maps: PlanetMaps, sim: FlightSim, mapOverlay: HTMLDivElement) {
     this.engine = engine;
     this.sim = sim;
+    this.particles = new Particles(engine.quality);
     this.planets = new Planets(maps);
     this.planets.addTo(this.scene);
     this.patch = new TerrainPatch(maps);
@@ -98,7 +100,7 @@ export class FlightScene {
 
     this.sun = new THREE.DirectionalLight(0xffffff, SUN_INTENSITY);
     this.sun.castShadow = engine.quality !== 'low';
-    this.sun.shadow.mapSize.set(engine.quality === 'high' ? 4096 : 2048, engine.quality === 'high' ? 4096 : 2048);
+    this.sun.shadow.mapSize.setScalar(engine.quality === 'high' ? 4096 : 2048);
     this.sun.shadow.bias = -0.0004;
     this.sun.shadow.normalBias = 0.03;
     this.scene.add(this.sun, this.sun.target);
@@ -556,7 +558,11 @@ export class FlightScene {
     sharedUniforms.uSunDir.value.copy(SUN_DIR);
     sharedUniforms.uCamPos.value.copy(this.camera.position);
     sharedUniforms.uEarthCenter.value.copy(earthPos).sub(origin);
-    sharedUniforms.uAtmoSamples.value = this.engine.quality === 'low' ? 6 : this.engine.quality === 'medium' ? 9 : 12;
+    // 自动降级到第 2 级时：减少大气采样、关闭阴影
+    const degraded = this.engine.detail >= 2;
+    sharedUniforms.uAtmoSamples.value = (this.engine.quality === 'low' ? 4 : this.engine.quality === 'medium' ? 6 : 10) - (degraded ? 2 : 0);
+    const wantShadow = this.engine.quality !== 'low' && !degraded;
+    if (this.sun.castShadow !== wantShadow) this.sun.castShadow = wantShadow;
     this.planets.sky.position.copy(this.camera.position);
     this.planets.stars.position.copy(this.camera.position);
     this.planets.starMat.uniforms.uPixelRatio.value = this.engine.renderer.getPixelRatio();
@@ -689,10 +695,13 @@ export class FlightScene {
     this.hemi.position.copy(tel.up);
     this.smokeLight.setRGB(0.25 + 0.75 * dayF * tr[0], 0.25 + 0.75 * dayF * tr[1], 0.27 + 0.75 * dayF * tr[2]);
 
-    // 环境贴图
+    // 环境贴图：只在天空/地面/阳光明显变化时重新生成（PMREM 生成一次代价不小）
     this.envTimer += dt;
-    if (this.envTimer > 2.5) {
+    const sig = [sky.r, sky.g, sky.b, ground.r, ground.g, ground.b, sunCol.r * occl, sunCol.g * occl, sunCol.b * occl, tel.up.x, tel.up.y, tel.up.z];
+    const changed = !this.envSig || sig.some((v, i) => Math.abs(v - this.envSig![i]) > 0.02 + Math.abs(v) * 0.08);
+    if (this.envTimer > 2.5 && changed) {
       this.envTimer = 0;
+      this.envSig = sig;
       this.envMat.uniforms.uSky.value.copy(sky).multiplyScalar(1.6).addScalar(0.01);
       this.envMat.uniforms.uGround.value.copy(ground).multiplyScalar(1.4).addScalar(0.005);
       this.envMat.uniforms.uSunDir.value.copy(SUN_DIR);

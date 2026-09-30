@@ -15,6 +15,7 @@ import { MISSIONS } from './game/missions';
 
 const QUALITY_KEY = 'rocket-game-quality';
 const VOLUME_KEY = 'rocket-game-volume';
+const AUTOSCALE_KEY = 'rocket-game-autoscale';
 
 function lsGet(k: string): string | null {
   try {
@@ -68,6 +69,7 @@ class App {
     const touch = matchMedia('(pointer: coarse)').matches;
     this.quality = stored ?? (touch ? 'low' : 'medium');
     this.engine = new RenderEngine(canvas, this.quality);
+    this.engine.setAutoScale(lsGet(AUTOSCALE_KEY) !== '0');
     const vol = parseFloat(lsGet(VOLUME_KEY) ?? '0.7');
     this.sound.volume = isFinite(vol) ? vol : 0.7;
   }
@@ -281,13 +283,16 @@ class App {
   frame(): void {
     requestAnimationFrame(() => this.frame());
     const now = performance.now();
-    const dt = Math.min(0.1, (now - this.last) / 1000);
+    const dtRaw = (now - this.last) / 1000;
+    const dt = Math.min(0.1, dtRaw);
     this.last = now;
     this.realTime += dt;
     const f = this.flight;
     if (!f) {
       this.builderScene.update();
+      const cpu = performance.now() - now;
       this.builderScene.render();
+      this.engine.adapt(dtRaw, cpu);
       return;
     }
     const sim = f.sim;
@@ -304,10 +309,14 @@ class App {
       f.maxSpeed = Math.max(f.maxSpeed, tel.orbSpeed);
     }
     f.scene.update(dt);
+    f.hud.setPerf(this.engine.fps, this.engine.pixelRatio);
     f.hud.update(dt);
     const air = tel.body.atmosphere ? tel.density / tel.body.atmosphere.rho0 : 0;
     this.sound.update(sim.paused ? 0 : tel.thrust, air, tel.dynPressure, sim.paused);
+    // 脚本耗时（不含渲染）：用来判断瓶颈在显卡还是 CPU
+    const cpu = performance.now() - now;
     f.scene.render();
+    this.engine.adapt(dtRaw, cpu);
     if (sim.destroyed && f.destroyedAt !== null && this.realTime - f.destroyedAt > 2.5 && !this.modal) this.showFailure();
   }
 
@@ -552,6 +561,36 @@ class App {
         h('h2', null, '设置'),
         h('p', null, '画质（切换后会重新载入页面）'),
         h('div', { class: 'actions', style: { marginTop: '4px' } }, q('low', '低（集显/手机）'), q('medium', '中'), q('high', '高（独显）')),
+        h('p', { style: { marginTop: '16px' } }, '自动分辨率：帧率低于 48 时自动降低渲染分辨率，保持流畅'),
+        h(
+          'div',
+          { class: 'actions', style: { marginTop: '4px' } },
+          h(
+            'button',
+            {
+              class: this.engine.autoScale ? 'on' : '',
+              onclick: () => {
+                this.engine.setAutoScale(true);
+                lsSet(AUTOSCALE_KEY, '1');
+                this.showSettings();
+              },
+            },
+            '开（推荐）',
+          ),
+          h(
+            'button',
+            {
+              class: this.engine.autoScale ? '' : 'on',
+              onclick: () => {
+                this.engine.setAutoScale(false);
+                lsSet(AUTOSCALE_KEY, '0');
+                this.showSettings();
+              },
+            },
+            '关',
+          ),
+        ),
+        h('p', { style: { color: '#8a97a8', fontSize: '12px' } }, `当前 ${this.engine.fps.toFixed(0)} 帧/秒 · 渲染分辨率 ${Math.round((this.engine.pixelRatio / (window.devicePixelRatio || 1)) * 100)}%`),
         h('p', { style: { marginTop: '16px' } }, '音量'),
         vol,
         h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => (this.flight ? this.showPause() : this.closeModal()) }, '完成')),

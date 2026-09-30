@@ -32,6 +32,8 @@ export class FlightHUD {
   /** 最近几秒的远/近拱点，用来显示变化趋势 */
   private apsisHist: { at: number; ap: number; pe: number }[] = [];
   private clock = 0;
+  private frameNo = 0;
+  private perf = { fps: 60, pr: 1 };
   private els: Record<string, HTMLElement> = {};
   private toasts: HTMLDivElement;
   private stageList: HTMLDivElement;
@@ -94,6 +96,7 @@ export class FlightHUD {
     warp.appendChild(h('button', { onclick: () => this.sim.setWarp(this.sim.warpIndex + 1), title: '加速 ( . )' }, '▶'));
     warp.appendChild(h('button', { onclick: () => this.sim.setWarp(0), title: '恢复实时 ( / )' }, '1×'));
     warp.appendChild(h('button', { onclick: () => this.cb.pause(), title: '暂停菜单 (Esc)' }, '❚❚'));
+    warp.appendChild((E.fps = h('span', { class: 'fps', title: '帧率 · 渲染分辨率（可在设置中关闭自动分辨率）' })));
     this.root.appendChild(warp);
 
     // 右上：轨道
@@ -413,13 +416,29 @@ export class FlightHUD {
     }, level === 'bad' || level === 'good' ? 5000 : 3200);
   }
 
+  /** 由主循环传入帧率与当前渲染像素比，显示在时间加速栏旁。 */
+  setPerf(fps: number, pixelRatio: number): void {
+    this.perf.fps = fps;
+    this.perf.pr = pixelRatio;
+  }
+
   update(dt: number): void {
+    this.clock += dt;
+    this.profile.update(this.sim, this.scene.history.ghost(), dt);
+    this.frameNo++;
+    // 导航球：隔帧更新（第二个 WebGL 画布，30 帧足够）
+    if (this.frameNo % 2 === 0) this.updateNavball();
+    this.updateGauges();
+    this.textTimer -= dt;
+    if (this.textTimer > 0) return;
+    this.textTimer = 0.1;
+    this.updateText();
+  }
+
+  private updateNavball(): void {
     const sim = this.sim;
     const tel = sim.telemetry;
     const V = sim.vessel;
-    this.clock += dt;
-    this.profile.update(sim, this.scene.history.ghost(), dt);
-    // 导航球（每帧）
     const vel = tel.speedModeUsed === 'surface' ? tel.vSurfVec : tel.vOrbVec;
     const bp = tel.up.clone().multiplyScalar(tel.alt + tel.body.radius);
     const nrm = new THREE.Vector3().crossVectors(bp, tel.vOrbVec).normalize();
@@ -435,15 +454,32 @@ export class FlightHUD {
       radialIn: tel.vOrbVec.length() > 1 ? radOut.clone().negate() : null,
       maneuver: nodeVec && nodeVec.lengthSq() > 1e-4 ? nodeVec : null,
     });
-    const E = this.els;
-    (E.thrFill as HTMLElement).style.height = `${V.throttle * 100}%`;
-    (E.fuelFill as HTMLElement).style.height = `${V.stageFuelFraction() * 100}%`;
-    this.updateRudder();
-    (E.heatFill as HTMLElement).style.height = `${Math.min(100, Math.max(0, ((tel.temp - 250) / Math.max(1, tel.tempMax - 250)) * 100))}%`;
+  }
 
-    this.textTimer -= dt;
-    if (this.textTimer > 0) return;
-    this.textTimer = 0.1;
+  private updateGauges(): void {
+    const sim = this.sim;
+    const tel = sim.telemetry;
+    const V = sim.vessel;
+    const E = this.els;
+    const pct = (x: number) => `${(Math.max(0, Math.min(1, x)) * 100).toFixed(1)}%`;
+    const set = (el: HTMLElement, v: string) => {
+      if (el.style.height !== v) el.style.height = v;
+    };
+    set(E.thrFill, pct(V.throttle));
+    set(E.fuelFill, pct(V.stageFuelFraction()));
+    set(E.heatFill, pct((tel.temp - 250) / Math.max(1, tel.tempMax - 250)));
+    this.updateRudder();
+  }
+
+  private updateText(): void {
+    const sim = this.sim;
+    const tel = sim.telemetry;
+    const V = sim.vessel;
+    const E = this.els;
+    const dpr = window.devicePixelRatio || 1;
+    const res = Math.round((this.perf.pr / dpr) * 100);
+    setText(E.fps, `${this.perf.fps.toFixed(0)} FPS${res < 99 ? ` · ${res}%` : ''}`);
+    E.fps.classList.toggle('low', this.perf.fps < 40);
 
     setText(E.met, fmtMET(sim.met));
     const situ = sim.destroyed

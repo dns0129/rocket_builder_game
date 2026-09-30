@@ -64,7 +64,7 @@ export class TrajectoryProfile {
   update(sim: FlightSim, ghost: Prediction | null, dt: number): void {
     this.timer -= dt;
     if (this.timer > 0) return;
-    this.timer = 0.05;
+    this.timer = 0.1;
     const tel = sim.telemetry;
     const body = tel.body;
     const R = body.radius;
@@ -238,55 +238,53 @@ export class TrajectoryProfile {
       c.strokeStyle = 'rgba(255,255,255,0.45)';
       c.lineWidth = 1.5;
       c.setLineDash([3, 3]);
-      poly(c, gh.pts, sx, sy);
+      poly(c, thin(gh.pts, 300), sx, sy);
       c.stroke();
       c.setLineDash([]);
     }
-    // 已飞过的航迹（按动力/滑行分色）
-    if (past.length) {
-      c.lineWidth = 2.4;
-      let i = 0;
-      while (i < past.length - 1) {
-        const pw = past[i].p;
-        c.beginPath();
-        c.moveTo(sx(past[i].x), sy(past[i].y));
-        let j = i + 1;
-        while (j < past.length && past[j - 1].p === pw) {
-          c.lineTo(sx(past[j].x), sy(past[j].y));
-          j++;
+    // 发光线：先画宽而淡的一层，再画细亮线（比 canvas 的 shadowBlur 便宜得多）
+    const glowStroke = (path: Path2D, rgb: string) => {
+      c.strokeStyle = `rgba(${rgb},0.22)`;
+      c.lineWidth = 6;
+      c.stroke(path);
+      c.strokeStyle = `rgb(${rgb})`;
+      c.lineWidth = 2.2;
+      c.stroke(path);
+    };
+    // 按颜色分段画折线：颜色不变的连续点合成一条路径
+    const runs = (pts: Pt[], colorOf: (i: number) => string, head?: Pt) => {
+      let path: Path2D | null = null;
+      let key = '';
+      let prev = head ?? null;
+      for (let i = 0; i < pts.length; i++) {
+        const k = colorOf(i);
+        if (k !== key || !path) {
+          if (path) glowStroke(path, key);
+          path = new Path2D();
+          key = k;
+          if (prev) path.moveTo(sx(prev.x), sy(prev.y));
+          else path.moveTo(sx(pts[i].x), sy(pts[i].y));
         }
-        c.strokeStyle = pw ? '#ff8a2a' : '#9fc8ff';
-        c.shadowColor = pw ? 'rgba(255,138,42,0.8)' : 'rgba(159,200,255,0.6)';
-        c.shadowBlur = 6;
-        c.stroke();
-        i = j - 1;
+        path.lineTo(sx(pts[i].x), sy(pts[i].y));
+        prev = pts[i];
       }
-      c.shadowBlur = 0;
-      // 从最后一个记录点连到当前位置
-      c.strokeStyle = tel.thrust > 0 ? '#ff8a2a' : '#9fc8ff';
-      c.beginPath();
-      c.moveTo(sx(past[0].x), sy(past[0].y));
-      c.lineTo(sx(0), sy(tel.alt));
-      c.stroke();
+      if (path) glowStroke(path, key);
+    };
+    // 已飞过的航迹（按动力/滑行分色），从当前位置往回画
+    if (past.length) {
+      const pts = thin(past, 400);
+      runs(pts, (i) => (pts[i].p ? '255,138,42' : '159,200,255'), { x: 0, y: tel.alt, p: 0, t });
     }
-    // 预测弹道：临近撞击的一段变红
+    // 预测弹道：临近撞击的一段逐渐变红
     if (fut.pts.length > 1) {
-      const pts = fut.pts;
+      const pts = thin(fut.pts, 500);
       const n = pts.length;
-      c.lineWidth = 2.4;
-      c.shadowBlur = 8;
-      for (let i = 0; i < n - 1; i++) {
-        const f = fut.impact ? i / (n - 1) : 0;
-        const red = fut.impact && f > 0.55 ? Math.min(1, (f - 0.55) / 0.35) : 0;
-        const col = pts[i].p ? '255,176,64' : `${Math.round(53 + red * 202)},${Math.round(208 - red * 149)},${Math.round(255 - red * 207)}`;
-        c.strokeStyle = `rgb(${col})`;
-        c.shadowColor = `rgba(${col},0.8)`;
-        c.beginPath();
-        c.moveTo(sx(pts[i].x), sy(pts[i].y));
-        c.lineTo(sx(pts[i + 1].x), sy(pts[i + 1].y));
-        c.stroke();
-      }
-      c.shadowBlur = 0;
+      runs(pts, (i) => {
+        if (pts[i].p) return '255,176,64';
+        const f = i / (n - 1);
+        const red = fut.impact && f > 0.55 ? Math.round(Math.min(1, (f - 0.55) / 0.35) * 6) / 6 : 0;
+        return `${Math.round(53 + red * 202)},${Math.round(208 - red * 149)},${Math.round(255 - red * 207)}`;
+      });
       // 最高点
       let top = pts[0];
       for (const p of pts) if (p.y > top.y) top = p;
@@ -335,6 +333,16 @@ export class TrajectoryProfile {
     c.restore();
     c.restore();
   }
+}
+
+/** 抽稀到最多 max 个点（保留首尾）。 */
+function thin(pts: Pt[], max: number): Pt[] {
+  if (pts.length <= max) return pts;
+  const k = Math.ceil(pts.length / max);
+  const out: Pt[] = [];
+  for (let i = 0; i < pts.length; i += k) out.push(pts[i]);
+  if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+  return out;
 }
 
 function poly(c: CanvasRenderingContext2D, pts: Pt[], sx: (x: number) => number, sy: (y: number) => number): void {
