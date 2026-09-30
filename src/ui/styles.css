@@ -13,6 +13,7 @@
   --radius: 10px;
   --mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Mono', Consolas, 'Menlo', monospace;
   --sans: -apple-system, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI', sans-serif;
+  color-scheme: dark;
 }
 
 * {
@@ -1066,5 +1067,47 @@ input[type='text'] {
   }
   .planner {
     width: 250px;
+  }
+}
+
+/* 窄屏：本游戏以键盘操作为主，给出提示并压缩面板 */
+.narrow-note {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  .narrow-note {
+    display: block;
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    bottom: 12px;
+    z-index: 40;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    color: var(--warn);
+    font-size: 12px;
+    text-align: center;
+    pointer-events: none;
+  }
+  .b-left {
+    width: 42vw;
+  }
+  .b-right {
+    width: 54vw;
+  }
+  .b-top {
+    display: none;
+  }
+  .hud-tr,
+  .hud-bl,
+  .sas-grid,
+  .gauges {
+    display: none;
+  }
+  .hud-br {
+    width: 150px;
   }
 }
