@@ -185,9 +185,9 @@ export class FlightTrajectory {
   visible = true;
 
   constructor(overlay: HTMLElement) {
-    this.trail = new DynLine([fadeLineMaterial({ width: 3.2 })], 40);
-    this.ghost = new DynLine([fadeLineMaterial({ width: 2 })], 42);
-    this.pred = new DynLine([fadeLineMaterial({ width: 7, opacity: 0.16 }), fadeLineMaterial({ width: 2.8 })], 44);
+    this.trail = new DynLine([fadeLineMaterial({ width: 2.4 })], 40);
+    this.ghost = new DynLine([fadeLineMaterial({ width: 1.8 })], 42);
+    this.pred = new DynLine([fadeLineMaterial({ width: 5, opacity: 0.12 }), fadeLineMaterial({ width: 2.2 })], 44);
     for (const l of [this.trail, this.ghost, this.pred]) l.addTo(this.group);
     this.labels = new ScreenLabels(overlay);
   }

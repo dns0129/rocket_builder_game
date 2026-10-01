@@ -1426,6 +1426,12 @@ input[type='text'] {
   border-top: none;
 }
 
+.map-toolbar .map-3d {
+  margin-left: 6px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
 .map-hint {
   font-size: 11px;
   color: var(--muted);

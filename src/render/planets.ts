@@ -5,6 +5,10 @@ import { ATMOSPHERE_GLSL } from './atmosphereGLSL';
 import type { PlanetMaps } from './planetBake';
 
 export const SUN_INTENSITY = 4.5; // 直射光照度（与 MeshStandardMaterial 的平行光一致）
+/** 夜面补光（相对正午的亮度）：夜面稍暗但看得清地形，不再一片漆黑 */
+export const NIGHT_LIGHT = 0.38;
+/** 夜面补光的颜色（略偏冷，像月光） */
+export const NIGHT_TINT = new THREE.Color(0.78, 0.86, 1.0);
 
 /** 有大气的天体的散射参数（1:10 尺度下的大气厚度）。 */
 export interface AtmoLook {
@@ -41,6 +45,7 @@ export const sharedUniforms = {
   uAtmBM: { value: new THREE.Vector3(6e-6, 6e-6, 6e-6) },
   uAtmG: { value: 0.78 },
   uTime: { value: 0 },
+  uNight: { value: NIGHT_LIGHT },
 };
 
 /**
@@ -83,6 +88,15 @@ uniform vec3 uCamPos;
 uniform vec3 uAtmoCenter;
 uniform int uAtmoSamples;
 uniform float uTime;
+uniform float uNight;
+// 昼夜过渡：白天按朗伯余弦，晨昏线向夜面延伸出一段较宽的渐变；
+// 夜面保留一定的冷色补光，越往夜面深处越暗一点（不再一片漆黑，也没有生硬的分界线）
+float dayTerm(float ndl) {
+  return clamp((ndl + 0.18) / 1.18, 0.0, 1.0) * (1.0 - uNight);
+}
+vec3 nightFill(float mu) {
+  return uNight * vec3(0.78, 0.86, 1.0) * mix(0.82, 1.0, smoothstep(-0.9, 0.1, mu));
+}
 // 太阳光穿过大气后的透射率（Kasten-Young 大气质量近似）
 vec3 sunTransmittance(float mu) {
   float am = 1.0 / (max(mu, 0.0) + 0.025 * exp(-11.0 * max(mu, -0.2)));
@@ -177,7 +191,8 @@ void main() {
 
   vec3 L = uSunDir;
   float muS = dot(upW, L);
-  vec3 sunT = sunTransmittance(muS) * smoothstep(-0.06, 0.03, muS);
+  // 晨昏线附近保留一点夕阳的暖色，但不让大气消光把光一下子掐灭（亮度过渡交给 dayTerm）
+  vec3 sunT = mix(sunTransmittance(max(muS, 0.0)), vec3(1.0), 0.55);
   vec3 V = normalize(uCamPos - vWorldPos);
   // 海面：近岸浅水（用模糊后的水体遮罩判断离岸远近）与流动的波浪
   if (water > 0.01) {
@@ -191,12 +206,12 @@ void main() {
       n = normalize(mix(n, bumpNormal(n, vWorldPos, wv * wf), water));
     }
   }
-  float ndl = max(dot(n, L), 0.0);
+  float ndl = dot(n, L);
   // 云影
   float cs = texture2D(uAux, vUv + vec2(uCloudOffset, 0.0)).g;
   float shadow = 1.0 - 0.45 * cs;
   vec3 skyAmb = vec3(0.03, 0.05, 0.09) * smoothstep(-0.2, 0.3, muS);
-  vec3 col = albedo * (uSunLight * RECIPROCAL_PI * ndl * sunT * shadow + skyAmb);
+  vec3 col = albedo * (uSunLight * RECIPROCAL_PI * (dayTerm(ndl) * sunT * shadow + nightFill(muS)) + skyAmb);
   // 海面高光（波浪让太阳倒影碎成闪烁的光斑）
   if (water > 0.01) {
     vec3 nw = normalize(mix(upW, n, 0.6));
@@ -244,10 +259,10 @@ void main() {
   vec3 upW = normalize(uModelRot * normalize(vLocal));
   float muS = dot(upW, uSunDir);
   // 晨昏线附近的云只在很窄的一条带内被夕阳染色，且不过分饱和
-  vec3 sunT = sunTransmittance(muS) * smoothstep(-0.02, 0.08, muS);
+  vec3 sunT = mix(sunTransmittance(max(muS, 0.0)), vec3(1.0), 0.55);
   sunT = mix(sunT, vec3(dot(sunT, vec3(0.2126, 0.7152, 0.0722))), 0.45);
   float lit = clamp(muS * 0.8 + 0.15, 0.0, 1.0);
-  vec3 col = vec3(0.92) * (uSunLight * RECIPROCAL_PI * lit * sunT) * (0.85 + 0.15 * nd * f) + vec3(0.03, 0.04, 0.06) * smoothstep(-0.2, 0.3, muS);
+  vec3 col = vec3(0.92) * uSunLight * RECIPROCAL_PI * (lit * (1.0 - uNight) * sunT + nightFill(muS)) * (0.85 + 0.15 * nd * f) + vec3(0.03, 0.04, 0.06) * smoothstep(-0.2, 0.3, muS);
   // 从云层下方看：云底较暗，越厚越暗
   float camR = length(uCamPos - uAtmoCenter);
   float cloudR = length(vWorldPos - uAtmoCenter);
@@ -291,9 +306,10 @@ void main() {
     albedo = mix(albedo, cl, uCloudMix);
     n = normalize(mix(n, upW, uCloudMix));
   }
-  float ndl = max(dot(n, uSunDir), 0.0);
-  float terminator = smoothstep(-0.02, 0.04, dot(upW, uSunDir));
-  vec3 col = albedo * uSunLight * RECIPROCAL_PI * ndl * terminator + albedo * uAmbient;
+  float ndl = dot(n, uSunDir);
+  float muS = dot(upW, uSunDir);
+  // 法线贴图的起伏只在白天起作用；晨昏线附近用几何法线限制，避免夜面出现亮斑
+  vec3 col = albedo * uSunLight * RECIPROCAL_PI * (dayTerm(min(ndl, muS + 0.25)) + nightFill(muS)) + albedo * uAmbient;
   if (uUseAtmo > 0.5) col = applyAtmo(col, vWorldPos);
   gl_FragColor = vec4(col, 1.0);
 }
@@ -317,7 +333,7 @@ void main() {
   vec3 V = normalize(uCamPos - vWorldPos);
   vec3 albedo = pow(texture2D(uColor, vUv).rgb, vec3(2.2));
   float ndl = dot(n, uSunDir);
-  float lit = smoothstep(-0.08, 0.25, ndl) * (0.35 + 0.65 * max(ndl, 0.0));
+  vec3 lit = vec3(dayTerm(ndl)) + nightFill(ndl);
   float mu = max(dot(n, V), 0.0);
   float limb = 0.55 + 0.45 * pow(mu, 0.4);
   vec3 col = albedo * uSunLight * RECIPROCAL_PI * lit * limb;
@@ -334,6 +350,7 @@ ${ATMOSPHERE_GLSL}
 ${LIGHT_GLSL}
 ${NOISE_GLSL}
 uniform vec3 uCenter;
+uniform float uSunGain;
 varying vec3 vWorldPos;
 varying vec3 vLocal;
 varying vec2 vUv;
@@ -345,7 +362,10 @@ void main() {
   float mu = max(dot(nw, V), 0.0);
   float limb = 1.0 - 0.62 * (1.0 - mu) - 0.2 * (1.0 - mu * mu);
   float g = gnoise(n * 220.0 + vec3(0.0, uTime * 0.02, 0.0), 977u) * 0.5 + gnoise(n * 55.0 - vec3(uTime * 0.01), 979u) * 0.5;
-  vec3 col = vec3(1.0, 0.86, 0.62) * (0.9 + 0.12 * g) * limb * 34.0;
+  // 近看（三维游览）时亮度降低，米粒组织与临边昏暗更明显，颜色偏橙
+  float near = clamp((1.0 - uSunGain) / 0.94, 0.0, 1.0);
+  vec3 tint = mix(vec3(1.0, 0.86, 0.62), vec3(1.0, 0.6, 0.2), near);
+  vec3 col = tint * (0.9 + mix(0.12, 0.4, near) * g) * mix(limb, limb * limb, near) * 34.0 * uSunGain;
   col = applyAtmo(col, vWorldPos);
   gl_FragColor = vec4(col, 1.0);
 }
@@ -388,12 +408,13 @@ void main() {
   vec3 p = vWorldPos - uCenter;
   float b = dot(p, uSunDir);
   float c = dot(p, p) - uPlanetR * uPlanetR;
-  float shadow = (b < 0.0 && b * b - c > 0.0) ? 0.08 : 1.0;
+  float shadow = (b < 0.0 && b * b - c > 0.0) ? 0.3 : 1.0;
   float sunSide = sign(dot(uNormalW, uSunDir));
   float camSide = sign(dot(uNormalW, uCamPos - vWorldPos));
-  float lit = sunSide == camSide ? 1.0 : 0.35;
+  float lit = sunSide == camSide ? 1.0 : 0.5;
   float inc = abs(dot(uNormalW, uSunDir));
-  vec3 col = pow(t.rgb, vec3(2.2)) * uSunLight * RECIPROCAL_PI * (0.25 + 0.75 * inc) * lit * shadow;
+  // 太阳几乎贴着环面照射时环会很暗：保留一定的底光（与星球夜面补光一致）
+  vec3 col = pow(t.rgb, vec3(2.2)) * uSunLight * RECIPROCAL_PI * (0.45 + 0.9 * inc) * lit * shadow;
   gl_FragColor = vec4(col, t.a * 0.95);
 }
 `;
@@ -414,8 +435,10 @@ const SKY_FRAG = /* glsl */ `
 #include <common>
 ${ATMOSPHERE_GLSL}
 ${LIGHT_GLSL}
+${NOISE_GLSL}
 varying vec3 vDir;
 uniform float uAureole;
+uniform float uGalaxy;
 void main() {
   vec3 rd = normalize(vDir);
   vec3 ro = uCamPos - uAtmoCenter;
@@ -425,7 +448,21 @@ void main() {
   vec3 gN = normalize(vec3(0.35, 0.82, 0.45));
   float gb = exp(-pow(dot(rd, gN) / 0.16, 2.0));
   float gn = 0.55 + 0.45 * sin(dot(rd, vec3(13.1, 7.7, 9.3))) * sin(dot(rd, vec3(-5.3, 11.9, 3.1)));
-  col += tr * vec3(0.55, 0.6, 0.75) * gb * gn * 0.012;
+  vec3 gal = vec3(0.55, 0.6, 0.75) * gb * gn * 0.012;
+  if (uGalaxy > 0.5) {
+    // 地图三维游览：更醒目的银河背景（星云状的亮带 + 暗尘埃带 + 偏暖的银心）
+    float h = dot(rd, gN);
+    float n1 = gnoise(rd * 5.0, 401u) * 0.55 + gnoise(rd * 13.0, 409u) * 0.3 + gnoise(rd * 31.0, 419u) * 0.15;
+    float band = exp(-pow(h / 0.22, 2.0));
+    float dust = smoothstep(0.02, 0.3, n1) * exp(-pow(h / 0.045, 2.0));
+    vec3 gC = normalize(vec3(0.82, -0.42, 0.39));
+    float core = exp(-pow(acos(clamp(dot(rd, gC), -1.0, 1.0)) / 0.45, 2.0));
+    gal += (vec3(0.5, 0.56, 0.72) * band * (0.55 + 0.7 * n1) + vec3(1.0, 0.82, 0.6) * core * band * 1.4) * 0.045 * (1.0 - 0.75 * dust) * uGalaxy;
+    // 远处的星云斑点
+    float neb = smoothstep(0.35, 0.75, gnoise(rd * 3.0, 431u) + 0.3);
+    gal += vec3(0.35, 0.18, 0.4) * neb * 0.012 * uGalaxy;
+  }
+  col += tr * gal;
   // 太阳周围的光晕（日面本身由太阳模型绘制）
   float sd = dot(rd, uSunDir);
   col += tr * vec3(1.0, 0.9, 0.75) * (pow(max(sd, 0.0), 4000.0) * 3.0 + pow(max(sd, 0.0), 300.0) * 0.12) * uAureole;
@@ -663,7 +700,7 @@ export class Planets {
     const sunMat = new THREE.ShaderMaterial({
       vertexShader: PLANET_VERT,
       fragmentShader: SUN_FRAG,
-      uniforms: { ...sharedUniforms, uCenter: { value: new THREE.Vector3() } },
+      uniforms: { ...sharedUniforms, uCenter: { value: new THREE.Vector3() }, uSunGain: { value: 1 } },
     });
     addVisual(SUN, sunMat, 96, sunDummy);
     this.sunGlow = new THREE.Sprite(
@@ -674,7 +711,7 @@ export class Planets {
     this.skyMat = new THREE.ShaderMaterial({
       vertexShader: SKY_VERT,
       fragmentShader: SKY_FRAG,
-      uniforms: { ...sharedUniforms, uAureole: { value: 1 } },
+      uniforms: { ...sharedUniforms, uAureole: { value: 1 }, uGalaxy: { value: 0 } },
       side: THREE.BackSide,
       depthWrite: false,
       depthTest: true,
@@ -761,7 +798,11 @@ export class Planets {
     const D = Math.min(dSun, Math.max(near * 3, 1e8));
     this.sunGlow.position.copy(camPos).addScaledVector(toSun, D / dSun);
     this.sunGlow.scale.setScalar(2 * D * Math.tan(ang / 2));
-    (this.sunGlow.material as THREE.SpriteMaterial).color.copy(glow);
+    // 近距离观察太阳（三维游览）时降低亮度，否则整个屏幕被泛光糊成一片白
+    const angR = SUN.radius / dSun;
+    const near3d = THREE.MathUtils.smoothstep(angR, 0.012, 0.12);
+    (sv.mat.uniforms.uSunGain as { value: number }).value = 1 - 0.94 * near3d;
+    (this.sunGlow.material as THREE.SpriteMaterial).color.copy(glow).multiplyScalar(1 - 0.7 * near3d);
     // 光点
     const pos = this.points.geometry.attributes.position as THREE.BufferAttribute;
     const col = this.points.geometry.attributes.aColor as THREE.BufferAttribute;

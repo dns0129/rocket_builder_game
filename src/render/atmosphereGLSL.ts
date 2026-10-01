@@ -66,7 +66,9 @@ vec3 atmScatter(vec3 ro, vec3 rd, float tMax, vec3 sunDir, out vec3 trans, int N
     // 行星本影：背着太阳一侧、离日地连线（过天体中心）的距离小于天体半径的点照不到阳光
     float pS = dot(p, sunDir);
     float dPerp = sqrt(max(dot(p, p) - pS * pS, 0.0));
-    float lit = pS > 0.0 ? 1.0 : smoothstep(ATM_R0 - ATM_HR * 0.3, ATM_R0 + ATM_HR * 0.3, dPerp);
+    // 半影放宽，晨昏线两侧的天光是渐变的，不是一条硬边
+    float pw = max(ATM_HR * 0.3, ATM_R0 * 0.012);
+    float lit = pS > 0.0 ? 1.0 : smoothstep(ATM_R0 - pw, ATM_R0 + pw, dPerp);
     // 晨昏线附近柔化
     float sunH = dot(normalize(p), sunDir);
     lit *= smoothstep(-0.05, 0.02, sunH + 0.08);

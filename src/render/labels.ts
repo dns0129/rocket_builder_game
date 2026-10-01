@@ -31,11 +31,12 @@ export class ScreenLabels {
     this.labels.push({ el, pos: pos.clone(), rot });
   }
 
-  layout(camera: THREE.Camera, w: number, h: number): void {
+  /** hidden：可选的遮挡测试（例如三维视图中被星球挡住的标签不显示）。 */
+  layout(camera: THREE.Camera, w: number, h: number, hidden?: (p: THREE.Vector3) => boolean): void {
     const v = this.v;
     for (const l of this.labels) {
       v.copy(l.pos).project(camera);
-      if (v.z > 1 || v.z < -1 || Math.abs(v.x) > 1.3 || Math.abs(v.y) > 1.3) {
+      if (v.z > 1 || v.z < -1 || Math.abs(v.x) > 1.3 || Math.abs(v.y) > 1.3 || (hidden && hidden(l.pos))) {
         l.el.style.display = 'none';
         continue;
       }

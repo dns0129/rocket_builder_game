@@ -14,6 +14,7 @@ export interface FadeLineParams {
 /**
  * 粗线材质（屏幕像素宽度）+ 逐顶点颜色 + 逐顶点透明度。
  * 透明度通过额外的 instanceAlphaStart/End 属性传入，用来让轨迹线由近及远渐隐。
+ * 线的两侧边缘各有约 1 像素的透明度渐变（抗锯齿），没有多重采样时也不会出现锯齿和“马赛克”。
  */
 export function fadeLineMaterial(p: FadeLineParams): LineMaterial {
   const m = new LineMaterial({
@@ -34,7 +35,11 @@ export function fadeLineMaterial(p: FadeLineParams): LineMaterial {
   );
   m.fragmentShader = m.fragmentShader
     .replace('void main() {', 'varying float vFade;\nvoid main() {')
-    .replace('gl_FragColor = vec4( diffuseColor.rgb, alpha );', 'gl_FragColor = vec4( diffuseColor.rgb, alpha * vFade );');
+    .replace(
+      'gl_FragColor = vec4( diffuseColor.rgb, alpha );',
+      // vUv.x 在线宽方向从 -1 变到 1；fwidth 给出每像素的变化量，换算成离边缘的像素数
+      'float aaPx = (1.0 - abs(vUv.x)) / max(fwidth(vUv.x), 1e-4);\n\tgl_FragColor = vec4( diffuseColor.rgb, alpha * vFade * clamp(aaPx * 0.9, 0.0, 1.0) );',
+    );
   return m;
 }
 
@@ -194,5 +199,56 @@ export class PolyBuilder {
   }
   flush(line: DynLine): void {
     line.set(this.n, this.pts, this.col, this.alpha);
+  }
+}
+
+/**
+ * 单位圆（抗锯齿细线，可选虚线），用对象的位置、朝向、缩放来摆放：天体轨道、影响球、大气层边界等。
+ * 顶点色为白色，颜色由材质的 color 决定，可以随时修改。
+ */
+export class RingLine {
+  private dyn: DynLine;
+  mat: LineMaterial;
+
+  constructor(segments: number, plane: 'xz' | 'xy', color: THREE.ColorRepresentation, opts: { width?: number; dashed?: boolean; renderOrder?: number } = {}) {
+    this.mat = fadeLineMaterial({ width: opts.width ?? 1.6, depthTest: false, dashed: opts.dashed });
+    this.mat.color.set(color);
+    if (opts.dashed) {
+      this.mat.dashSize = 0.025;
+      this.mat.gapSize = 0.02;
+    }
+    this.dyn = new DynLine([this.mat], opts.renderOrder ?? 45);
+    const pts: number[] = [];
+    const col: number[] = [];
+    const alpha: number[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const a = (i / segments) * Math.PI * 2;
+      if (plane === 'xz') pts.push(Math.cos(a), 0, -Math.sin(a));
+      else pts.push(Math.cos(a), Math.sin(a), 0);
+      col.push(1, 1, 1);
+      alpha.push(1);
+    }
+    this.dyn.set(segments + 1, pts, col, alpha);
+  }
+
+  get object(): LineSegments2 {
+    return this.dyn.objects[0];
+  }
+
+  set opacity(v: number) {
+    this.mat.opacity = v;
+    this.object.visible = v > 0.005;
+  }
+
+  set visible(v: boolean) {
+    this.object.visible = v;
+  }
+
+  addTo(parent: THREE.Object3D): void {
+    this.dyn.addTo(parent);
+  }
+
+  dispose(): void {
+    this.dyn.dispose();
   }
 }
