@@ -6,8 +6,23 @@
 
 ## 快速开始
 
+### Windows：双击启动
+
+1. 下载项目：GitHub 页面上点 **Code → Download ZIP** 并解压（或 `git clone`）。
+2. 双击项目文件夹里的 **`Start Game.cmd`**。
+   - **第一次运行**：如果电脑上没有 Node.js（或版本太旧），它会询问是否用 Windows 自带的 winget 自动安装 Node.js LTS（也可以选“否”，它会打开 nodejs.org 让你手动安装）；装好后关闭窗口，再双击一次。接着它会自动安装依赖（需要联网，约 1 分钟）。
+   - **之后每次**：构建游戏（几秒）→ 启动本地服务器 → 自动在默认浏览器里打开 `http://localhost:4173/`。拉取了新版本时会自动重新安装有变化的依赖。
+3. 玩完后关闭那个黑色的命令窗口即可退出。
+
+> 不能直接双击 `dist/index.html`：浏览器禁止以 `file://` 方式加载模块脚本、Web Worker 和贴图，必须通过本地服务器打开。推荐使用 Chrome 或 Edge。
+
+其他系统（或习惯命令行）可以用 `npm install` 之后 `npm start`，效果相同。
+
+### 开发
+
 ```bash
 npm install
+npm start          # 构建并在浏览器中打开游戏（http://localhost:4173）
 npm run dev        # 开发模式，浏览器打开 http://localhost:5173
 npm run build      # 生产构建，输出到 dist/
 npm run preview    # 预览生产构建

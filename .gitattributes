@@ -1,0 +1,3 @@
+# Windows 批处理文件必须使用 CRLF 换行，否则 cmd 解析标签与跳转会出错
+*.cmd text eol=crlf
+*.bat text eol=crlf
