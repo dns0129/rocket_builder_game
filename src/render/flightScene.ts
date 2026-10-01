@@ -275,13 +275,14 @@ export class FlightScene {
     this.setMapFocus(this.mapFocusBody(), !this.map3d);
   }
 
-  /** 进入三维游览：从太阳一侧斜着看过去（大半个星球是亮的），距离约为天体半径的 3 倍。 */
+  /** 进入三维游览：从太阳一侧斜着看过去（大半个星球是亮的），星球约占画面高度的六成。 */
   private initOrbit(): void {
     const sim = this.sim;
     const f = this.mapFocusBody();
     const center = f === 'vessel' ? sim.vessel.r.clone() : bodyPosition(BODY_BY_ID[f], sim.t, new THREE.Vector3());
     const sd = f === 'sun' ? new THREE.Vector3(1, 0, 0) : sunDirection(center, sim.t, new THREE.Vector3());
-    this.orbYaw = Math.atan2(sd.z, sd.x) - 0.75;
+    // 从太阳一侧偏开约 60°：大半个星球是亮的，一侧露出晨昏线，低角度的光让地形起伏更立体
+    this.orbYaw = Math.atan2(sd.z, sd.x) - 1.05;
     this.orbPitch = 0.38;
     // 星球约占画面高度的 60%，四周留出星空背景；土星要把光环也框进来
     const k = f === 'saturn' ? 7.5 : f === 'sun' ? 5 : 4.6;

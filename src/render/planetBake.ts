@@ -361,27 +361,41 @@ void main() {
 }
 
 const MERCURY_COLOR = /* glsl */ `
-  float hl = 0.36 + 0.06 * gnoise(d * 40.0, 191u) + 0.03 * gnoise(d * 160.0, 193u);
-  vec3 high = vec3(hl) * vec3(1.0, 0.95, 0.88);
-  vec3 low = vec3(0.27 + 0.03 * gnoise(d * 30.0, 197u)) * vec3(0.96, 0.93, 0.9);
+  float hl = 0.3 + 0.06 * gnoise(d * 40.0, 191u) + 0.03 * gnoise(d * 160.0, 193u) + 0.02 * gnoise(d * 640.0, 195u);
+  vec3 high = vec3(hl) * vec3(1.0, 0.94, 0.86);
+  vec3 low = vec3(0.21 + 0.03 * gnoise(d * 30.0, 197u)) * vec3(0.95, 0.91, 0.87);
   col = mix(high, low, t.y);
   col += vec3(0.3) * clamp(t.z, 0.0, 1.2);
   col *= 0.92 + 0.08 * smoothstep(-2000.0, 3000.0, t.x);
 `;
 
 const MARS_COLOR = /* glsl */ `
-  float n1 = gnoise(d * 6.0, 211u) * 0.5 + gnoise(d * 24.0, 213u) * 0.25 + gnoise(d * 96.0, 217u) * 0.12;
-  vec3 rust = vec3(0.62, 0.31, 0.16);
-  vec3 ochre = vec3(0.74, 0.5, 0.3);
-  vec3 dark = vec3(0.29, 0.17, 0.11);
+  float n1 = gnoise(d * 6.0, 211u) * 0.5 + gnoise(d * 24.0, 213u) * 0.25 + gnoise(d * 96.0, 217u) * 0.12 + gnoise(d * 384.0, 219u) * 0.06;
+  vec3 wq = vec3(gnoise(d * 3.0, 241u), gnoise(d * 3.0 + 5.3, 243u), gnoise(d * 3.0 + 9.1, 245u));
+  float dk = gnoise(d * 4.0 + wq * 1.4, 247u) + 0.5 * gnoise(d * 9.0 + wq, 249u);
+  vec3 rust = vec3(0.6, 0.27, 0.12);
+  vec3 ochre = vec3(0.74, 0.46, 0.25);
+  vec3 butter = vec3(0.78, 0.56, 0.35);
+  vec3 dark = vec3(0.3, 0.16, 0.09);
+  vec3 basalt = vec3(0.36, 0.22, 0.15);
   col = mix(rust, ochre, smoothstep(-0.3, 0.5, n1));
-  // 北部低地与暗色区（类似大瑟提斯）
-  col = mix(col, dark, smoothstep(0.25, 0.8, t.y + n1 * 0.35) * 0.7);
-  col += vec3(0.1, 0.07, 0.05) * clamp(t.z, 0.0, 1.0);
-  col *= 0.9 + 0.1 * smoothstep(-3000.0, 3000.0, t.x);
-  // 极冠
-  float cap = smoothstep(1.2, 1.3, abs(lat) + n1 * 0.08);
-  col = mix(col, vec3(0.93, 0.92, 0.9), cap);
+  col = mix(col, butter, smoothstep(0.35, 0.7, n1 + 0.2 * dk) * 0.5);
+  // 经典的暗色反照率区（类似大瑟提斯、子午湾）：边缘较清晰，带风蚀的条纹
+  float darkA = smoothstep(0.12, 0.5, dk + 0.25 * t.y) * (1.0 - smoothstep(1.0, 1.25, abs(lat)));
+  float streak = gnoise(d * vec3(40.0, 8.0, 40.0) + wq * 3.0, 251u);
+  col = mix(col, mix(dark, basalt, 0.5 + 0.5 * streak), darkA * 0.62);
+  // 北部低地
+  col = mix(col, dark * 1.2, smoothstep(0.25, 0.8, t.y + n1 * 0.35) * 0.45);
+  col += vec3(0.12, 0.08, 0.05) * clamp(t.z, 0.0, 1.0);
+  col *= 0.88 + 0.12 * smoothstep(-3000.0, 3000.0, t.x);
+  // 极冠：边缘有螺旋状的槽沟与层状纹理
+  float pa = atan(d.z, d.x);
+  float spiral = sin(pa * 3.0 + (1.5708 - abs(lat)) * 40.0 + n1 * 4.0);
+  float capEdge = abs(lat) + n1 * 0.08 + 0.015 * spiral;
+  float cap = smoothstep(1.2, 1.28, capEdge);
+  vec3 ice = vec3(0.93, 0.92, 0.9) * (0.92 + 0.08 * spiral);
+  col = mix(col, ice, cap);
+  col = mix(col, vec3(0.75, 0.62, 0.5), smoothstep(1.12, 1.2, capEdge) * (1.0 - cap) * 0.35);
 `;
 
 const VENUS_SURFACE_COLOR = /* glsl */ `
@@ -404,11 +418,17 @@ void main() {
   float lat = (uv.y - 0.5) * PI;
   vec3 d = dirFromLatLon(lat, lon);
   float w = fbm(d * 2.5, 4, 601u);
-  float sw = fbm(d * vec3(3.0, 9.0, 3.0) + w * 1.5, 5, 607u);
+  vec3 wq = vec3(w, fbm(d * 2.5 + 3.7, 4, 603u), fbm(d * 2.5 + 8.1, 4, 605u));
+  float sw = fbm(d * vec3(3.0, 9.0, 3.0) + wq * 1.5, 6, 607u);
+  // 斜向的条纹（超级自转的风把云拉成长条，向两极呈“V”形）
+  float streaks = fbm(d * vec3(6.0, 40.0, 6.0) + wq * 2.0 + vec3(0.0, abs(lat) * 2.0, 0.0), 5, 611u);
   float bands = sin(lat * 10.0 + sw * 3.0 + lon * 0.6 * cos(lat));
-  vec3 c1 = vec3(0.95, 0.9, 0.74);
-  vec3 c2 = vec3(0.83, 0.71, 0.49);
-  vec3 col = mix(c2, c1, bands * 0.3 + 0.5 + sw * 0.25);
+  vec3 c1 = vec3(0.96, 0.91, 0.76);
+  vec3 c2 = vec3(0.8, 0.67, 0.45);
+  vec3 col = mix(c2, c1, bands * 0.3 + 0.5 + sw * 0.3);
+  col *= 0.9 + 0.16 * streaks;
+  // 极地的冷色云环
+  col = mix(col, vec3(0.86, 0.84, 0.78), exp(-pow((abs(lat) - 1.15) / 0.08, 2.0)) * 0.4);
   // 赤道附近的“Y”形暗纹
   float y = exp(-pow(lat / 0.35, 2.0)) * smoothstep(0.1, 0.5, sin(lon * 1.0 + abs(lat) * 2.5 + w));
   col *= 1.0 - 0.18 * y;
@@ -417,36 +437,144 @@ void main() {
 }
 `;
 
-/** 气态巨行星：随纬度交替的亮带（zone）与暗带（belt），带湍流与大红斑。 */
-function gasFrag(seed: number, zone: string, belt: string, polar: string, bandFreq: number, turb: number, redSpot: boolean): string {
+interface GasLook {
+  seed: number;
+  zone: string;
+  belt: string;
+  beltDark: string;
+  accent: string;
+  polar: string;
+  bandFreq: number;
+  turb: number;
+  redSpot: boolean;
+  hexagon: boolean;
+  /** 白色卵形风暴所在的纬度（弧度）、每圈个数、大小（弧度）、出现概率 */
+  ovals: [number, number, number, number][];
+}
+
+/**
+ * 气态巨行星：随纬度交替的亮带（zone）与暗带（belt）。
+ * 多尺度湍流（纬向拉伸的域扭曲）、带边缘的剪切波、细丝、白色卵形风暴、
+ * 木星的大红斑（螺旋结构）、斑驳的极区与土星北极六边形。
+ */
+function gasFrag(g: GasLook): string {
+  const S = g.seed;
+  const f = (x: number) => x.toFixed(4);
+  const ovalCalls = g.ovals
+    .map(([lat0, n, size, prob], i) => `  ov = max(ov, ovals(lon, lat, ${f(lat0)}, ${n.toFixed(1)}, ${f(size)}, ${f(prob)}, ${S + 40 + i * 3}u, w.x));`)
+    .join('\n');
   return /* glsl */ `
 ${COMMON}
 ${NOISE_GLSL}
 ${FBM_GLSL}
 layout(location = 0) out vec4 oColor;
+// 沿某一纬度排成一串的卵形风暴：返回 x = 覆盖度，y = 暗边
+vec2 ovals(float lon, float lat, float lat0, float n, float size, float prob, uint seed, float jit) {
+  vec2 res = vec2(0.0);
+  float cellW = 6.2831853 / n;
+  float c0 = floor((lon + 3.14159265) / cellW);
+  for (int k = -1; k <= 1; k++) {
+    float c = c0 + float(k);
+    uint h = hash3u(ivec3(int(c) + 1000, int(lat0 * 100.0) + 1000, 7), seed);
+    if (hashToFloat(h) > prob) continue;
+    h = nextHash(h);
+    float cx = (c + 0.25 + 0.5 * hashToFloat(h)) * cellW - 3.14159265;
+    h = nextHash(h);
+    float sz = size * (0.55 + 0.6 * hashToFloat(h));
+    h = nextHash(h);
+    float cy = lat0 + (hashToFloat(h) - 0.5) * size * 0.8 + jit * 0.01;
+    float dl = lon - cx;
+    dl -= 6.2831853 * floor((dl + 3.14159265) / 6.2831853);
+    float e = pow(dl * cos(lat) / (sz * 1.6), 2.0) + pow((lat - cy) / sz, 2.0);
+    res.x = max(res.x, 1.0 - smoothstep(0.55, 1.0, e));
+    res.y = max(res.y, smoothstep(0.8, 1.05, e) * (1.0 - smoothstep(1.05, 1.6, e)));
+  }
+  return res;
+}
 void main() {
   vec2 uv = gl_FragCoord.xy / uRes;
   float lon = (uv.x - 0.5) * 2.0 * PI;
   float lat = (uv.y - 0.5) * PI;
   vec3 d = dirFromLatLon(lat, lon);
-  // 纬向拉伸的湍流：沿经度方向拉长
-  vec3 q = d * vec3(2.0, 12.0, 2.0);
-  float w = fbm(q, 5, ${seed}u);
-  float w2 = fbm(d * vec3(5.0, 40.0, 5.0) + w * 0.8, 4, ${seed + 11}u);
-  float y = lat + ${turb.toFixed(3)} * w + ${(turb * 0.35).toFixed(3)} * w2;
-  float b = sin(y * ${bandFreq.toFixed(2)}) + 0.35 * sin(y * ${(bandFreq * 2.3).toFixed(2)} + 1.3);
-  vec3 col = mix(${belt}, ${zone}, smoothstep(-0.55, 0.55, b));
-  col *= 0.92 + 0.08 * w2;
-  col = mix(col, ${polar}, smoothstep(1.0, 1.35, abs(lat)));
+  float alat = abs(lat);
+  // 大尺度扰动（纬向拉伸的域扭曲）
+  vec3 q = d * vec3(2.5, 11.0, 2.5);
+  vec3 w = vec3(fbm(q, 4, ${S}u), fbm(q + vec3(5.2, 1.3, 2.8), 4, ${S + 1}u), fbm(q + vec3(1.7, 9.2, 3.4), 4, ${S + 2}u));
+  // 多次迭代的流场扭曲：沿经度（东西向）的位移远大于南北向，云带边缘被卷成涡旋
+  vec3 east = vec3(-sin(lon), 0.0, -cos(lon));
+  vec3 north = vec3(-sin(lat) * cos(lon), cos(lat), sin(lat) * sin(lon));
+  vec3 pw = d;
+  for (int i = 0; i < 3; i++) {
+    float k = float(i + 1);
+    vec3 qq = pw * vec3(3.0, 16.0, 3.0) * k;
+    float a = fbm(qq, 4, ${S + 30}u + uint(i) * 5u);
+    float b = fbm(qq + vec3(7.3, 2.1, 4.4), 4, ${S + 33}u + uint(i) * 5u);
+    pw = normalize(pw + (east * a * 0.07 + north * b * ${f(g.turb * 0.35)}) / k);
+  }
+  float latW = asin(clamp(pw.y, -1.0, 1.0));
+  // 细丝：更细、沿经度拉得更长（在扭曲后的坐标里）
+  float fil = fbm(pw * vec3(12.0, 80.0, 12.0) + w * 1.6, 7, ${S + 3}u);
+  float fil2 = fbm(pw * vec3(30.0, 200.0, 30.0) + w * 2.4 + fil, 5, ${S + 4}u);
+  float y = latW + ${f(g.turb)} * w.x + ${f(g.turb * 0.45)} * fil;
+  float F = ${f(g.bandFreq)};
+  float b = sin(y * F) + 0.4 * sin(y * F * 2.3 + 1.3) + 0.18 * sin(y * F * 4.7 + 0.4);
+  float zoneMix = smoothstep(-0.45, 0.45, b);
+  vec3 col = mix(${g.belt}, ${g.zone}, zoneMix);
+  // 暗带中心更深更红，亮带中心更白
+  col = mix(col, ${g.beltDark}, smoothstep(-0.55, -1.25, b) * 0.65);
+  col = mix(col, ${g.zone} * 1.04, smoothstep(0.7, 1.3, b) * 0.4);
+  // 带边缘的剪切波（开尔文-亥姆霍兹不稳定）：卷起的波纹
+  float edge = 1.0 - smoothstep(0.0, 0.32, abs(b));
+  float kh = sin(lon * 34.0 + fil * 7.0 + w.y * 9.0 + y * 60.0);
+  col = mix(col, mix(${g.beltDark}, ${g.zone}, 0.5 + 0.5 * kh), edge * 0.38);
+  // 细丝与更细的纹理
+  col *= 0.86 + 0.2 * (fil * 0.5 + 0.5) + 0.08 * fil2;
+  // 色调变化（暗带里偏蓝灰的“彩饰”）
+  col = mix(col, ${g.accent}, smoothstep(0.15, 0.55, fbm(d * vec3(5.0, 26.0, 5.0) + w * 1.2, 4, ${S + 5}u)) * 0.3 * (1.0 - zoneMix));
+  // 白色卵形风暴
+  vec2 ov = vec2(0.0);
+${ovalCalls}
+  col = mix(col, ${g.beltDark} * 0.9, ov.y * 0.35);
+  col = mix(col, ${g.zone} * 1.06 * (0.94 + 0.08 * fil), ov.x * 0.85);
   ${
-    redSpot
+    g.redSpot
       ? `{
+    // 大红斑：椭圆涡旋，内部是螺旋状的云，外面一圈浅色的环
     float dl = lon - 0.6;
     dl -= 6.2831853 * floor((dl + 3.14159265) / 6.2831853);
-    float e = pow(dl / 0.16, 2.0) + pow((lat + 0.39) / 0.075, 2.0);
-    float swirl = fbm(vec3(dl * 8.0, (lat + 0.39) * 14.0, e), 3, ${seed + 23}u);
-    col = mix(col, vec3(0.74, 0.36, 0.24) * (0.9 + 0.2 * swirl), (1.0 - smoothstep(0.6, 1.0, e)) * 0.9);
-    col = mix(col, vec3(0.95, 0.88, 0.8), smoothstep(1.0, 1.15, e) * (1.0 - smoothstep(1.15, 1.6, e)) * 0.35);
+    vec2 e2 = vec2(dl / 0.17, (lat + 0.39) / 0.08);
+    float e = dot(e2, e2);
+    float ang = atan(e2.y, e2.x);
+    float spiral = sin(ang * 2.0 + sqrt(e) * 9.0 + fil * 2.0) * 0.5 + 0.5;
+    float swirl = fbm(vec3(e2 * 3.0, e * 2.0), 4, ${S + 23}u);
+    vec3 red = mix(vec3(0.66, 0.3, 0.2), vec3(0.85, 0.48, 0.32), spiral * 0.6 + swirl * 0.4);
+    red = mix(red, vec3(0.9, 0.62, 0.45), smoothstep(0.35, 0.0, e) * 0.5);
+    col = mix(col, red, (1.0 - smoothstep(0.6, 1.0, e)) * 0.92);
+    col = mix(col, vec3(0.96, 0.9, 0.82), smoothstep(1.0, 1.15, e) * (1.0 - smoothstep(1.15, 1.7, e)) * 0.45);
+  }`
+      : ''
+  }
+  // 极区：颜色转灰蓝，布满小气旋
+  float pole = smoothstep(1.0, 1.3, alat);
+  float mott = fbm(d * 16.0 + w * 2.0, 5, ${S + 7}u);
+  vec3 pc = ${g.polar} * (0.82 + 0.36 * (mott * 0.5 + 0.5));
+  vec2 cy = vec2(0.0);
+  cy = max(cy, ovals(lon, lat, 1.36, 9.0, 0.035, 0.8, ${S + 61}u, 0.0));
+  cy = max(cy, ovals(lon, lat, -1.36, 9.0, 0.035, 0.8, ${S + 67}u, 0.0));
+  pc = mix(pc, pc * 1.15, cy.x * 0.6);
+  pc = mix(pc, pc * 0.75, cy.y * 0.5);
+  col = mix(col, pc, pole);
+  ${
+    g.hexagon
+      ? `{
+    // 土星北极六边形
+    float rho = 1.5707963 - lat;
+    float a = mod(lon + 0.2, 1.0471976) - 0.5235988;
+    float hexR = rho * cos(a) / 0.8660254;
+    float ring = exp(-pow((hexR - 0.24) / 0.018, 2.0));
+    col = mix(col, ${g.polar} * vec3(0.78, 0.86, 0.95), smoothstep(0.26, 0.2, hexR) * 0.55);
+    col = mix(col, ${g.polar} * 0.7, ring * 0.6);
+    col = mix(col, ${g.polar} * 0.55, exp(-pow(rho / 0.03, 2.0)) * 0.8);
   }`
       : ''
   }
@@ -496,6 +624,9 @@ export interface BodyMaps {
   clouds?: THREE.Texture;
 }
 
+/** 烘焙贴图包含的撞击坑层级（0 = 半径 20 km 起）；更小的撞击坑由星球着色器在近处实时计算 */
+export const BAKE_CRATER_LEVEL = 3;
+
 export interface PlanetMaps {
   earthColor: THREE.Texture;
   earthAux: THREE.Texture;
@@ -542,7 +673,7 @@ export async function bakePlanets(
   const src = await loadEarthSources((f) => onProgress(f * 0.35));
   const bakeProgress = (f: number) => onProgress(0.35 + f * 0.65);
   const maxTex = renderer.capabilities.maxTextureSize;
-  const mw = quality === 'low' ? 1024 : 2048;
+  const mw = Math.min(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096, maxTex);
   const scene = new THREE.Scene();
   const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
@@ -619,8 +750,11 @@ export async function bakePlanets(
     readSource = earthColor;
   }
   // ---- 其他行星
-  const pw = quality === 'low' ? 512 : 1024;
-  const marsW = quality === 'low' ? 1024 : 2048;
+  // 分辨率：低画质 1024，中 2048，高画质的火星、月球与气态巨行星 4096（4096 受显卡上限约束）
+  const cap = (w: number) => Math.min(w, maxTex);
+  const pw = cap(quality === 'low' ? 1024 : 2048);
+  const marsW = cap(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096);
+  const gasW = cap(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096);
   const bodies: Partial<Record<BodyId, BodyMaps>> = {};
   const rockyJob = (id: BodyId, w: number, color: string, radius: number) => {
     const rt = makeTarget(w, w / 2, 2);
@@ -632,7 +766,7 @@ export async function bakePlanets(
         glslVersion: THREE.GLSL3,
         vertexShader: VERT,
         fragmentShader: rockyFrag(id, color),
-        uniforms: { uRes: { value: new THREE.Vector2(w, w / 2) }, uMaxLevel: { value: quality === 'low' ? 3 : 4 }, uRadius: { value: radius } },
+        uniforms: { uRes: { value: new THREE.Vector2(w, w / 2) }, uMaxLevel: { value: BAKE_CRATER_LEVEL }, uRadius: { value: radius } },
       }),
     });
     bodies[id] = { color: rt.textures[0], normal: rt.textures[1] };
@@ -651,8 +785,47 @@ export async function bakePlanets(
   rockyJob('venus', pw, VENUS_SURFACE_COLOR, 605_180);
   bodies.venus!.clouds = colorJob(pw, VENUS_CLOUD_FRAG);
   rockyJob('mars', marsW, MARS_COLOR, 338_950);
-  bodies.jupiter = { color: colorJob(pw, gasFrag(701, 'vec3(0.94, 0.88, 0.77)', 'vec3(0.66, 0.46, 0.31)', 'vec3(0.62, 0.6, 0.56)', 15.0, 0.05, true)) };
-  bodies.saturn = { color: colorJob(pw, gasFrag(733, 'vec3(0.93, 0.85, 0.65)', 'vec3(0.8, 0.69, 0.48)', 'vec3(0.72, 0.7, 0.62)', 19.0, 0.025, false)) };
+  bodies.jupiter = {
+    color: colorJob(
+      gasW,
+      gasFrag({
+        seed: 701,
+        zone: 'vec3(0.96, 0.92, 0.84)',
+        belt: 'vec3(0.64, 0.43, 0.28)',
+        beltDark: 'vec3(0.44, 0.26, 0.16)',
+        accent: 'vec3(0.5, 0.52, 0.6)',
+        polar: 'vec3(0.62, 0.61, 0.6)',
+        bandFreq: 15,
+        turb: 0.06,
+        redSpot: true,
+        hexagon: false,
+        ovals: [
+          [-0.58, 9, 0.022, 0.8],
+          [0.36, 7, 0.016, 0.5],
+          [-0.75, 6, 0.02, 0.5],
+          [0.62, 8, 0.015, 0.45],
+        ],
+      }),
+    ),
+  };
+  bodies.saturn = {
+    color: colorJob(
+      gasW,
+      gasFrag({
+        seed: 733,
+        zone: 'vec3(0.93, 0.86, 0.66)',
+        belt: 'vec3(0.82, 0.71, 0.5)',
+        beltDark: 'vec3(0.72, 0.6, 0.41)',
+        accent: 'vec3(0.86, 0.8, 0.62)',
+        polar: 'vec3(0.66, 0.68, 0.66)',
+        bandFreq: 19,
+        turb: 0.025,
+        redSpot: false,
+        hexagon: true,
+        ovals: [[0.7, 5, 0.014, 0.35]],
+      }),
+    ),
+  };
 
   const moonRT = makeTarget(mw, mw / 2, 2);
   jobs.push({
@@ -663,7 +836,7 @@ export async function bakePlanets(
       glslVersion: THREE.GLSL3,
       vertexShader: VERT,
       fragmentShader: MOON_FRAG,
-      uniforms: { uRes: { value: new THREE.Vector2(mw, mw / 2) }, uMaxLevel: { value: quality === 'low' ? 3 : 4 } },
+      uniforms: { uRes: { value: new THREE.Vector2(mw, mw / 2) }, uMaxLevel: { value: BAKE_CRATER_LEVEL } },
     }),
   });
 

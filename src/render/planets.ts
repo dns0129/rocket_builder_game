@@ -2,7 +2,8 @@ import * as THREE from 'three';
 import { AU, BODIES, EARTH, MARS, SATURN, SUN, VENUS, type Body, type BodyId, bodyPosition, bodyRotation } from '../physics/bodies';
 import { NOISE_GLSL } from '../physics/noise';
 import { ATMOSPHERE_GLSL } from './atmosphereGLSL';
-import type { PlanetMaps } from './planetBake';
+import { BAKE_CRATER_LEVEL, type PlanetMaps } from './planetBake';
+import { ROCKY_COMMON_GLSL, TERRAIN } from '../physics/terrain';
 
 export const SUN_INTENSITY = 4.5; // 直射光照度（与 MeshStandardMaterial 的平行光一致）
 /** 夜面补光（相对正午的亮度）：夜面稍暗但看得清地形，不再一片漆黑 */
@@ -273,12 +274,21 @@ void main() {
 }
 `;
 
-/** 岩质天体（月球、水星、金星、火星）：贴图 + 法线贴图；金星从云层上方看到的是云顶。 */
-const ROCKY_FRAG = /* glsl */ `
+/**
+ * 岩质天体（月球、水星、金星、火星）：贴图 + 法线贴图；金星从云层上方看到的是云顶。
+ * 近看时，比烘焙贴图更小的撞击坑在着色器里实时计算（与物理地形是同一个函数，看到的坑就是会撞上的坑），
+ * 再叠加两层细小的明暗与起伏；都按每个像素覆盖的地面尺寸淡入，远看不增加开销。
+ */
+function rockyFrag(body: Body): string {
+  const T = TERRAIN[body.id];
+  const levels = T ? T.craterLevels : 0;
+  return /* glsl */ `
 #include <common>
 #include <logdepthbuf_pars_fragment>
 ${ATMOSPHERE_GLSL}
 ${LIGHT_GLSL}
+${ROCKY_COMMON_GLSL}
+${BUMP_GLSL}
 uniform sampler2D uColor;
 uniform sampler2D uNormal;
 uniform sampler2D uClouds;
@@ -291,6 +301,17 @@ uniform float uAmbient;
 varying vec3 vWorldPos;
 varying vec3 vLocal;
 varying vec2 vUv;
+const float BODY_R = ${body.radius.toFixed(1)};
+vec2 craterDetail(vec3 p, float px) {
+  vec2 s = vec2(0.0);
+  for (int l = ${BAKE_CRATER_LEVEL + 1}; l < ${levels}; l++) {
+    float r = CRATER_RMAX[l];
+    float fade = 1.0 - smoothstep(r * 0.3, r * 0.8, px);
+    if (fade <= 0.0) break;
+    s += craterLevel(p, l, ${T?.craterSeed ?? 0}, ${(T?.craterProb ?? 0).toFixed(4)}) * fade;
+  }
+  return s;
+}
 void main() {
   #include <logdepthbuf_fragment>
   vec3 up = normalize(vLocal);
@@ -301,6 +322,21 @@ void main() {
   vec3 east = normalize(vec3(up.z, 0.0, -up.x) + vec3(1e-6, 0.0, 0.0));
   vec3 north = cross(up, east);
   vec3 n = normalize(uModelRot * normalize(east * nt.x + north * nt.y + up * nt.z));
+  // 近处细节（金星从云层上方看时不需要）
+  float surf = 1.0 - uCloudMix;
+  if (surf > 0.0) {
+    float px = length(fwidth(vWorldPos));
+    vec3 P = up * BODY_R;
+    vec2 cd = craterDetail(P, px);
+    float f1 = 1.0 - smoothstep(700.0, 2500.0, px);
+    float f2 = 1.0 - smoothstep(120.0, 450.0, px);
+    float m1 = f1 > 0.0 ? gnoise(P / 1800.0, 701u) * 0.6 + gnoise(P / 700.0, 703u) * 0.4 : 0.0;
+    float m2 = f2 > 0.0 ? gnoise(P / 260.0, 709u) * 0.6 + gnoise(P / 90.0, 711u) * 0.4 : 0.0;
+    albedo *= 1.0 + (m1 * 0.16 * f1 + m2 * 0.12 * f2) * surf;
+    albedo *= 1.0 + clamp(cd.y, 0.0, 1.5) * 0.45 * surf;
+    float hd = cd.x + m1 * 60.0 * f1 + m2 * 10.0 * f2;
+    n = bumpNormal(n, vWorldPos, hd * surf);
+  }
   if (uCloudMix > 0.0) {
     vec3 cl = pow(texture2D(uClouds, vUv).rgb, vec3(2.2));
     albedo = mix(albedo, cl, uCloudMix);
@@ -314,6 +350,7 @@ void main() {
   gl_FragColor = vec4(col, 1.0);
 }
 `;
+}
 
 /** 气态巨行星：带状云 + 临边昏暗 + 一圈淡淡的大气辉光。 */
 const GAS_FRAG = /* glsl */ `
@@ -321,9 +358,11 @@ const GAS_FRAG = /* glsl */ `
 #include <logdepthbuf_pars_fragment>
 ${ATMOSPHERE_GLSL}
 ${LIGHT_GLSL}
+${NOISE_GLSL}
 uniform sampler2D uColor;
 uniform vec3 uCenter;
 uniform vec3 uRim;
+uniform float uRadius;
 varying vec3 vWorldPos;
 varying vec3 vLocal;
 varying vec2 vUv;
@@ -331,7 +370,24 @@ void main() {
   #include <logdepthbuf_fragment>
   vec3 n = normalize(vWorldPos - uCenter);
   vec3 V = normalize(uCamPos - vWorldPos);
-  vec3 albedo = pow(texture2D(uColor, vUv).rgb, vec3(2.2));
+  // 近看时的细节：沿经度拉长的细丝与小涡旋（贴图坐标被轻微扭曲），按像素尺寸淡入
+  vec3 up = normalize(vLocal);
+  float px = length(fwidth(vWorldPos));
+  float f1 = 1.0 - smoothstep(uRadius * 0.003, uRadius * 0.01, px);
+  float f2 = 1.0 - smoothstep(uRadius * 0.0008, uRadius * 0.0025, px);
+  vec2 tuv = vUv;
+  float fineA = 0.0;
+  float fineB = 0.0;
+  if (f1 > 0.0) {
+    vec3 q = up * vec3(70.0, 420.0, 70.0);
+    float a = gnoise(q, 811u);
+    float b = gnoise(q * 1.9 + a * 1.5, 813u);
+    tuv += vec2(a * 0.0012, b * 0.0004) * f1;
+    fineA = gnoise(up * vec3(160.0, 900.0, 160.0) + vec3(a, b, a) * 1.2, 817u) * f1;
+  }
+  if (f2 > 0.0) fineB = gnoise(up * vec3(520.0, 2800.0, 520.0) + fineA * 2.0, 819u) * f2;
+  vec3 albedo = pow(texture2D(uColor, tuv).rgb, vec3(2.2));
+  albedo *= 1.0 + 0.14 * fineA + 0.08 * fineB;
   float ndl = dot(n, uSunDir);
   vec3 lit = vec3(dayTerm(ndl)) + nightFill(ndl);
   float mu = max(dot(n, V), 0.0);
@@ -362,10 +418,26 @@ void main() {
   float mu = max(dot(nw, V), 0.0);
   float limb = 1.0 - 0.62 * (1.0 - mu) - 0.2 * (1.0 - mu * mu);
   float g = gnoise(n * 220.0 + vec3(0.0, uTime * 0.02, 0.0), 977u) * 0.5 + gnoise(n * 55.0 - vec3(uTime * 0.01), 979u) * 0.5;
+  // 近看时更细的米粒组织
+  float pxs = length(fwidth(vWorldPos));
+  float fg = 1.0 - smoothstep(${(SUN.radius * 0.002).toFixed(1)}, ${(SUN.radius * 0.006).toFixed(1)}, pxs);
+  if (fg > 0.0) g = mix(g, g * 0.6 + gnoise(n * 900.0 + vec3(uTime * 0.03), 981u) * 0.6, fg);
+  // 太阳黑子：活动带（南北纬约 5°~35°）里成群出现，暗的本影外面是带纹理的半影
+  float slat = abs(n.y);
+  float band = smoothstep(0.08, 0.16, slat) * (1.0 - smoothstep(0.5, 0.62, slat));
+  float grp = gnoise(n * 6.0, 961u) * 0.6 + gnoise(n * 14.0, 963u) * 0.4;
+  float sp = gnoise(n * 48.0, 967u) + 0.35 * gnoise(n * 130.0, 971u);
+  float act = band * smoothstep(0.22, 0.42, grp);
+  float pen = act * smoothstep(0.12, 0.3, sp);
+  float umb = act * smoothstep(0.36, 0.5, sp);
+  // 光斑：靠近临边的亮网
+  float fac = smoothstep(0.05, 0.4, gnoise(n * 34.0, 977u) + 0.4 * grp) * pow(1.0 - mu, 1.5) * (0.4 + band);
   // 近看（三维游览）时亮度降低，米粒组织与临边昏暗更明显，颜色偏橙
   float near = clamp((1.0 - uSunGain) / 0.94, 0.0, 1.0);
   vec3 tint = mix(vec3(1.0, 0.86, 0.62), vec3(1.0, 0.6, 0.2), near);
   vec3 col = tint * (0.9 + mix(0.12, 0.4, near) * g) * mix(limb, limb * limb, near) * 34.0 * uSunGain;
+  col *= (1.0 - 0.45 * pen) * (1.0 - 0.6 * umb) * (1.0 + 0.35 * fac);
+  col = mix(col, col * vec3(1.0, 0.75, 0.55), pen * 0.5);
   col = applyAtmo(col, vWorldPos);
   gl_FragColor = vec4(col, 1.0);
 }
@@ -404,6 +476,16 @@ void main() {
   float u = (r - 1.24) / (2.27 - 1.24);
   if (u < 0.0 || u > 1.0) discard;
   vec4 t = texture2D(uRings, vec2(u, 0.5));
+  // 细密的小环：几组不同频率的明暗与疏密变化，按每像素跨过的半径淡出，避免远处闪烁
+  float fw = fwidth(r);
+  float fine = 0.0;
+  fine += 0.5 * sin(r * 780.0 + 0.7) * (1.0 - smoothstep(0.0006, 0.0025, fw));
+  fine += 0.35 * sin(r * 2300.0 + 2.1) * (1.0 - smoothstep(0.0002, 0.0008, fw));
+  float cellR = floor(r * 1400.0);
+  float rnd = fract(sin(cellR * 12.9898) * 43758.5453) - 0.5;
+  fine += 0.6 * rnd * (1.0 - smoothstep(0.0003, 0.0012, fw));
+  t.a = clamp(t.a * (1.0 + 0.4 * fine), 0.0, 1.0);
+  t.rgb *= 1.0 + 0.12 * fine;
   // 土星的阴影：从环上的点朝太阳看，是否被行星挡住
   vec3 p = vWorldPos - uCenter;
   float b = dot(p, uSunDir);
@@ -630,7 +712,7 @@ export class Planets {
     const rockyMat = (body: Body, sunDir: { value: THREE.Vector3 }) =>
       new THREE.ShaderMaterial({
         vertexShader: PLANET_VERT,
-        fragmentShader: ROCKY_FRAG,
+        fragmentShader: rockyFrag(body),
         uniforms: {
           ...sharedUniforms,
           uSunDir: sunDir,
@@ -648,7 +730,7 @@ export class Planets {
     for (const b of BODIES) {
       if (b.kind !== 'rocky' || b.id === 'earth') continue;
       const sd = own();
-      addVisual(b, rockyMat(b, sd), b.id === 'moon' || b.id === 'mars' ? 256 : 160, sd);
+      addVisual(b, rockyMat(b, sd), 320, sd);
     }
     this.moon = this.visuals.get('moon')!.mesh;
     this.moonMat = this.visuals.get('moon')!.mat;
@@ -666,9 +748,10 @@ export class Planets {
           uColor: { value: maps.bodies[b.id]!.color },
           uCenter: { value: new THREE.Vector3() },
           uRim: { value: new THREE.Color(b.id === 'jupiter' ? 0x9fb8e8 : 0xd8c79a) },
+          uRadius: { value: b.radius },
         },
       });
-      addVisual(b, mat, 128, sd);
+      addVisual(b, mat, 256, sd);
     }
     // 土星环
     const sat = this.visuals.get('saturn')!;
