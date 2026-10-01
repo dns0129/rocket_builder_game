@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>火箭工坊 · 登月计划（手机版）</title>
+    <meta name="description" content="造一枚火箭，飞向月球并安全返回。基于真实物理的火箭总装与飞行模拟——触屏版。" />
+    <meta name="theme-color" content="#07090d" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="火箭工坊" />
+    <meta name="format-detection" content="telephone=no" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="map-overlay"></div>
+    <div id="ui"></div>
+    <div id="loading">
+      <div class="loading-inner">
+        <div class="loading-title">火箭工坊 <span>登月计划</span></div>
+        <div class="loading-sub" id="loading-text">正在生成地球与月球……</div>
+        <div class="loading-bar"><div id="loading-fill"></div></div>
+        <div class="loading-tip">手机版 · 横屏飞行体验更佳</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

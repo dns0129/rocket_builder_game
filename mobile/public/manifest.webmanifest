@@ -1,0 +1,20 @@
+{
+  "name": "火箭工坊 · 登月计划",
+  "short_name": "火箭工坊",
+  "description": "造一枚火箭，飞向月球并安全返回。基于真实物理的火箭总装与飞行模拟（触屏版）。",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "any",
+  "background_color": "#05070b",
+  "theme_color": "#07090d",
+  "categories": ["games", "education", "simulation"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
