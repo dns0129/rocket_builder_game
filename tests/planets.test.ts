@@ -2,10 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { Vector3 } from 'three';
 import { FlightSim } from '../src/game/flight';
 import { templateDesign } from '../src/rocket/design';
-import { BODIES, EARTH, MARS, MOON, SUN, bodyPosition, dominantBody, gravityAccel, helioPosition } from '../src/physics/bodies';
+import { BODIES, EARTH, MARS, MOON, SUN, bodyPosition, dirFromLatLon, dominantBody, gravityAccel, helioPosition } from '../src/physics/bodies';
 import { computeOrbit } from '../src/physics/orbit';
 import { lambert, solveCaptureAt, solvePlanetCorrection, solveTransfer } from '../src/game/maneuver';
-import { terrainHeight } from '../src/physics/terrain';
+import { TERRAIN, rockyHeight, terrainHeight } from '../src/physics/terrain';
 import { bodyChain, encounterAnchor, placeSegments } from '../src/render/trajectoryView';
 import type { Prediction } from '../src/game/predictor';
 
@@ -60,6 +60,26 @@ describe('solar system', () => {
       expect(Math.abs(h)).toBeLessThan(b.maxTerrain);
     }
     expect(terrainHeight(BODIES.find((x) => x.id === 'jupiter')!, d)).toBe(0);
+  });
+
+  it('has the Tharsis volcanoes and Valles Marineris on Mars', () => {
+    const DEG = Math.PI / 180;
+    const T = TERRAIN.mars!;
+    const bare = { ...T, volcanoes: [], canyons: [] };
+    // 特征本身的高度贡献（去掉丘陵、撞击坑等背景起伏）
+    const feature = (lat: number, lon: number) => {
+      const d = dirFromLatLon(lat * DEG, lon * DEG);
+      return rockyHeight(T, MARS.radius, d.x, d.y, d.z) - rockyHeight(bare, MARS.radius, d.x, d.y, d.z);
+    };
+    for (const [lat, lon] of [[18.65, -133.8], [-8.26, -120.09], [1.48, -112.96], [11.92, -104.08]]) expect(feature(lat + 0.4, lon)).toBeGreaterThan(900);
+    // 峡谷中段：沿两端点之间的大圆取中点
+    const a = dirFromLatLon(-7 * DEG, -96 * DEG);
+    const b = dirFromLatLon(-12 * DEG, -42 * DEG);
+    const m = a.clone().add(b).normalize();
+    const lat = Math.asin(m.y) / DEG;
+    const lon = Math.atan2(-m.z, m.x) / DEG;
+    expect(feature(lat, lon)).toBeLessThan(-500);
+    expect(Math.abs(feature(lat + 6, lon))).toBeLessThan(1);
   });
 
   it('flies from low Earth orbit to Mars orbit', () => {

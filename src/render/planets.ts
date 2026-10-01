@@ -236,6 +236,7 @@ const CLOUD_FRAG = /* glsl */ `
 ${ATMOSPHERE_GLSL}
 ${LIGHT_GLSL}
 ${NOISE_GLSL}
+${BUMP_GLSL}
 uniform sampler2D uAux;
 uniform mat3 uModelRot;
 uniform float uCloudOffset;
@@ -262,8 +263,13 @@ void main() {
   // 晨昏线附近的云只在很窄的一条带内被夕阳染色，且不过分饱和
   vec3 sunT = mix(sunTransmittance(max(muS, 0.0)), vec3(1.0), 0.55);
   sunT = mix(sunT, vec3(dot(sunT, vec3(0.2126, 0.7152, 0.0722))), 0.45);
-  float lit = clamp(muS * 0.8 + 0.15, 0.0, 1.0);
-  vec3 col = vec3(0.92) * uSunLight * RECIPROCAL_PI * (lit * (1.0 - uNight) * sunT + nightFill(muS)) * (0.85 + 0.15 * nd * f) + vec3(0.03, 0.04, 0.06) * smoothstep(-0.2, 0.3, muS);
+  // 云顶的起伏：越厚的地方越高（约 2.5 km），迎着太阳的一面亮、背面暗，云团显得立体
+  vec3 nc = bumpNormal(upW, vWorldPos, (cov * 2500.0 + nd * f * 700.0));
+  float relief = clamp(dot(nc, uSunDir) - muS, -0.6, 0.6);
+  float lit = clamp(muS * 0.8 + 0.15 + relief * 1.3 * smoothstep(-0.1, 0.2, muS), 0.0, 1.15);
+  // 厚云更白、薄云略灰（透出下面的地表）
+  vec3 cc = mix(vec3(0.82, 0.84, 0.87), vec3(0.96), smoothstep(0.3, 0.9, cov));
+  vec3 col = cc * uSunLight * RECIPROCAL_PI * (lit * (1.0 - uNight) * sunT + nightFill(muS)) * (0.85 + 0.15 * nd * f) + vec3(0.03, 0.04, 0.06) * smoothstep(-0.2, 0.3, muS);
   // 从云层下方看：云底较暗，越厚越暗
   float camR = length(uCamPos - uAtmoCenter);
   float cloudR = length(vWorldPos - uAtmoCenter);
@@ -946,6 +952,10 @@ export function sunlightFactor(distToSun: number): number {
 }
 
 let glowTex: THREE.Texture | null = null;
+/**
+ * 太阳光晕贴图：近似指数衰减的径向亮度，叠加几道日冕流光（角向起伏，离日面越远越淡），
+ * 避免出现明显的圆盘边缘。
+ */
 function glowTexture(): THREE.Texture {
   if (glowTex) return glowTex;
   const s = 256;
@@ -953,11 +963,55 @@ function glowTexture(): THREE.Texture {
   cv.width = s;
   cv.height = s;
   const ctx = cv.getContext('2d')!;
-  const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
-  // 近似指数衰减，避免出现明显的圆盘边缘
-  for (const [r, a] of [[0, 1], [0.04, 0.62], [0.1, 0.3], [0.2, 0.12], [0.35, 0.045], [0.55, 0.014], [0.8, 0.003], [1, 0]]) g.addColorStop(r, `rgba(255,255,255,${a})`);
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, s, s);
+  const img = ctx.createImageData(s, s);
+  const stops: [number, number][] = [
+    [0, 1],
+    [0.04, 0.62],
+    [0.1, 0.3],
+    [0.2, 0.12],
+    [0.35, 0.045],
+    [0.55, 0.014],
+    [0.8, 0.003],
+    [1, 0],
+  ];
+  const radial = (r: number) => {
+    for (let i = 1; i < stops.length; i++) {
+      if (r <= stops[i][0]) {
+        const [r0, a0] = stops[i - 1];
+        const [r1, a1] = stops[i];
+        return a0 + ((a1 - a0) * (r - r0)) / (r1 - r0);
+      }
+    }
+    return 0;
+  };
+  // 日冕流光：几道宽窄不一的亮条
+  const lobes = [
+    [2, 0.4, 0.5],
+    [3, 1.7, 0.35],
+    [5, 0.9, 0.25],
+    [7, 2.6, 0.15],
+  ];
+  const sm = (e0: number, e1: number, x: number) => {
+    const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+  };
+  for (let y = 0; y < s; y++) {
+    for (let x = 0; x < s; x++) {
+      const dx = (x + 0.5) / s - 0.5;
+      const dy = (y + 0.5) / s - 0.5;
+      const r = Math.hypot(dx, dy) * 2;
+      const th = Math.atan2(dy, dx);
+      let st = 0;
+      for (const [n, ph, w] of lobes) st += w * Math.pow(0.5 + 0.5 * Math.sin(n * th + ph), 6);
+      const a = radial(Math.min(1, r)) * (1 + 1.4 * st * sm(0.05, 0.15, r) * (1 - sm(0.45, 1.0, r)));
+      const k = (y * s + x) * 4;
+      img.data[k] = 255;
+      img.data[k + 1] = 255;
+      img.data[k + 2] = 255;
+      img.data[k + 3] = Math.round(Math.min(1, a) * 255);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
   glowTex = new THREE.CanvasTexture(cv);
   return glowTex;
 }

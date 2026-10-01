@@ -28,7 +28,28 @@ export interface RockyTerrainDef {
   craterProb: number;
   /** 撞击坑层级数（浓密大气会烧掉小陨石，金星只有大坑） */
   craterLevels: number;
-  volcano?: { lat: number; lon: number; height: number; radius: number };
+  /** 盾状火山（带破火山口） */
+  volcanoes?: VolcanoDef[];
+  /** 峡谷：沿大圆弧的长条凹陷，平底、陡壁、边缘参差 */
+  canyons?: CanyonDef[];
+}
+
+export interface VolcanoDef {
+  lat: number;
+  lon: number;
+  height: number;
+  radius: number;
+}
+
+export interface CanyonDef {
+  lat0: number;
+  lon0: number;
+  lat1: number;
+  lon1: number;
+  /** 半宽 m */
+  halfWidth: number;
+  depth: number;
+  seed: number;
 }
 
 const DEG = Math.PI / 180;
@@ -48,8 +69,18 @@ export const TERRAIN: Partial<Record<BodyId, RockyTerrainDef>> = {
     hillAmp: 2000,
     craterProb: 0.45,
     craterLevels: 9,
-    // 奥林帕斯山（按 1:10 缩小）
-    volcano: { lat: 18.65 * DEG, lon: -133.8 * DEG, height: 2200, radius: 30_000 },
+    // 奥林帕斯山与塔尔西斯三火山（阿尔西亚、帕弗尼斯、艾斯克雷尔斯），均按 1:10 缩小
+    volcanoes: [
+      { lat: 18.65 * DEG, lon: -133.8 * DEG, height: 2200, radius: 30_000 },
+      { lat: -8.26 * DEG, lon: -120.09 * DEG, height: 1600, radius: 21_000 },
+      { lat: 1.48 * DEG, lon: -112.96 * DEG, height: 1300, radius: 18_000 },
+      { lat: 11.92 * DEG, lon: -104.08 * DEG, height: 1700, radius: 22_000 },
+    ],
+    // 水手号峡谷：主峡谷与北侧一条较窄的平行峡谷
+    canyons: [
+      { lat0: -7 * DEG, lon0: -96 * DEG, lat1: -12 * DEG, lon1: -42 * DEG, halfWidth: 9_000, depth: 700, seed: 3911 },
+      { lat0: -4.5 * DEG, lon0: -88 * DEG, lat1: -7.5 * DEG, lon1: -64 * DEG, halfWidth: 4_500, depth: 450, seed: 3923 },
+    ],
   },
 };
 
@@ -128,14 +159,62 @@ export function mareMask(T: RockyTerrainDef, R: number, dx: number, dy: number, 
 const _vd = new Vector3();
 
 /** 盾状火山（带破火山口）的高度。 */
-function volcanoHeight(T: RockyTerrainDef, R: number, dx: number, dy: number, dz: number): number {
-  const v = T.volcano;
-  if (!v) return 0;
+function volcanoHeight(v: VolcanoDef, R: number, dx: number, dy: number, dz: number): number {
   dirFromLatLon(v.lat, v.lon, _vd);
   const ang = Math.acos(Math.max(-1, Math.min(1, dx * _vd.x + dy * _vd.y + dz * _vd.z)));
   const x = (ang * R) / v.radius;
   if (x > 4) return 0;
   return v.height * (Math.exp(-x * x) - 0.22 * Math.exp(-x * x * 40));
+}
+
+/** 峡谷的几何：两端点 A、B、大圆的法向 N、弧长对应的角度 */
+interface CanyonGeom {
+  a: Vector3;
+  b: Vector3;
+  n: Vector3;
+  span: number;
+}
+const canyonCache = new WeakMap<CanyonDef, CanyonGeom>();
+function canyonGeom(c: CanyonDef): CanyonGeom {
+  let g = canyonCache.get(c);
+  if (!g) {
+    const a = dirFromLatLon(c.lat0, c.lon0, new Vector3());
+    const b = dirFromLatLon(c.lat1, c.lon1, new Vector3());
+    const n = new Vector3().crossVectors(a, b).normalize();
+    g = { a, b, n, span: Math.acos(Math.max(-1, Math.min(1, a.dot(b)))) };
+    canyonCache.set(c, g);
+  }
+  return g;
+}
+
+/**
+ * 峡谷深度（负值）。到大圆弧的距离（两端按到端点的距离，自然收成圆头）与半宽之比决定剖面：
+ * 平底 + 陡壁；半宽随位置用噪声扰动，壁面参差不齐。
+ */
+function canyonHeight(c: CanyonDef, R: number, dx: number, dy: number, dz: number): number {
+  const g = canyonGeom(c);
+  const sn = dx * g.n.x + dy * g.n.y + dz * g.n.z;
+  // 投影到大圆所在平面后，相对 A 的角度
+  const qx = dx - g.n.x * sn;
+  const qy = dy - g.n.y * sn;
+  const qz = dz - g.n.z * sn;
+  const cx = g.a.y * qz - g.a.z * qy;
+  const cy = g.a.z * qx - g.a.x * qz;
+  const cz = g.a.x * qy - g.a.y * qx;
+  const ta = Math.atan2(cx * g.n.x + cy * g.n.y + cz * g.n.z, g.a.x * qx + g.a.y * qy + g.a.z * qz);
+  let ang: number;
+  if (ta >= 0 && ta <= g.span) ang = Math.abs(Math.asin(Math.max(-1, Math.min(1, sn))));
+  else {
+    const da = Math.acos(Math.max(-1, Math.min(1, dx * g.a.x + dy * g.a.y + dz * g.a.z)));
+    const db = Math.acos(Math.max(-1, Math.min(1, dx * g.b.x + dy * g.b.y + dz * g.b.z)));
+    ang = Math.min(da, db);
+  }
+  const dist = ang * R;
+  if (dist > c.halfWidth * 2) return 0;
+  const k = R / (c.halfWidth * 3);
+  const w = c.halfWidth * (1 + 0.28 * gnoise(dx * k, dy * k, dz * k, c.seed));
+  const x = dist / w;
+  return -c.depth * (1 - smoothstep(0.55, 1.0, x));
 }
 
 /**
@@ -163,7 +242,8 @@ export function rockyHeight(T: RockyTerrainDef, R: number, dx: number, dy: numbe
     const c = craterLevel(px, py, pz, l, T.craterSeed, T.craterProb);
     h += l < 3 ? c * (1 - 0.6 * mare) : c;
   }
-  if (T.volcano) h += volcanoHeight(T, R, dx, dy, dz);
+  if (T.volcanoes) for (const v of T.volcanoes) h += volcanoHeight(v, R, dx, dy, dz);
+  if (T.canyons) for (const c of T.canyons) h += canyonHeight(c, R, dx, dy, dz);
   return h;
 }
 
@@ -259,7 +339,35 @@ export function rockyTerrainGLSL(id: BodyId, fn: string): string {
   const T = TERRAIN[id]!;
   const R = BODY_R[id]!;
   const f = (x: number) => x.toFixed(4);
-  const vd = T.volcano ? dirFromLatLon(T.volcano.lat, T.volcano.lon, new Vector3()) : null;
+  const volcanoGLSL = (T.volcanoes ?? [])
+    .map((v) => {
+      const vd = dirFromLatLon(v.lat, v.lon, new Vector3());
+      return `  {
+    float ang = acos(clamp(dot(d, vec3(${f(vd.x)}, ${f(vd.y)}, ${f(vd.z)})), -1.0, 1.0));
+    float x = ang * ${f(R)} / ${f(v.radius)};
+    if (x < 4.0) h += ${f(v.height)} * (exp(-x * x) - 0.22 * exp(-x * x * 40.0));
+  }`;
+    })
+    .join('\n');
+  const canyonGLSL = (T.canyons ?? [])
+    .map((c) => {
+      const g = canyonGeom(c);
+      const v3 = (v: Vector3) => `vec3(${v.x.toFixed(6)}, ${v.y.toFixed(6)}, ${v.z.toFixed(6)})`;
+      return `  {
+    vec3 cA = ${v3(g.a)}; vec3 cB = ${v3(g.b)}; vec3 cN = ${v3(g.n)};
+    float sn = dot(d, cN);
+    vec3 q = d - cN * sn;
+    float ta = atan(dot(cross(cA, q), cN), dot(cA, q));
+    float ang = (ta >= 0.0 && ta <= ${g.span.toFixed(6)}) ? abs(asin(clamp(sn, -1.0, 1.0))) : min(acos(clamp(dot(d, cA), -1.0, 1.0)), acos(clamp(dot(d, cB), -1.0, 1.0)));
+    float dist = ang * ${f(R)};
+    if (dist < ${f(c.halfWidth * 2)}) {
+      float k = ${f(R / (c.halfWidth * 3))};
+      float w = ${f(c.halfWidth)} * (1.0 + 0.28 * gnoise(d * k, ${c.seed}u));
+      h -= ${f(c.depth)} * (1.0 - smoothstep(0.55, 1.0, dist / w));
+    }
+  }`;
+    })
+    .join('\n');
   return /* glsl */ `
 float ${fn}_mare(vec3 d) {
   float s = ${f(R)} / ${f(T.mareScale)};
@@ -284,15 +392,8 @@ vec3 ${fn}(vec3 d, int maxLevel) {
     h += l < 3 ? c.x * (1.0 - 0.6 * mare) : c.x;
     fresh += c.y;
   }
-  ${
-    vd && T.volcano
-      ? `{
-    float ang = acos(clamp(dot(d, vec3(${f(vd.x)}, ${f(vd.y)}, ${f(vd.z)})), -1.0, 1.0));
-    float x = ang * ${f(R)} / ${f(T.volcano.radius)};
-    if (x < 4.0) h += ${f(T.volcano.height)} * (exp(-x * x) - 0.22 * exp(-x * x * 40.0));
-  }`
-      : ''
-  }
+${volcanoGLSL}
+${canyonGLSL}
   return vec3(h, mare, fresh);
 }
 `;

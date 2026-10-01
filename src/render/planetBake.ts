@@ -1,6 +1,6 @@
 import * as THREE from 'three';
-import { NOISE_GLSL } from '../physics/noise';
-import { MOON_TERRAIN_GLSL, ROCKY_COMMON_GLSL, rockyTerrainGLSL } from '../physics/terrain';
+import { NOISE_GLSL, NOISE_OFFSET } from '../physics/noise';
+import { CRATER_CELL_K, MOON_TERRAIN_GLSL, ROCKY_COMMON_GLSL, TERRAIN, rockyTerrainGLSL } from '../physics/terrain';
 import { EARTH, LAUNCH_SITE, MOON, type BodyId, dirFromLatLon } from '../physics/bodies';
 
 /**
@@ -298,9 +298,58 @@ function siteRotation(): THREE.Matrix3 {
   return new THREE.Matrix3().set(up.x, up.y, up.z, north.x, north.y, north.z, -east.x, -east.y, -east.z);
 }
 
+/**
+ * 新鲜撞击坑的辐射纹（只画在贴图上）：按与 craterLevel 相同的哈希顺序找到同一批撞击坑，
+ * 只有最新鲜的一小部分带辐射纹——长短不一的亮条从坑缘向外延伸约 3 倍半径，沿径向断断续续。
+ * 搜索范围是周围 4×4×4 个格子，保证辐射纹不会在格子边界被截断。
+ */
+const RAYS_GLSL = /* glsl */ `
+float craterRays(vec3 p, int craterSeed, float probScale) {
+  float sum = 0.0;
+  for (int level = 0; level < 3; level++) {
+    float rmax = CRATER_RMAX[level];
+    float cell = rmax * ${CRATER_CELL_K.toFixed(2)};
+    float prob = CRATER_PROB[level] * probScale;
+    vec3 g = p / cell - 0.5;
+    ivec3 b = ivec3(floor(g));
+    uint seed = uint(craterSeed + level * 101);
+    for (int k = 0; k < 64; k++) {
+      ivec3 c = b + ivec3(k & 3, (k >> 2) & 3, (k >> 4) & 3) - ivec3(1);
+      uint h = hash3u(c + ivec3(${NOISE_OFFSET}), seed);
+      if (hashToFloat(h) >= prob) continue;
+      h = nextHash(h);
+      float rr = hashToFloat(h);
+      float r = rmax * (0.35 + 0.65 * rr * rr);
+      h = nextHash(h); float ox = (float(c.x) + 0.25 + 0.5 * hashToFloat(h)) * cell;
+      h = nextHash(h); float oy = (float(c.y) + 0.25 + 0.5 * hashToFloat(h)) * cell;
+      h = nextHash(h); float oz = (float(c.z) + 0.25 + 0.5 * hashToFloat(h)) * cell;
+      h = nextHash(h);
+      float fresh = hashToFloat(h);
+      if (fresh >= 0.1) continue;
+      vec3 cp = vec3(ox, oy, oz);
+      vec3 dp = p - cp;
+      float x = length(dp) / r;
+      if (x < 0.9 || x > 3.2) continue;
+      vec3 cn = normalize(cp);
+      vec3 t1 = normalize(cross(cn, abs(cn.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+      vec3 t2 = cross(cn, t1);
+      float th = atan(dot(dp, t2), dot(dp, t1));
+      float ph = hashToFloat(nextHash(h)) * 50.0;
+      float a = gnoise(vec3(cos(th) * 6.0, sin(th) * 6.0, ph), seed + 77u) + 0.5 * gnoise(vec3(cos(th) * 17.0, sin(th) * 17.0, ph), seed + 79u);
+      float ray = smoothstep(0.12, 0.55, a);
+      float fall = smoothstep(0.9, 1.25, x) * pow(1.0 - (x - 1.0) / 2.2, 1.6);
+      float brk = 0.55 + 0.45 * gnoise(vec3(th * 4.0, x * 3.0, ph), seed + 91u);
+      sum += ray * max(fall, 0.0) * brk * (1.0 - fresh / 0.1);
+    }
+  }
+  return sum;
+}
+`;
+
 const MOON_FRAG = /* glsl */ `
 ${COMMON}
 ${MOON_TERRAIN_GLSL}
+${RAYS_GLSL}
 layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oNormal;
 uniform int uMaxLevel;
@@ -324,6 +373,8 @@ void main() {
   vec3 col = mix(high, low, mare);
   col += vec3(0.28) * clamp(t.z, 0.0, 1.2);
   col *= 0.92 + 0.08 * smoothstep(-2000.0, 3000.0, t.x);
+  // 辐射纹（在月海的暗底上更显眼）
+  col += vec3(0.2, 0.2, 0.19) * clamp(craterRays(d * MOON_R, ${TERRAIN.moon!.craterSeed}, ${TERRAIN.moon!.craterProb.toFixed(3)}), 0.0, 1.0);
   oColor = vec4(srgb(col), clamp(t.x / 8000.0 * 0.5 + 0.5, 0.0, 1.0));
 }
 `;
@@ -332,11 +383,12 @@ void main() {
 // ---------------------------------------------------------------- 其他行星
 
 /** 岩质行星（水星、金星表面、火星）：与物理地形相同的撞击坑、低地与火山，再按行星上色。 */
-function rockyFrag(id: BodyId, colorGLSL: string): string {
+function rockyFrag(id: BodyId, colorGLSL: string, extraGLSL = ''): string {
   return /* glsl */ `
 ${COMMON}
 ${ROCKY_COMMON_GLSL}
 ${rockyTerrainGLSL(id, 'terr')}
+${extraGLSL}
 layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oNormal;
 uniform int uMaxLevel;
@@ -367,6 +419,8 @@ const MERCURY_COLOR = /* glsl */ `
   col = mix(high, low, t.y);
   col += vec3(0.3) * clamp(t.z, 0.0, 1.2);
   col *= 0.92 + 0.08 * smoothstep(-2000.0, 3000.0, t.x);
+  // 水星的辐射纹又亮又长
+  col += vec3(0.24, 0.23, 0.21) * clamp(craterRays(d * uRadius, ${TERRAIN.mercury!.craterSeed}, ${TERRAIN.mercury!.craterProb.toFixed(3)}), 0.0, 1.0);
 `;
 
 const MARS_COLOR = /* glsl */ `
@@ -583,30 +637,75 @@ ${ovalCalls}
 `;
 }
 
-/** 土星环：一维的径向密度与颜色（C 环、B 环、卡西尼缝、A 环、恩克缝）。 */
+/**
+ * 土星环：一维的径向密度与颜色（半径以土星半径为单位，1.24 .. 2.27）。
+ * C 环（灰褐、稀薄、有“平台”）、B 环（明亮、偏暖、内疏外密）、卡西尼缝（几条暗淡的小环）、
+ * A 环（中等亮度，有恩克缝与基勒缝），再叠加多个尺度的细密小环。
+ */
 function saturnRingTexture(): THREE.Texture {
-  const W = 1024;
+  const W = 4096;
   const cv = document.createElement('canvas');
   cv.width = W;
-  cv.height = 4;
+  cv.height = 2;
   const ctx = cv.getContext('2d')!;
-  const img = ctx.createImageData(W, 4);
-  // 半径以土星半径为单位：1.24 .. 2.27
+  const img = ctx.createImageData(W, 2);
+  // 一维值噪声（固定种子，保证每次一样）
+  let seed = 9177;
+  const rnd = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  const tables = [64, 256, 1024, 3000].map((n) => Array.from({ length: n + 1 }, rnd));
+  const vnoise = (x: number, k: number) => {
+    const t = tables[k];
+    const n = t.length - 1;
+    const f = x * n;
+    const i = Math.min(n - 1, Math.floor(f));
+    const u = f - i;
+    const s = u * u * (3 - 2 * u);
+    return t[i] * (1 - s) + t[i + 1] * s;
+  };
+  const sm = (e0: number, e1: number, x: number) => {
+    const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+  };
   for (let i = 0; i < W; i++) {
-    const r = 1.24 + (i / (W - 1)) * (2.27 - 1.24);
-    let a = 0;
-    if (r < 1.53) a = 0.12 + 0.05 * Math.sin(r * 240);
-    else if (r < 1.95) a = 0.75 + 0.15 * Math.sin(r * 180) + 0.08 * Math.sin(r * 523);
-    else if (r < 2.03) a = 0.04;
-    else a = 0.5 + 0.08 * Math.sin(r * 310);
-    if (r > 2.21 && r < 2.225) a = 0.05;
-    a *= 1 - 0.5 * Math.max(0, (r - 2.2) / 0.07);
-    const warm = r < 1.95 ? 1 : 0.9;
-    for (let y = 0; y < 4; y++) {
+    const u = i / (W - 1);
+    const r = 1.24 + u * (2.27 - 1.24);
+    const fine = (vnoise(u, 1) - 0.5) * 0.5 + (vnoise(u, 2) - 0.5) * 0.35 + (vnoise(u, 3) - 0.5) * 0.3;
+    let a: number;
+    let c: [number, number, number];
+    if (r < 1.527) {
+      // C 环：稀薄，有几处较亮的“平台”，麦克斯韦缝
+      const plateau = sm(0.62, 0.7, vnoise(u * 3.1, 0)) * 0.12;
+      a = 0.1 + plateau + 0.06 * fine;
+      if (r > 1.448 && r < 1.456) a *= 0.2;
+      c = [0.62, 0.58, 0.52];
+    } else if (r < 1.951) {
+      // B 环：由内向外越来越密，最亮
+      const k = (r - 1.527) / (1.951 - 1.527);
+      a = 0.62 + 0.3 * sm(0.0, 0.5, k) + 0.12 * fine;
+      const warm = 0.9 + 0.1 * vnoise(u * 2.0, 0);
+      c = [0.95 * warm, 0.86 * warm, 0.68 * warm];
+    } else if (r < 2.025) {
+      // 卡西尼缝：几乎是空的，只有几条暗淡的小环
+      a = 0.035 + 0.05 * Math.max(0, Math.sin((r - 1.951) * 420)) * (0.5 + fine);
+      c = [0.6, 0.57, 0.52];
+    } else {
+      // A 环：中等亮度，外缘渐暗；恩克缝、基勒缝
+      a = 0.5 + 0.1 * fine - 0.18 * sm(2.18, 2.267, r);
+      if (r > 2.211 && r < 2.217) a = 0.04;
+      if (r > 2.262 && r < 2.264) a = 0.06;
+      c = [0.86, 0.8, 0.68];
+    }
+    // 内外边缘柔化
+    a *= sm(1.24, 1.25, r) * (1 - sm(2.262, 2.27, r));
+    const lum = 0.92 + 0.16 * fine;
+    for (let y = 0; y < 2; y++) {
       const k = (y * W + i) * 4;
-      img.data[k] = Math.round(232 * warm);
-      img.data[k + 1] = Math.round(214 * warm);
-      img.data[k + 2] = Math.round(176 * warm);
+      img.data[k] = Math.round(Math.min(1, c[0] * lum) * 255);
+      img.data[k + 1] = Math.round(Math.min(1, c[1] * lum) * 255);
+      img.data[k + 2] = Math.round(Math.min(1, c[2] * lum) * 255);
       img.data[k + 3] = Math.round(Math.max(0, Math.min(1, a)) * 255);
     }
   }
@@ -614,6 +713,8 @@ function saturnRingTexture(): THREE.Texture {
   const t = new THREE.CanvasTexture(cv);
   t.colorSpace = THREE.SRGBColorSpace;
   t.wrapS = THREE.ClampToEdgeWrapping;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.anisotropy = 8;
   return t;
 }
 
@@ -756,7 +857,7 @@ export async function bakePlanets(
   const marsW = cap(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096);
   const gasW = cap(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096);
   const bodies: Partial<Record<BodyId, BodyMaps>> = {};
-  const rockyJob = (id: BodyId, w: number, color: string, radius: number) => {
+  const rockyJob = (id: BodyId, w: number, color: string, radius: number, extra = '') => {
     const rt = makeTarget(w, w / 2, 2);
     jobs.push({
       rt,
@@ -765,7 +866,7 @@ export async function bakePlanets(
       mat: new THREE.RawShaderMaterial({
         glslVersion: THREE.GLSL3,
         vertexShader: VERT,
-        fragmentShader: rockyFrag(id, color),
+        fragmentShader: rockyFrag(id, color, extra),
         uniforms: { uRes: { value: new THREE.Vector2(w, w / 2) }, uMaxLevel: { value: BAKE_CRATER_LEVEL }, uRadius: { value: radius } },
       }),
     });
@@ -781,7 +882,7 @@ export async function bakePlanets(
     });
     return rt.textures[0];
   };
-  rockyJob('mercury', pw, MERCURY_COLOR, 243_970);
+  rockyJob('mercury', pw, MERCURY_COLOR, 243_970, RAYS_GLSL);
   rockyJob('venus', pw, VENUS_SURFACE_COLOR, 605_180);
   bodies.venus!.clouds = colorJob(pw, VENUS_CLOUD_FRAG);
   rockyJob('mars', marsW, MARS_COLOR, 338_950);
