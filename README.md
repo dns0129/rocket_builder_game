@@ -15,6 +15,19 @@ npm test           # 物理与平衡测试（含一次完整的自动登月往�
 
 需要支持 WebGL2 的浏览器（Chrome / Edge / Firefox / Safari 最新版）。有独立显卡时可在“设置”里选“高”画质。
 
+### 手机版
+
+`mobile/` 目录是独立的手机版项目（触屏操作、横竖屏布局、动态分辨率、可添加到主屏幕离线游玩），玩法与物理和电脑版相同：
+
+```bash
+cd mobile
+npm install
+npm run dev        # 手机与电脑连同一 Wi-Fi，用手机打开终端里显示的 Network 地址
+npm run build      # 输出到 mobile/dist/
+```
+
+详见 [mobile/README.md](mobile/README.md)。
+
 ## 玩法流程
 
 1. **总装车间**：左侧零件库 → 点击添加到选中零件下方；右侧可调整顺序、切换推进剂（液氧煤油 / 液氢液氧）、加装着陆腿/尾翼、捆绑助推器。性能面板实时给出每一级的 Δv、推重比（地球/月球）与燃烧时间，并提示设计问题。
@@ -126,6 +139,7 @@ src/
   ui/        总装车间界面、飞行 HUD、机动规划、格式化工具与样式
   audio/     程序化音效
 tests/       平衡与物理测试
+mobile/      手机版（独立的 Vite 项目，见 mobile/README.md）
 ```
 
 ## 关于模型与贴图素材
