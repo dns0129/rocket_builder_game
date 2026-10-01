@@ -1,3 +1,4 @@
-# Windows 批处理文件必须使用 CRLF 换行，否则 cmd 解析标签与跳转会出错
-*.cmd text eol=crlf
-*.bat text eol=crlf
+# Windows 批处理文件必须使用 CRLF 换行，否则 cmd 解析标签与跳转会出错。
+# 按原样存储（不做换行转换），这样无论 git clone 还是 GitHub 的 Download ZIP 拿到的都是 CRLF。
+*.cmd -text
+*.bat -text
