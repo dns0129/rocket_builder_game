@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { NOISE_GLSL } from '../physics/noise';
-import { MOON_TERRAIN_GLSL } from '../physics/terrain';
-import { EARTH, LAUNCH_SITE, MOON, dirFromLatLon } from '../physics/bodies';
+import { MOON_TERRAIN_GLSL, ROCKY_COMMON_GLSL, rockyTerrainGLSL } from '../physics/terrain';
+import { EARTH, LAUNCH_SITE, MOON, type BodyId, dirFromLatLon } from '../physics/bodies';
 
 /**
  * 在 GPU 上一次性烘焙程序化星球贴图（等距柱状投影）。
@@ -328,12 +328,184 @@ void main() {
 }
 `;
 
+
+// ---------------------------------------------------------------- 其他行星
+
+/** 岩质行星（水星、金星表面、火星）：与物理地形相同的撞击坑、低地与火山，再按行星上色。 */
+function rockyFrag(id: BodyId, colorGLSL: string): string {
+  return /* glsl */ `
+${COMMON}
+${ROCKY_COMMON_GLSL}
+${rockyTerrainGLSL(id, 'terr')}
+layout(location = 0) out vec4 oColor;
+layout(location = 1) out vec4 oNormal;
+uniform int uMaxLevel;
+uniform float uRadius;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float lon = (uv.x - 0.5) * 2.0 * PI;
+  float lat = (uv.y - 0.5) * PI;
+  vec3 d = dirFromLatLon(lat, lon);
+  vec3 t = terr(d, uMaxLevel);
+  float eps = 2.0 * PI / uRes.x;
+  float hE = terr(dirFromLatLon(lat, lon + eps), uMaxLevel).x;
+  float hN = terr(dirFromLatLon(lat + eps, lon), uMaxLevel).x;
+  float dist = eps * uRadius;
+  vec3 n = normalize(vec3(-(hE - t.x) / (dist * max(cos(lat), 0.05)), -(hN - t.x) / dist, 1.0));
+  oNormal = vec4(n * 0.5 + 0.5, 1.0);
+  vec3 col;
+  ${colorGLSL}
+  oColor = vec4(srgb(col), clamp(t.x / 8000.0 * 0.5 + 0.5, 0.0, 1.0));
+}
+`;
+}
+
+const MERCURY_COLOR = /* glsl */ `
+  float hl = 0.36 + 0.06 * gnoise(d * 40.0, 191u) + 0.03 * gnoise(d * 160.0, 193u);
+  vec3 high = vec3(hl) * vec3(1.0, 0.95, 0.88);
+  vec3 low = vec3(0.27 + 0.03 * gnoise(d * 30.0, 197u)) * vec3(0.96, 0.93, 0.9);
+  col = mix(high, low, t.y);
+  col += vec3(0.3) * clamp(t.z, 0.0, 1.2);
+  col *= 0.92 + 0.08 * smoothstep(-2000.0, 3000.0, t.x);
+`;
+
+const MARS_COLOR = /* glsl */ `
+  float n1 = gnoise(d * 6.0, 211u) * 0.5 + gnoise(d * 24.0, 213u) * 0.25 + gnoise(d * 96.0, 217u) * 0.12;
+  vec3 rust = vec3(0.62, 0.31, 0.16);
+  vec3 ochre = vec3(0.74, 0.5, 0.3);
+  vec3 dark = vec3(0.29, 0.17, 0.11);
+  col = mix(rust, ochre, smoothstep(-0.3, 0.5, n1));
+  // 北部低地与暗色区（类似大瑟提斯）
+  col = mix(col, dark, smoothstep(0.25, 0.8, t.y + n1 * 0.35) * 0.7);
+  col += vec3(0.1, 0.07, 0.05) * clamp(t.z, 0.0, 1.0);
+  col *= 0.9 + 0.1 * smoothstep(-3000.0, 3000.0, t.x);
+  // 极冠
+  float cap = smoothstep(1.2, 1.3, abs(lat) + n1 * 0.08);
+  col = mix(col, vec3(0.93, 0.92, 0.9), cap);
+`;
+
+const VENUS_SURFACE_COLOR = /* glsl */ `
+  float n1 = gnoise(d * 10.0, 231u) * 0.5 + gnoise(d * 40.0, 233u) * 0.25 + gnoise(d * 160.0, 237u) * 0.1;
+  vec3 basalt = vec3(0.3, 0.24, 0.19);
+  vec3 plains = vec3(0.45, 0.35, 0.25);
+  col = mix(basalt, plains, smoothstep(-0.4, 0.4, n1 + t.y * 0.5));
+  col *= 0.9 + 0.1 * smoothstep(-2000.0, 3000.0, t.x);
+`;
+
+/** 金星云层：黄白色的带状云与 Y 形图案。 */
+const VENUS_CLOUD_FRAG = /* glsl */ `
+${COMMON}
+${NOISE_GLSL}
+${FBM_GLSL}
+layout(location = 0) out vec4 oColor;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float lon = (uv.x - 0.5) * 2.0 * PI;
+  float lat = (uv.y - 0.5) * PI;
+  vec3 d = dirFromLatLon(lat, lon);
+  float w = fbm(d * 2.5, 4, 601u);
+  float sw = fbm(d * vec3(3.0, 9.0, 3.0) + w * 1.5, 5, 607u);
+  float bands = sin(lat * 10.0 + sw * 3.0 + lon * 0.6 * cos(lat));
+  vec3 c1 = vec3(0.95, 0.9, 0.74);
+  vec3 c2 = vec3(0.83, 0.71, 0.49);
+  vec3 col = mix(c2, c1, bands * 0.3 + 0.5 + sw * 0.25);
+  // 赤道附近的“Y”形暗纹
+  float y = exp(-pow(lat / 0.35, 2.0)) * smoothstep(0.1, 0.5, sin(lon * 1.0 + abs(lat) * 2.5 + w));
+  col *= 1.0 - 0.18 * y;
+  col *= mix(1.0, 0.9, smoothstep(1.0, 1.4, abs(lat)));
+  oColor = vec4(srgb(col), 1.0);
+}
+`;
+
+/** 气态巨行星：随纬度交替的亮带（zone）与暗带（belt），带湍流与大红斑。 */
+function gasFrag(seed: number, zone: string, belt: string, polar: string, bandFreq: number, turb: number, redSpot: boolean): string {
+  return /* glsl */ `
+${COMMON}
+${NOISE_GLSL}
+${FBM_GLSL}
+layout(location = 0) out vec4 oColor;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float lon = (uv.x - 0.5) * 2.0 * PI;
+  float lat = (uv.y - 0.5) * PI;
+  vec3 d = dirFromLatLon(lat, lon);
+  // 纬向拉伸的湍流：沿经度方向拉长
+  vec3 q = d * vec3(2.0, 12.0, 2.0);
+  float w = fbm(q, 5, ${seed}u);
+  float w2 = fbm(d * vec3(5.0, 40.0, 5.0) + w * 0.8, 4, ${seed + 11}u);
+  float y = lat + ${turb.toFixed(3)} * w + ${(turb * 0.35).toFixed(3)} * w2;
+  float b = sin(y * ${bandFreq.toFixed(2)}) + 0.35 * sin(y * ${(bandFreq * 2.3).toFixed(2)} + 1.3);
+  vec3 col = mix(${belt}, ${zone}, smoothstep(-0.55, 0.55, b));
+  col *= 0.92 + 0.08 * w2;
+  col = mix(col, ${polar}, smoothstep(1.0, 1.35, abs(lat)));
+  ${
+    redSpot
+      ? `{
+    float dl = lon - 0.6;
+    dl -= 6.2831853 * floor((dl + 3.14159265) / 6.2831853);
+    float e = pow(dl / 0.16, 2.0) + pow((lat + 0.39) / 0.075, 2.0);
+    float swirl = fbm(vec3(dl * 8.0, (lat + 0.39) * 14.0, e), 3, ${seed + 23}u);
+    col = mix(col, vec3(0.74, 0.36, 0.24) * (0.9 + 0.2 * swirl), (1.0 - smoothstep(0.6, 1.0, e)) * 0.9);
+    col = mix(col, vec3(0.95, 0.88, 0.8), smoothstep(1.0, 1.15, e) * (1.0 - smoothstep(1.15, 1.6, e)) * 0.35);
+  }`
+      : ''
+  }
+  oColor = vec4(srgb(col), 1.0);
+}
+`;
+}
+
+/** 土星环：一维的径向密度与颜色（C 环、B 环、卡西尼缝、A 环、恩克缝）。 */
+function saturnRingTexture(): THREE.Texture {
+  const W = 1024;
+  const cv = document.createElement('canvas');
+  cv.width = W;
+  cv.height = 4;
+  const ctx = cv.getContext('2d')!;
+  const img = ctx.createImageData(W, 4);
+  // 半径以土星半径为单位：1.24 .. 2.27
+  for (let i = 0; i < W; i++) {
+    const r = 1.24 + (i / (W - 1)) * (2.27 - 1.24);
+    let a = 0;
+    if (r < 1.53) a = 0.12 + 0.05 * Math.sin(r * 240);
+    else if (r < 1.95) a = 0.75 + 0.15 * Math.sin(r * 180) + 0.08 * Math.sin(r * 523);
+    else if (r < 2.03) a = 0.04;
+    else a = 0.5 + 0.08 * Math.sin(r * 310);
+    if (r > 2.21 && r < 2.225) a = 0.05;
+    a *= 1 - 0.5 * Math.max(0, (r - 2.2) / 0.07);
+    const warm = r < 1.95 ? 1 : 0.9;
+    for (let y = 0; y < 4; y++) {
+      const k = (y * W + i) * 4;
+      img.data[k] = Math.round(232 * warm);
+      img.data[k + 1] = Math.round(214 * warm);
+      img.data[k + 2] = Math.round(176 * warm);
+      img.data[k + 3] = Math.round(Math.max(0, Math.min(1, a)) * 255);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = THREE.ClampToEdgeWrapping;
+  return t;
+}
+
+export interface BodyMaps {
+  color: THREE.Texture;
+  normal?: THREE.Texture;
+  /** 金星：浓密的云层 */
+  clouds?: THREE.Texture;
+}
+
 export interface PlanetMaps {
   earthColor: THREE.Texture;
   earthAux: THREE.Texture;
   earthNormal: THREE.Texture;
   moonColor: THREE.Texture;
   moonNormal: THREE.Texture;
+  /** 其他行星的贴图（程序化烘焙） */
+  bodies: Partial<Record<BodyId, BodyMaps>>;
+  /** 土星环的径向密度/颜色（一维） */
+  saturnRings: THREE.Texture;
   waterMask: Uint8Array;
   waterW: number;
   waterH: number;
@@ -446,6 +618,42 @@ export async function bakePlanets(
     [earthColor, earthAux, earthNormal] = earthRT.textures;
     readSource = earthColor;
   }
+  // ---- 其他行星
+  const pw = quality === 'low' ? 512 : 1024;
+  const marsW = quality === 'low' ? 1024 : 2048;
+  const bodies: Partial<Record<BodyId, BodyMaps>> = {};
+  const rockyJob = (id: BodyId, w: number, color: string, radius: number) => {
+    const rt = makeTarget(w, w / 2, 2);
+    jobs.push({
+      rt,
+      w,
+      h: w / 2,
+      mat: new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: VERT,
+        fragmentShader: rockyFrag(id, color),
+        uniforms: { uRes: { value: new THREE.Vector2(w, w / 2) }, uMaxLevel: { value: quality === 'low' ? 3 : 4 }, uRadius: { value: radius } },
+      }),
+    });
+    bodies[id] = { color: rt.textures[0], normal: rt.textures[1] };
+  };
+  const colorJob = (w: number, frag: string): THREE.Texture => {
+    const rt = makeTarget(w, w / 2, 1);
+    jobs.push({
+      rt,
+      w,
+      h: w / 2,
+      mat: new THREE.RawShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: VERT, fragmentShader: frag, uniforms: { uRes: { value: new THREE.Vector2(w, w / 2) } } }),
+    });
+    return rt.textures[0];
+  };
+  rockyJob('mercury', pw, MERCURY_COLOR, 243_970);
+  rockyJob('venus', pw, VENUS_SURFACE_COLOR, 605_180);
+  bodies.venus!.clouds = colorJob(pw, VENUS_CLOUD_FRAG);
+  rockyJob('mars', marsW, MARS_COLOR, 338_950);
+  bodies.jupiter = { color: colorJob(pw, gasFrag(701, 'vec3(0.94, 0.88, 0.77)', 'vec3(0.66, 0.46, 0.31)', 'vec3(0.62, 0.6, 0.56)', 15.0, 0.05, true)) };
+  bodies.saturn = { color: colorJob(pw, gasFrag(733, 'vec3(0.93, 0.85, 0.65)', 'vec3(0.8, 0.69, 0.48)', 'vec3(0.72, 0.7, 0.62)', 19.0, 0.025, false)) };
+
   const moonRT = makeTarget(mw, mw / 2, 2);
   jobs.push({
     rt: moonRT,
@@ -507,7 +715,8 @@ export async function bakePlanets(
   if (src) for (const t of Object.values(src)) t.dispose();
 
   const [moonColor, moonNormal] = moonRT.textures;
-  return { earthColor, earthAux, earthNormal, moonColor, moonNormal, waterMask, waterW: readW, waterH: readH, realEarth: !!src };
+  bodies.moon = { color: moonColor, normal: moonNormal };
+  return { earthColor, earthAux, earthNormal, moonColor, moonNormal, bodies, saturnRings: saturnRingTexture(), waterMask, waterW: readW, waterH: readH, realEarth: !!src };
 }
 
 export function sampleWater(maps: PlanetMaps, dir: THREE.Vector3): boolean {

@@ -1,8 +1,12 @@
 import { Matrix4, Quaternion, Vector3 } from 'three';
 import {
+  AU,
+  BODY_BY_ID,
   EARTH,
   MOON,
+  SUN,
   type Body,
+  type BodyId,
   G0,
   atmoDensity,
   atmoPressure,
@@ -25,12 +29,12 @@ import { terrainHeight, terrainNormal } from '../physics/terrain';
 import type { RocketDesign } from '../rocket/design';
 import { Debris, Vessel, type RuntimePart } from './vessel';
 import { predict, nodeDvWorld, type NodeSpec, type Prediction } from './predictor';
-import { burnTime } from './maneuver';
+import { burnTime, solveTransfer } from './maneuver';
 import { Autopilot } from './autopilot';
 import { MissionTracker } from './missions';
 import { FlightTrail } from './trail';
 
-export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000];
+export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000, 1000000];
 export const PHYS_WARP_MAX = 3;
 /** 方向舵最大倾角：±90°（水平向西 / 向东） */
 export const RUDDER_MAX = Math.PI / 2;
@@ -45,7 +49,7 @@ const HEAT_SCALE = 0.8;
 
 export type SasMode = 'stability' | 'prograde' | 'retrograde' | 'normal' | 'antinormal' | 'radialOut' | 'radialIn' | 'maneuver' | 'rudder';
 export type SpeedMode = 'auto' | 'surface' | 'orbit';
-export type Scenario = 'pad' | 'leo' | 'llo';
+export type Scenario = 'pad' | 'leo' | 'llo' | 'lmo';
 
 export interface FlightEvent {
   type: string;
@@ -95,6 +99,9 @@ export interface Telemetry {
 export interface ManeuverNode extends NodeSpec {
   fixedDv: Vector3 | null; // 开始执行后锁定的惯性系 Δv 矢量
   remaining: Vector3 | null;
+  /** 行星际转移：到这个时刻自动重新精确计算节点 */
+  replanAt?: number | null;
+  replanTarget?: BodyId;
 }
 
 const UP = new Vector3(0, 1, 0);
@@ -147,6 +154,13 @@ export class FlightSim {
   lastThrustAccel = new Vector3();
   heatFlux = 0;
   private overheatWarned = false;
+  /** 太阳辐射热流 W/m²（靠近太阳时会把飞船烤化） */
+  solarFlux = 0;
+  private sunWarned = false;
+  /** 已提示“正在精确计算”，下一帧再真正计算（让提示先显示出来） */
+  private replanNotified = false;
+  /** 机动规划中选择的目标行星（用于提示与捕获） */
+  targetBody: BodyId | null = null;
   private lastNonGravAcc = 0;
   landedOnMoonOnce = false;
   paused = false;
@@ -202,12 +216,16 @@ export class FlightSim {
       this.lockLanded(EARTH);
       this.landed = true;
     } else {
-      const body = sc === 'leo' ? EARTH : MOON;
-      const alt = sc === 'leo' ? 100_000 : 22_000;
+      const body = sc === 'leo' ? EARTH : sc === 'llo' ? MOON : BODY_BY_ID.mars;
+      const alt = sc === 'leo' ? 100_000 : sc === 'llo' ? 22_000 : 80_000;
       const bp = bodyPosition(body, 0, new Vector3());
       const bv = bodyVelocity(body, 0, new Vector3());
-      // 从日照面起步：沿轨道飞行一段后仍处在白天（太阳方位角约 0.75 rad）
-      const az = sc === 'leo' ? 0.45 : -0.5;
+      // 从日照面起步：沿轨道飞行一段后仍处在白天（地球附近太阳方位角约 0.75 rad）
+      let az = sc === 'leo' ? 0.45 : -0.5;
+      if (sc === 'lmo') {
+        const sd = bodyPosition(SUN, 0, new Vector3()).sub(bp);
+        az = Math.atan2(-sd.z, sd.x) - 0.4;
+      }
       const dir = new Vector3(Math.cos(az), 0, -Math.sin(az));
       const rr = body.radius + alt;
       V.r.copy(bp).addScaledVector(dir, rr);
@@ -405,6 +423,7 @@ export class FlightSim {
   maxWarpIndex(): number {
     if (this.destroyed) return WARP_LEVELS.length - 1;
     if (this.landed) return WARP_LEVELS.length - 1;
+    if (this.solarFlux > 20_000) return PHYS_WARP_MAX;
     const tel = this.telemetry;
     if (this.vessel.parts.some((rp) => rp.thrustNow > 0 || (rp.igniteDelay ?? 0) > 0) || this.ullageT > 0) return PHYS_WARP_MAX;
     if (this.autopilot.mode === 'ascent' || this.autopilot.mode === 'land') return PHYS_WARP_MAX;
@@ -414,9 +433,10 @@ export class FlightSim {
     if (a < 3000 * s + 2000) return PHYS_WARP_MAX;
     if (a < 20_000 * s) return 5;
     if (a < 60_000 * s) return 6;
-    // 等待奔月发射窗口可能需要数天，近地轨道也允许 ×10000
-    if (a < 2_000_000 * s) return 8;
-    return 9;
+    // 等待奔月 / 行星际发射窗口可能需要数天到数十天，低轨道也允许 ×100000
+    if (a < 2_000_000 * s) return 9;
+    // 行星际巡航（日心轨道或远离行星）允许 ×1000000
+    return tel.body.id === 'sun' || a > 60 * tel.body.radius ? WARP_LEVELS.length - 1 : 9;
   }
 
   setWarp(i: number): void {
@@ -471,6 +491,10 @@ export class FlightSim {
 
     if (this.warpIndex > PHYS_WARP_MAX && !this.landed && !this.destroyed) {
       this.stepRails(simDt);
+    } else if (this.warpIndex > PHYS_WARP_MAX) {
+      // 着陆状态（或已损毁）下的高倍时间加速：直接推进时间，不必逐小步积分
+      this.t += simDt;
+      if (this.landed && !this.destroyed) this.applyLanded();
     } else {
       const near = this.telemetry ? this.telemetry.radarAlt < 200 : true;
       const hMax = near ? 1 / 480 : 1 / 200;
@@ -485,6 +509,7 @@ export class FlightSim {
     this.checkSoi();
     this.missions.update();
     this.updateNodes();
+    this.checkReplan();
     this.predictionAge += dtReal;
     const thrusting = this.vessel.parts.some((rp) => rp.thrustNow > 0);
     const interval = thrusting ? 0.25 : this.warpIndex > PHYS_WARP_MAX ? 0.1 : 0.5;
@@ -504,17 +529,23 @@ export class FlightSim {
       this.prediction = null;
       return;
     }
-    this.prediction = predict(V.r, V.v, this.t, this.nodes, { maxSteps: 2500, eta: 0.02 });
+    // 行星际航行：预测要覆盖数月的日心轨道
+    const o = tel.orbit;
+    const far = tel.body.id === 'sun' || (tel.body.id !== 'moon' && (o.hyperbolic || o.ap > tel.body.soi * 0.8)) || this.nodes.length > 0;
+    this.prediction = far
+      ? predict(V.r, V.v, this.t, this.nodes, { maxSteps: 4000, eta: 0.02, maxTime: 9e7 })
+      : predict(V.r, V.v, this.t, this.nodes, { maxSteps: 2500, eta: 0.02 });
   }
 
   private checkSoi(): void {
     const b = dominantBody(this.vessel.r, this.t);
     if (b !== this.body) {
-      this.emit({
-        type: 'soi',
-        msg: b.id === 'moon' ? '进入月球引力影响球' : '离开月球引力影响球，返回地球轨道',
-        level: 'good',
-      });
+      const old = this.body;
+      const msg =
+        b.parent === old.id
+          ? `进入${b.name}引力影响球`
+          : `离开${old.name}引力影响球，${b.id === 'sun' ? '进入环绕太阳的轨道' : `返回${b.name}轨道`}`;
+      this.emit({ type: 'soi', msg, level: 'good' });
       this.body = b;
       this.predictionAge = 999;
     }
@@ -559,6 +590,11 @@ export class FlightSim {
       const b = dominantBody(V.r, this.t);
       this.trail.record(b, V.r, this.t, false);
       const alt = V.r.distanceTo(bodyPosition(b, this.t, _v1)) - b.radius;
+      if (b.kind === 'star' && alt < 15 * b.radius) {
+        this.warpIndex = 0;
+        this.emit({ type: 'msg', msg: '太靠近太阳，时间加速已停止', level: 'warn' });
+        break;
+      }
       if (b.atmosphere && alt < b.atmosphere.height) {
         this.warpIndex = 0;
         this.emit({ type: 'msg', msg: '进入大气层，时间加速已停止', level: 'warn' });
@@ -622,8 +658,15 @@ export class FlightSim {
     const dist = rel.length();
     const up = rel.clone().divideScalar(dist);
     const alt = dist - body.radius;
+    if (body.kind !== 'rocky' && alt < 0) {
+      this.destroy(body.kind === 'gas' ? `坠入${body.name}的大气深处，被巨大的压力压碎` : '坠入太阳，瞬间汽化');
+      return;
+    }
     const pressure = atmoPressure(body, alt);
     const rho = atmoDensity(body, alt);
+    // 太阳辐射：1361 W/m²（1 AU），按距离平方增长；约 35% 被船体吸收
+    const dSun = V.r.distanceTo(bodyPosition(SUN, this.t, _v4));
+    this.solarFlux = 1361 * 0.35 * (AU / dSun) ** 2;
     let lit = false;
     for (const rp of V.parts) {
       if (rp.igniteDelay && rp.igniteDelay > 0) {
@@ -737,7 +780,7 @@ export class FlightSim {
     let crash: RuntimePart | null = null;
     let crashSpeed = 0;
     this.touchingWater = false;
-    if (radar < reach) {
+    if (radar < reach && body.kind === 'rocky') {
       const nBf = terrainNormal(body, bodyDir, new Vector3());
       const rotB = bodyRotation(body, this.t);
       const nW = nBf.clone().applyAxisAngle(UP, rotB);
@@ -854,15 +897,25 @@ export class FlightSim {
     this.tempLimit = tMax;
     const sigma = 5.67e-8 * 0.85;
     const tAmb = 250;
-    const dT = (this.heatFlux - sigma * (V.temperature ** 4 - tAmb ** 4)) / 11_000;
+    const dT = (this.heatFlux + this.solarFlux - sigma * (V.temperature ** 4 - tAmb ** 4)) / 11_000;
     V.temperature = Math.max(tAmb, V.temperature + dT * h);
     if (V.temperature > tMax * 0.85 && !this.overheatWarned) {
       this.overheatWarned = true;
       this.emit({ type: 'msg', msg: '警告：蒙皮温度接近极限！', level: 'bad' });
     }
+    if (this.solarFlux > 60_000 && !this.sunWarned) {
+      this.sunWarned = true;
+      this.emit({ type: 'msg', msg: '警告：离太阳太近，船体正在被烤热！', level: 'bad' });
+    }
+    if (this.solarFlux < 30_000) this.sunWarned = false;
     if (V.temperature < tMax * 0.7) this.overheatWarned = false;
     if (V.temperature > tMax) {
-      this.destroy(`${leading?.p.def.name ?? '船体'} 过热烧毁（${V.temperature.toFixed(0)} K）${a.shieldBottom ? '——再入时应让隔热罩朝前（逆行方向）' : ''}`);
+      const bySun = this.solarFlux > this.heatFlux;
+      this.destroy(
+        bySun
+          ? `离太阳太近，船体被烤化（${V.temperature.toFixed(0)} K）`
+          : `${leading?.p.def.name ?? '船体'} 过热烧毁（${V.temperature.toFixed(0)} K）${a.shieldBottom ? '——再入时应让隔热罩朝前（逆行方向）' : ''}`,
+      );
       return;
     }
 
@@ -905,8 +958,10 @@ export class FlightSim {
       } else if (!upright) {
         this.emit({ type: 'landed', msg: '着陆器倾覆了……很难再起飞', level: 'bad' });
       }
-    } else {
+    } else if (body.id === 'earth') {
       this.emit({ type: 'landed', msg: water ? '溅落成功！' : '着陆成功！', level: 'good' });
+    } else {
+      this.emit({ type: 'landed', msg: upright ? `${body.name}着陆成功！` : `着陆器在${body.name}表面倾覆了……`, level: upright ? 'good' : 'bad' });
     }
     this.missions.onTouchdown(body, upright);
   }
@@ -970,7 +1025,7 @@ export class FlightSim {
           _q1.setFromAxisAngle(d.w.clone().divideScalar(wl), wl * h);
           d.q.multiply(_q1).normalize();
         }
-        if (alt < 40 + (body.id === 'moon' ? body.maxTerrain : 0)) {
+        if (alt < 40 + (body.id === 'earth' ? 0 : body.maxTerrain)) {
           const dir = toBodyFixed(body, this.t, d.r).normalize();
           const th = terrainHeight(body, dir);
           if (alt < th + 1) {
@@ -1085,10 +1140,30 @@ export class FlightSim {
 
   // ---------------------------------------------------------------- 机动节点
 
-  addNode(n: NodeSpec): void {
-    this.nodes = [{ t: n.t, dv: n.dv.clone(), fixedDv: null, remaining: null }];
+  addNode(n: NodeSpec, replan?: { at: number; target: BodyId } | null): void {
+    this.nodes = [{ t: n.t, dv: n.dv.clone(), fixedDv: null, remaining: null, replanAt: replan?.at ?? null, replanTarget: replan?.target }];
     this.predictionAge = 999;
     this.refreshPrediction();
+  }
+
+  /** 行星际转移的近似节点：飞到窗口前一天左右时用多体积分重新精确计算。 */
+  private checkReplan(): void {
+    const n = this.nodes[0];
+    if (!n || n.replanAt == null || !n.replanTarget || this.t < n.replanAt || n.remaining) return;
+    if (!this.replanNotified) {
+      this.replanNotified = true;
+      this.emit({ type: 'msg', msg: '临近转移窗口：正在用多体引力精确计算转移轨道……', level: 'info' });
+      return;
+    }
+    this.replanNotified = false;
+    n.replanAt = null;
+    const res = solveTransfer({ r: this.vessel.r, v: this.vessel.v, t: this.t }, BODY_BY_ID[n.replanTarget]);
+    if (res.node) {
+      this.addNode(res.node, res.replanAt != null && res.target ? { at: res.replanAt, target: res.target.id } : null);
+      // 正在“加速到节点前”时，改为加速到新的节点之前
+      if (this.autoWarpTo !== null) this.autoWarpTo = Math.min(this.autoWarpTo, res.node.t - this.nodeBurnTime() / 2 - 60);
+      this.emit({ type: 'msg', msg: `已重新精确计算：${res.msg}`, level: 'good' });
+    } else this.emit({ type: 'msg', msg: res.msg, level: 'warn' });
   }
 
   removeNode(): void {
@@ -1182,7 +1257,7 @@ export class FlightSim {
     const atmoTop = body.atmosphere?.height ?? 0;
     let speedModeUsed: 'surface' | 'orbit';
     if (this.speedMode === 'auto') {
-      const thr = body.id === 'earth' ? 36_000 : 8_000;
+      const thr = body.id === 'earth' ? 36_000 : body.atmosphere ? body.atmosphere.height * 0.5 : 8_000;
       speedModeUsed = alt < thr ? 'surface' : 'orbit';
     } else speedModeUsed = this.speedMode;
     // 着陆建议点火

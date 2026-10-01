@@ -1,8 +1,9 @@
 import * as THREE from 'three';
 import type { FlightSim, SasMode } from '../game/flight';
 import { WARP_LEVELS, PHYS_WARP_MAX, RUDDER_MAX } from '../game/flight';
-import { MISSIONS } from '../game/missions';
-import { solveCapture, solveChangeApsis, solveCircularize, solveCorrection, solveReturn, solveTLI, type SolveResult } from '../game/maneuver';
+import { MISSIONS, PLANET_MISSIONS, loadAchievements } from '../game/missions';
+import { solveCapture, solveCaptureAt, solveChangeApsis, solveCircularize, solveCorrection, solvePlanetCorrection, solveReturn, solveTLI, solveTransfer, type SolveResult, type TransferPlan } from '../game/maneuver';
+import { BODY_BY_ID, EARTH, HELIO, type BodyId } from '../physics/bodies';
 import type { FlightScene } from '../render/flightScene';
 import { Navball } from '../render/navball';
 import { nextStep } from '../game/guide';
@@ -514,10 +515,10 @@ export class FlightHUD {
     const o = tel.orbit;
     setText(E.orbTitle, `${tel.body.name}轨道`);
     const ground = sim.landed;
-    const moon = tel.body.id === 'moon';
-    setText(E.apK, moon ? '远月点' : '远地点');
-    setText(E.peK, moon ? '近月点' : '近地点');
-    setText(E.tapK, moon ? '到达远月点' : '到达远地点');
+    const c = tel.body.apsisChar;
+    setText(E.apK, `远${c}点`);
+    setText(E.peK, `近${c}点`);
+    setText(E.tapK, `到达远${c}点`);
     setText(E.ap, ground ? '—' : o.hyperbolic ? '逃逸' : fmtDist(o.apAlt));
     setText(E.pe, ground ? '—' : fmtDist(o.peAlt));
     setText(E.tap, ground || o.hyperbolic ? '—' : fmtTime(o.timeToAp));
@@ -543,6 +544,14 @@ export class FlightHUD {
         const done = sim.missions.done.has(m.id);
         this.missionBox.appendChild(h('div', { class: `mission ${done ? 'done' : ''}`, title: m.desc }, `${done ? '✔' : '○'} ${m.title}`));
       }
+      // 行星任务：本次飞行完成的高亮，以前完成过的显示为淡色
+      const ever = loadAchievements();
+      const chips = h('div', { class: 'planet-chips' }, h('span', { class: 'lbl' }, '行星'));
+      for (const m of PLANET_MISSIONS) {
+        const cls = sim.missions.done.has(m.id) ? 'done' : ever.has(m.id) ? 'ever' : '';
+        chips.appendChild(h('span', { class: `chip ${cls}`, title: m.desc }, m.title));
+      }
+      this.missionBox.appendChild(chips);
     }
 
     // 速度与航向
@@ -618,15 +627,83 @@ export class FlightHUD {
 
   // ---------------------------------------------------------------- 机动规划
 
-  private solve(f: () => SolveResult): void {
+  private solving = false;
+
+  /** heavy：需要长时间多体积分的计算，先显示“正在计算”再开始（计算期间画面会停顿一两秒）。 */
+  private solve(f: () => SolveResult | TransferPlan, heavy = false): void {
+    if (this.solving) return;
+    if (heavy) {
+      this.solving = true;
+      this.toast('正在计算轨道……', 'info');
+      requestAnimationFrame(() =>
+        setTimeout(() => {
+          try {
+            this.applySolve(f);
+          } finally {
+            this.solving = false;
+          }
+        }, 0),
+      );
+    } else this.applySolve(f);
+  }
+
+  private applySolve(f: () => SolveResult | TransferPlan): void {
     const sim = this.sim;
     const r = f();
     this.plannerMsg = r.msg;
     if (r.node) {
-      sim.addNode(r.node);
+      // 行星际转移：先给出近似节点，临近窗口时自动重新精确计算
+      const plan = r as TransferPlan;
+      sim.addNode(r.node, plan.replanAt != null && plan.target ? { at: plan.replanAt, target: plan.target.id } : null);
       this.toast(r.msg, 'info');
     } else this.toast(r.msg, 'warn');
     this.plannerKey = '';
+  }
+
+  /** 行星际航行的按钮（按当前所在天体与目标给出可用的操作）。 */
+  private planetButtons(b: (label: string, f: () => SolveResult | TransferPlan, title?: string, heavy?: boolean) => HTMLElement): HTMLElement[] {
+    const sim = this.sim;
+    const tel = sim.telemetry;
+    const body = tel.body;
+    const state = () => ({ r: sim.vessel.r, v: sim.vessel.v, t: sim.t });
+    const tgt = sim.targetBody ? BODY_BY_ID[sim.targetBody] : null;
+    const out: HTMLElement[] = [];
+    // 目标选择
+    const pick = h('div', { class: 'target-pick' }, h('span', { class: 'lbl' }, '目标'));
+    for (const id of ['mercury', 'venus', 'earth', 'mars', 'jupiter', 'saturn'] as BodyId[]) {
+      const bd = BODY_BY_ID[id];
+      if (id === 'earth' && body.id === 'earth') continue;
+      pick.appendChild(
+        h(
+          'button',
+          {
+            class: sim.targetBody === id ? 'on' : '',
+            title: `把${bd.name}设为目标`,
+            style: { '--bc': `#${new THREE.Color(bd.color).getHexString()}` },
+            onclick: () => {
+              sim.targetBody = sim.targetBody === id ? null : id;
+              this.plannerMsg = '';
+              this.plannerKey = '';
+            },
+          },
+          bd.apsisChar,
+        ),
+      );
+    }
+    out.push(pick);
+    if (!tgt) return out;
+    const grid = h('div', { class: 'grid' });
+    const atPlanet = !!HELIO[body.id] && body !== tgt;
+    if (atPlanet) grid.appendChild(b(`🚀 前往${tgt.name}`, () => solveTransfer(state(), tgt), `自动寻找发射窗口，计算从${body.name}轨道飞往${tgt.name}的转移（窗口可能在几天到几十天后）`, true));
+    if (body.id === 'sun' || (atPlanet && (tel.orbit.hyperbolic || tel.orbit.ap > body.soi * 0.3)))
+      grid.appendChild(b('中途修正', () => solvePlanetCorrection(state(), tgt), `2 分钟后做一次小修正，使${tgt.name}的近拱点落在合适高度`, true));
+    if (body.id === 'sun' || body === tgt) grid.appendChild(b(`${tgt.name}捕获`, () => solveCaptureAt(state(), tgt, sim.prediction ?? undefined), `在近${tgt.apsisChar}点减速，进入环绕${tgt.name}的轨道`, true));
+    if (body === tgt && tgt.kind === 'rocky' && !tel.orbit.hyperbolic && tgt !== EARTH) {
+      const pe = tgt.atmosphere ? Math.max(8_000, tgt.atmosphere.height * 0.3) : 6_000;
+      grid.appendChild(b(`降低近${tgt.apsisChar}点`, () => solveChangeApsis(state(), 'ap', pe), `在远拱点减速，把近${tgt.apsisChar}点降到 ${(pe / 1000).toFixed(0)} km，准备着陆`));
+    }
+    if (grid.childElementCount) out.push(grid);
+    return out;
   }
 
   private updatePlanner(): void {
@@ -640,22 +717,34 @@ export class FlightHUD {
     const state = () => ({ r: sim.vessel.r, v: sim.vessel.v, t: sim.t });
     P.appendChild(h('h3', null, '机动规划'));
     if (!n) {
-      const b = (label: string, f: () => SolveResult, title = '') => h('button', { title, onclick: () => this.solve(f) }, label);
+      const b = (label: string, f: () => SolveResult | TransferPlan, title = '', heavy = false) => h('button', { title, onclick: () => this.solve(f, heavy) }, label);
+      const body = sim.telemetry.body.id;
+      const lunar: HTMLElement[] = [];
+      if (body === 'earth') {
+        lunar.push(
+          b('🌙 奔月转移', () => solveTLI(state()), '自动计算地月转移入射（霍曼转移 + 三体修正）'),
+          b('修正近月点', () => solveCorrection(state(), 'moon', 40_000, 90), '奔月途中做小修正，使近月点约 40 km'),
+          b('修正再入角', () => solveCorrection(state(), 'earth', 35_000, 90), '返回途中修正近地点到 35 km 再入走廊'),
+        );
+      } else if (body === 'moon') {
+        lunar.push(
+          b('月球捕获', () => solveCapture(state(), sim.prediction ?? undefined), '在近月点减速进入环月轨道'),
+          b('降低近月点', () => solveChangeApsis(state(), 'ap', 6_000), '在远月点减速，把近月点降到 6 km，准备着陆'),
+          b('🌍 返回地球', () => solveReturn(state()), '从环月轨道返回，再入近地点约 35 km'),
+        );
+      }
       P.appendChild(
         h(
           'div',
           { class: 'grid' },
           b('远拱点圆化', () => solveCircularize(state(), 'ap')),
           b('近拱点圆化', () => solveCircularize(state(), 'pe')),
-          b('🌙 奔月转移', () => solveTLI(state()), '自动计算地月转移入射（霍曼转移 + 三体修正）'),
-          b('修正近月点', () => solveCorrection(state(), 'moon', 40_000, 90), '奔月途中做小修正，使近月点约 40 km'),
-          b('月球捕获', () => solveCapture(state(), sim.prediction ?? undefined), '在近月点减速进入环月轨道'),
-          b('降低近月点', () => solveChangeApsis(state(), 'ap', 6_000), '在远月点减速，把近月点降到 6 km，准备着陆'),
-          b('🌍 返回地球', () => solveReturn(state()), '从环月轨道返回，再入近地点约 35 km'),
-          b('修正再入角', () => solveCorrection(state(), 'earth', 35_000, 90), '返回途中修正近地点到 35 km 再入走廊'),
+          ...lunar,
           b('＋ 手动节点', () => ({ node: { t: sim.t + 300, dv: new THREE.Vector3() }, msg: '已在 5 分钟后创建空白节点' })),
         ),
       );
+      P.appendChild(h('h4', null, '🪐 行星际航行'));
+      for (const e of this.planetButtons(b)) P.appendChild(e);
       if (this.plannerMsg) P.appendChild(h('div', { class: 'note' }, this.plannerMsg));
       P.appendChild(
         h(
@@ -696,9 +785,10 @@ export class FlightHUD {
     if (pred) {
       const pe = pred.events.find((e) => e.afterNode && e.type === 'pe');
       const ap = pred.events.find((e) => e.afterNode && e.type === 'ap');
-      if (ap) res.push(`${ap.body.id === 'moon' ? '远月点' : '远地点'} ${fmtDist(ap.alt)}`);
-      if (pe) res.push(`${pe.body.id === 'moon' ? '近月点' : '近地点'} ${fmtDist(pe.alt)}`);
-      if (pred.events.some((e) => e.afterNode && e.type === 'soiEnter')) res.push('将进入月球影响球');
+      if (ap) res.push(`远${ap.body.apsisChar}点 ${fmtDist(ap.alt)}`);
+      if (pe) res.push(`近${pe.body.apsisChar}点 ${fmtDist(pe.alt)}`);
+      const enter = pred.events.find((e) => e.afterNode && e.type === 'soiEnter');
+      if (enter) res.push(`将进入${enter.body.name}影响球（${fmtTime(enter.t - sim.t)} 后）`);
       if (pred.impact && pred.impact.afterNode) res.push(`⚠ 将撞击${pred.impact.body.name}`);
     }
     if (res.length) P.appendChild(h('div', { class: 'note' }, '机动后：' + res.join('，')));

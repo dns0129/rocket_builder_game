@@ -1,8 +1,8 @@
 import * as THREE from 'three';
-import { EARTH, MOON, MOON_ORBIT, SUN_DIR, atmoDensity, bodyPosition, bodyRotation, bodyVelocity, dominantBody, surfaceVelocity, toBodyFixed } from '../physics/bodies';
+import { AU, BODIES, BODY_BY_ID, EARTH, HELIO, MOON_ORBIT, SUN, VENUS, type Body, type BodyId, atmoDensity, bodyPosition, bodyRotation, bodyVelocity, dominantBody, sunDirection, surfaceVelocity, toBodyFixed } from '../physics/bodies';
 import type { FlightSim, FlightEvent } from '../game/flight';
 import type { Prediction } from '../game/predictor';
-import { Planets, SUN_INTENSITY, sharedUniforms } from './planets';
+import { ATMO_LOOK, Planets, SUN_INTENSITY, setActiveAtmosphere, sharedUniforms, sunlightFactor } from './planets';
 import type { PlanetMaps } from './planetBake';
 import { TerrainPatch } from './terrainPatch';
 import { LaunchPad } from './launchpad';
@@ -10,21 +10,33 @@ import { VesselView } from './vesselView';
 import { Particles, ReentryGlow } from './effects';
 import { SeparationFx } from './separation';
 import { MapView, type MapBasis, type MapFocus } from './mapView';
-import { FlightTrajectory, PredictionHistory, encounterAnchor } from './trajectoryView';
+import { FlightTrajectory, PredictionHistory, bodyChain, placeSegments } from './trajectoryView';
 import type { RenderEngine } from './engine';
 
 export type CamMode = 'orbit' | 'chase' | 'free';
+
+/** 太阳光晕的基础颜色（HDR） */
+const GLOW_BASE = new THREE.Color(3.2, 2.6, 1.9);
+
+/** 半球光：各天体的天空色与地面反照色 */
+const HEMI_LOOK: Partial<Record<BodyId, { sky: THREE.Color; ground: THREE.Color; k: number }>> = {
+  earth: { sky: new THREE.Color(0.35, 0.5, 0.85), ground: new THREE.Color(0.25, 0.3, 0.38), k: 0.15 },
+  moon: { sky: new THREE.Color(0, 0, 0), ground: new THREE.Color(0.35, 0.35, 0.34), k: 0.25 },
+  mercury: { sky: new THREE.Color(0, 0, 0), ground: new THREE.Color(0.36, 0.34, 0.32), k: 0.25 },
+  mars: { sky: new THREE.Color(0.75, 0.55, 0.4), ground: new THREE.Color(0.45, 0.24, 0.14), k: 0.2 },
+  venus: { sky: new THREE.Color(0.8, 0.62, 0.36), ground: new THREE.Color(0.45, 0.32, 0.18), k: 0.25 },
+};
 
 const UP = new THREE.Vector3(0, 1, 0);
 /** 二维地图相机的基准视场角：远处的长焦相机近似正投影，但保留大气辉光等透视效果 */
 const MAP_FOV = (10 * Math.PI) / 180;
 const MAP_MIN_EXTENT = 1_500;
-const MAP_MAX_EXTENT = 1.5e8;
+const MAP_MAX_EXTENT = 2.5e11;
 
 /** 飞行场景：浮动原点、相机、光照、特效与地图视图。 */
 export class FlightScene {
   scene = new THREE.Scene();
-  camera = new THREE.PerspectiveCamera(55, 1, 0.3, 1e11);
+  camera = new THREE.PerspectiveCamera(55, 1, 0.3, 1e13);
   planets: Planets;
   patch: TerrainPatch;
   pad: LaunchPad | null = null;
@@ -81,7 +93,7 @@ export class FlightScene {
     this.engine = engine;
     this.sim = sim;
     this.particles = new Particles(engine.quality);
-    this.planets = new Planets(maps);
+    this.planets = new Planets(maps, engine.quality);
     this.planets.addTo(this.scene);
     this.patch = new TerrainPatch(maps);
     this.scene.add(this.patch.mesh);
@@ -222,8 +234,15 @@ export class FlightScene {
   }
 
   cycleMapFocus(): void {
-    const order: MapFocus[] = ['earth', 'moon', 'vessel'];
-    this.setMapFocus(order[(order.indexOf(this.mapFocusBody()) + 1) % 3]);
+    // 当前天体 → 目标天体 → 太阳 → 飞船 → 当前天体……
+    const tel = this.sim.telemetry;
+    const order: MapFocus[] = [tel.body.id];
+    const tgt = this.sim.targetBody;
+    if (tgt && !order.includes(tgt)) order.push(tgt);
+    if (!order.includes('sun')) order.push('sun');
+    order.push('vessel');
+    const i = order.indexOf(this.mapFocusBody());
+    this.setMapFocus(order[(i + 1) % order.length]);
   }
 
   /** 是否在天体表面附近做亚轨道飞行（上升段、再入、着陆）。 */
@@ -255,7 +274,7 @@ export class FlightScene {
     const sim = this.sim;
     const t = sim.t;
     const f = this.mapFocusBody();
-    const center = f === 'vessel' ? sim.vessel.r.clone() : bodyPosition(f === 'earth' ? EARTH : MOON, t, new THREE.Vector3());
+    const center = f === 'vessel' ? sim.vessel.r.clone() : bodyPosition(BODY_BY_ID[f], t, new THREE.Vector3());
     const R = this.mapRight;
     const U = this.mapUp;
     let x0 = Infinity;
@@ -277,14 +296,17 @@ export class FlightScene {
     add(V.x, V.y, V.z);
     const base = new THREE.Vector3();
     const pred = sim.destroyed ? null : sim.prediction;
-    if (pred) {
-      let visitedMoon = false;
-      for (const seg of pred.segments) {
-        // 奔月途中：框到月球相遇段为止（之后的飞掠弹道不计入）
-        if (seg.body.id === 'earth' && visitedMoon && sim.telemetry.body.id === 'earth') break;
-        if (seg.body.id === 'moon') visitedMoon = true;
-        const anchor = encounterAnchor(pred, seg);
-        bodyPosition(seg.body, anchor ?? t, base);
+    if (pred && pred.segments.length) {
+      const place = placeSegments(pred);
+      const chain = bodyChain(pred.segments[0].body);
+      let visited = false;
+      for (let si = 0; si < pred.segments.length; si++) {
+        const seg = pred.segments[si];
+        // 飞往其他天体途中：框到相遇段为止（之后的飞掠弹道不计入）
+        if (visited && chain.has(seg.body.id)) break;
+        if (!chain.has(seg.body.id)) visited = true;
+        const pl = place[si];
+        bodyPosition(BODY_BY_ID[pl.host], t, base).add(pl.off);
         const n = seg.times.length;
         const stride = Math.max(1, Math.floor(n / 400));
         for (let i = 0; i < n; i += stride) add(seg.pts[i * 3] + base.x, seg.pts[i * 3 + 1] + base.y, seg.pts[i * 3 + 2] + base.z);
@@ -311,9 +333,15 @@ export class FlightScene {
       const top = Math.max(tel.alt, isFinite(tel.orbit.apAlt) && tel.orbit.apAlt > 0 ? tel.orbit.apAlt : 0);
       return Math.max(25_000, Math.min(tel.body.radius * 1.2, top * 1.4 + 30_000));
     }
-    const body = f === 'earth' ? EARTH : MOON;
+    const body = BODY_BY_ID[f];
     const o = tel.orbit;
     if (tel.body === body && !o.hyperbolic && isFinite(o.ap)) return Math.max(body.radius * 1.35, Math.min(MAP_MAX_EXTENT, o.ap * 1.2));
+    if (f === 'sun') {
+      // 太阳：框住飞船与目标行星的轨道
+      const tgt = this.sim.targetBody ? HELIO[this.sim.targetBody]?.a ?? 0 : 0;
+      const ship = this.sim.vessel.r.distanceTo(bodyPosition(SUN, this.sim.t, new THREE.Vector3()));
+      return Math.min(MAP_MAX_EXTENT, Math.max(tgt, ship, AU * 0.5) * 1.25);
+    }
     if (f === 'earth' && (tel.body.id === 'moon' || o.hyperbolic || o.ap > MOON_ORBIT.a * 0.3)) return MOON_ORBIT.a * 1.15;
     return body.radius * (f === 'earth' ? 1.6 : 3);
   }
@@ -334,7 +362,7 @@ export class FlightScene {
     const V = sim.vessel;
     const tel = sim.telemetry;
     const f = this.mapFocusBody();
-    const ref = f === 'vessel' ? tel.body : f === 'earth' ? EARTH : MOON;
+    const ref = f === 'vessel' ? tel.body : BODY_BY_ID[f];
     const rel = V.r.clone().sub(bodyPosition(ref, sim.t, new THREE.Vector3()));
     const vrel = V.v.clone().sub(bodyVelocity(ref, sim.t, new THREE.Vector3()));
     const hv = rel.clone().cross(vrel);
@@ -351,7 +379,8 @@ export class FlightScene {
     const want = new THREE.Vector3();
     if (f === 'vessel') want.copy(rel).normalize().cross(n);
     else if (this.mapUpRef) want.copy(this.mapUpRef).cross(n);
-    else want.copy(SUN_DIR);
+    else if (ref.id === 'sun') want.set(1, 0, 0);
+    else sunDirection(bodyPosition(ref, sim.t, new THREE.Vector3()), sim.t, want);
     want.addScaledVector(n, -want.dot(n));
     if (want.lengthSq() < 0.01) want.set(1, 0, 0).addScaledVector(n, -n.x);
     want.normalize();
@@ -392,37 +421,25 @@ export class FlightScene {
     const fxDt = Math.min(sim.lastSimDt, 0.25);
 
     // 浮动原点
-    const earthPos = new THREE.Vector3();
-    const moonPos = bodyPosition(MOON, t, new THREE.Vector3());
     if (this.mode === 'map') {
       const f = this.mapFocusBody();
-      this.origin.copy(f === 'earth' ? earthPos : f === 'moon' ? moonPos : V.r);
+      if (f === 'vessel') this.origin.copy(V.r);
+      else bodyPosition(BODY_BY_ID[f], t, this.origin);
     } else {
       this.origin.copy(V.r);
     }
     const origin = this.origin;
 
     // 天体
-    const eRot = bodyRotation(EARTH, t);
-    const mRot = bodyRotation(MOON, t);
-    this.planets.earth.position.copy(earthPos).sub(origin);
-    this.planets.earth.rotation.set(0, eRot, 0);
-    this.planets.clouds.position.copy(this.planets.earth.position);
-    this.planets.clouds.rotation.set(0, eRot, 0);
-    this.planets.moon.position.copy(moonPos).sub(origin);
-    this.planets.moon.rotation.set(0, mRot, 0);
-    const rotE = new THREE.Matrix3().setFromMatrix4(new THREE.Matrix4().makeRotationY(eRot));
-    const rotM = new THREE.Matrix3().setFromMatrix4(new THREE.Matrix4().makeRotationY(mRot));
-    this.planets.earthMat.uniforms.uModelRot.value = rotE;
-    this.planets.cloudMat.uniforms.uModelRot.value = rotE;
-    this.planets.moonMat.uniforms.uModelRot.value = rotM;
+    this.planets.updateBodies(t, origin);
+    this.planets.cloudMat.uniforms.uModelRot.value.copy(this.planets.earthMat.uniforms.uModelRot.value);
     const cloudOff = (t * 2e-6) % 1;
     this.planets.earthMat.uniforms.uCloudOffset.value = cloudOff;
     this.planets.cloudMat.uniforms.uCloudOffset.value = cloudOff;
 
     // 地形补丁
     const body = tel.body;
-    if (this.mode === 'flight') {
+    if (this.mode === 'flight' && body.kind === 'rocky') {
       const shipBf = toBodyFixed(body, t, V.r);
       this.patch.update(body, t, shipBf, Math.max(0, tel.radarAlt), origin);
     } else {
@@ -432,16 +449,8 @@ export class FlightScene {
     const pdir = new THREE.Vector3();
     if (this.patch.active && this.patch.body) {
       pdir.copy(this.patch.centerDir).applyAxisAngle(UP, bodyRotation(this.patch.body, t));
-      const c = Math.cos(this.patch.angularRadius * 0.97);
-      const isE = this.patch.body.id === 'earth';
-      this.planets.earthMat.uniforms.uPatchDir.value.copy(pdir);
-      this.planets.earthMat.uniforms.uPatchCos.value = isE ? c : 2;
-      this.planets.moonMat.uniforms.uPatchDir.value.copy(pdir);
-      this.planets.moonMat.uniforms.uPatchCos.value = isE ? 2 : c;
-    } else {
-      this.planets.earthMat.uniforms.uPatchCos.value = 2;
-      this.planets.moonMat.uniforms.uPatchCos.value = 2;
-    }
+      this.planets.setPatch(this.patch.body.id, pdir, Math.cos(this.patch.angularRadius * 0.97));
+    } else this.planets.setPatch(null, pdir, 2);
     if (this.pad) {
       this.pad.update(t, origin);
       const padDist = this.pad.group.position.length();
@@ -554,28 +563,50 @@ export class FlightScene {
     this.updateLights(dtReal);
     this.updateCamera(dtReal);
 
-    // 共享 uniform
-    sharedUniforms.uSunDir.value.copy(SUN_DIR);
+    // 共享 uniform：太阳方向（从相机看）、当前启用的大气
+    const camAbs = this.camera.position.clone().add(origin);
+    sunDirection(camAbs, t, sharedUniforms.uSunDir.value);
     sharedUniforms.uCamPos.value.copy(this.camera.position);
-    sharedUniforms.uEarthCenter.value.copy(earthPos).sub(origin);
+    const atmo = this.activeAtmosphere(camAbs, t);
+    const atmoC = atmo ? bodyPosition(atmo, t, new THREE.Vector3()).sub(origin) : bodyPosition(EARTH, t, new THREE.Vector3()).sub(origin);
+    setActiveAtmosphere(atmo?.id ?? null, atmoC);
+    sharedUniforms.uSunIntensity.value = 9 * (atmo ? sunlightFactor(bodyPosition(SUN, t, new THREE.Vector3()).distanceTo(camAbs)) : 1);
     // 自动降级到第 2 级时：减少大气采样、关闭阴影
     const degraded = this.engine.detail >= 2;
     sharedUniforms.uAtmoSamples.value = (this.engine.quality === 'low' ? 4 : this.engine.quality === 'medium' ? 6 : 10) - (degraded ? 2 : 0);
     const wantShadow = this.engine.quality !== 'low' && !degraded;
     if (this.sun.castShadow !== wantShadow) this.sun.castShadow = wantShadow;
     this.planets.sky.position.copy(this.camera.position);
+    // 二维地图是窄视场的长焦相机：太阳周围按角度计算的光晕会糊满整个屏幕
+    this.planets.skyMat.uniforms.uAureole.value = this.mode === 'map' ? 0 : 1;
     this.planets.stars.position.copy(this.camera.position);
     this.planets.starMat.uniforms.uPixelRatio.value = this.engine.renderer.getPixelRatio();
-    // 星空可见度
-    const camRel = this.camera.position.clone().sub(sharedUniforms.uEarthCenter.value);
-    const camAltE = camRel.length() - EARTH.radius;
-    const muSun = camRel.clone().normalize().dot(SUN_DIR);
-    const day = THREE.MathUtils.smoothstep(muSun, -0.15, 0.05) * (1 - THREE.MathUtils.smoothstep(camAltE, 25_000, 75_000));
+    // 星空可见度：在有大气的天体上白天看不见星星
+    let day = 0;
+    if (atmo) {
+      const look = ATMO_LOOK[atmo.id]!;
+      const camRel = this.camera.position.clone().sub(atmoC);
+      const camAlt = camRel.length() - look.r0;
+      const thick = look.r1 - look.r0;
+      const muSun = camRel.normalize().dot(sharedUniforms.uSunDir.value);
+      day = THREE.MathUtils.smoothstep(muSun, -0.15, 0.05) * (1 - THREE.MathUtils.smoothstep(camAlt, thick * 0.3, thick * 0.95));
+      if (atmo.id === 'mars') day *= 0.75;
+    }
     this.planets.starMat.uniforms.uStarVis.value = 1 - day;
     // 云层淡出（相机穿越云层时）
+    const earthW = this.planets.earth.parent!.position;
+    const camAltE = this.camera.position.distanceTo(earthW) - EARTH.radius;
     const dc = Math.abs(camAltE - Planets.CLOUD_ALT);
     this.planets.cloudMat.uniforms.uFade.value = THREE.MathUtils.smoothstep(dc, 300, 2500);
-    this.planets.clouds.visible = true;
+    this.planets.clouds.visible = camAltE < 5e8;
+    // 金星：在浓密云层之下才看得到地面
+    const venusW = this.planets.visuals.get('venus')!.group.position;
+    const camAltV = this.camera.position.distanceTo(venusW) - VENUS.radius;
+    this.planets.setVenusCloudMix(THREE.MathUtils.smoothstep(camAltV, 30_000, 42_000));
+    // 太阳光晕与远处行星的光点
+    const pxPerRad = this.engine.height / ((this.camera.fov * Math.PI) / 180);
+    const glow = this.glowColor.copy(this.sunTint).multiplyScalar(this.sunOccl * (1 - day * 0.7));
+    this.planets.updateView(this.camera.position, this.camera.near, pxPerRad, this.engine.renderer.getPixelRatio(), glow);
 
     // 轨迹：飞行视图与二维地图
     this.history.update(sim.prediction, this.time);
@@ -585,8 +616,29 @@ export class FlightScene {
   }
 
   private smokeLight = new THREE.Color(1, 1, 1);
+  /** 太阳被天体遮挡的程度（1 = 无遮挡）与穿过大气后的颜色 */
+  private sunOccl = 1;
+  private sunTint = new THREE.Color(1, 1, 1);
+  private glowColor = new THREE.Color();
 
-  private ignitionFlash(pv: { plumes: { group: THREE.Object3D; radius: number }[] }, thrust: number, vel: THREE.Vector3, body: typeof EARTH): void {
+  /** 离相机最近的有大气的天体（按相对大气层半径的距离）。 */
+  private activeAtmosphere(camAbs: THREE.Vector3, t: number): Body | null {
+    let best: Body | null = null;
+    let bestK = Infinity;
+    const c = new THREE.Vector3();
+    for (const b of BODIES) {
+      const look = ATMO_LOOK[b.id];
+      if (!look) continue;
+      const k = camAbs.distanceTo(bodyPosition(b, t, c)) / look.r1;
+      if (k < bestK) {
+        bestK = k;
+        best = b;
+      }
+    }
+    return best;
+  }
+
+  private ignitionFlash(pv: { plumes: { group: THREE.Object3D; radius: number }[] }, thrust: number, vel: THREE.Vector3, body: Body): void {
     const fwd = UP.clone().applyQuaternion(this.sim.vessel.q);
     const tel = this.sim.telemetry;
     const inAir = !!body.atmosphere && tel.density > 0.01;
@@ -603,7 +655,7 @@ export class FlightScene {
     this.shake = Math.max(this.shake, Math.min(0.4, 0.1 + thrust / 4e6));
   }
 
-  private emitExhaust(key: string, thrust: number, kind: string, pv: { visual: { bells: { pivot: THREE.Object3D; radius: number }[] } }, dt: number, body: typeof EARTH): void {
+  private emitExhaust(key: string, thrust: number, kind: string, pv: { visual: { bells: { pivot: THREE.Object3D; radius: number }[] } }, dt: number, body: Body): void {
     const sim = this.sim;
     const tel = sim.telemetry;
     if (!body.atmosphere || tel.density < 0.004 || kind === 'lander') return;
@@ -641,27 +693,35 @@ export class FlightScene {
     const sim = this.sim;
     const V = sim.vessel;
     const tel = sim.telemetry;
+    const sunDir = sunDirection(V.r, sim.t, new THREE.Vector3());
     // 太阳是否被天体遮挡
     let occl = 1;
-    for (const b of [EARTH, MOON]) {
+    for (const b of BODIES) {
+      if (b.kind === 'star') continue;
       const c = bodyPosition(b, sim.t, new THREE.Vector3());
       const rel = c.sub(V.r);
-      const along = rel.dot(SUN_DIR);
+      const along = rel.dot(sunDir);
       if (along <= 0) continue;
       const perp = Math.sqrt(Math.max(0, rel.lengthSq() - along * along));
       const soft = b.radius * 0.004 + 200;
       occl *= THREE.MathUtils.smoothstep(perp, b.radius - soft, b.radius + soft);
     }
-    // 大气对太阳光的染色
-    const alt = tel.body.id === 'earth' ? tel.alt : Math.max(0, V.r.length() - EARTH.radius);
-    const upE = V.r.clone().normalize();
-    const mu = upE.dot(SUN_DIR);
-    const am = 1 / (Math.max(mu, 0) + 0.025 * Math.exp(-11 * Math.max(mu, -0.2)));
-    const dens = Math.exp(-Math.max(0, alt) / 7000);
-    const tr = [5.8e-6, 13.5e-6, 33.1e-6].map((b) => Math.exp(-(b * 7000 + 6e-6 * 1.1 * 1300) * Math.min(am, 40) * dens));
+    // 大气对太阳光的染色（只考虑飞船所在天体的大气）
+    const look = ATMO_LOOK[tel.body.id];
+    const upB = V.r.clone().sub(bodyPosition(tel.body, sim.t, new THREE.Vector3())).normalize();
+    const mu = upB.dot(sunDir);
+    let tr = [1, 1, 1];
+    if (look) {
+      const am = 1 / (Math.max(mu, 0) + 0.025 * Math.exp(-11 * Math.max(mu, -0.2)));
+      const dens = Math.exp(-Math.max(0, tel.alt) / look.hr);
+      tr = [0, 1, 2].map((i) => Math.exp(-(look.br[i] * look.hr + look.bm[i] * 1.1 * look.hm) * Math.min(am, 40) * dens));
+    }
     const sunCol = new THREE.Color(tr[0], tr[1], tr[2]);
+    const flux = sunlightFactor(V.r.distanceTo(bodyPosition(SUN, sim.t, new THREE.Vector3())));
     this.sun.color.copy(sunCol);
-    this.sun.intensity = SUN_INTENSITY * occl;
+    this.sun.intensity = SUN_INTENSITY * occl * flux;
+    this.sunOccl = occl;
+    this.sunTint.copy(sunCol).multiplyScalar(Math.min(1.3, flux)).multiply(GLOW_BASE);
     // 阴影相机跟随飞船
     const b = V.bounds();
     const size = Math.max(25, (b.maxY - b.minY) * 1.2, b.radius * 4);
@@ -676,19 +736,17 @@ export class FlightScene {
     cam.updateProjectionMatrix();
     const focus = V.r.clone().sub(this.origin);
     this.sun.target.position.copy(focus);
-    this.sun.position.copy(focus).addScaledVector(SUN_DIR, size * 8 + 150);
+    this.sun.position.copy(focus).addScaledVector(sunDir, size * 8 + 150);
     // 半球光：天空与地面反照
-    const inAtmo = tel.body.id === 'earth' && tel.alt < 70_000;
+    const atm = tel.body.atmosphere;
     const dayF = THREE.MathUtils.smoothstep(mu, -0.1, 0.15);
-    const airF = inAtmo ? 1 - THREE.MathUtils.smoothstep(tel.alt, 5_000, 60_000) : 0;
-    const sky = new THREE.Color(0.35, 0.5, 0.85).multiplyScalar(0.55 * dayF * airF + 0.02);
-    let ground: THREE.Color;
-    if (tel.body.id === 'moon') ground = new THREE.Color(0.35, 0.35, 0.34).multiplyScalar(0.25 * occl);
-    else {
-      const r = V.r.length();
-      const solid = 1 - Math.sqrt(Math.max(0, 1 - (EARTH.radius / r) ** 2));
-      ground = new THREE.Color(0.25, 0.3, 0.38).multiplyScalar((0.15 + 0.4 * airF) * dayF * (0.3 + solid));
-    }
+    const airF = atm && tel.alt < atm.height ? 1 - THREE.MathUtils.smoothstep(tel.alt, atm.height * 0.07, atm.height * 0.85) : 0;
+    const look2 = HEMI_LOOK[tel.body.id] ?? HEMI_LOOK.moon!;
+    const sky = look2.sky.clone().multiplyScalar(0.55 * dayF * airF * flux + 0.02);
+    // 天体占据的立体角越大，地面反照越强
+    const rB = V.r.distanceTo(bodyPosition(tel.body, sim.t, new THREE.Vector3()));
+    const solid = 1 - Math.sqrt(Math.max(0, 1 - (tel.body.radius / Math.max(rB, tel.body.radius)) ** 2));
+    const ground = look2.ground.clone().multiplyScalar((look2.k + 0.4 * airF) * dayF * (0.3 + solid) * occl * flux);
     this.hemi.color.copy(sky);
     this.hemi.groundColor.copy(ground);
     this.hemi.intensity = 1.0;
@@ -704,7 +762,7 @@ export class FlightScene {
       this.envSig = sig;
       this.envMat.uniforms.uSky.value.copy(sky).multiplyScalar(1.6).addScalar(0.01);
       this.envMat.uniforms.uGround.value.copy(ground).multiplyScalar(1.4).addScalar(0.005);
-      this.envMat.uniforms.uSunDir.value.copy(SUN_DIR);
+      this.envMat.uniforms.uSunDir.value.copy(sunDir);
       this.envMat.uniforms.uSunCol.value.copy(sunCol).multiplyScalar(occl);
       this.envMat.uniforms.uUp.value.copy(tel.up);
       const rt = this.pmrem.fromScene(this.envScene, 0, 0.1, 100);

@@ -425,6 +425,7 @@ export class BuilderUI {
       h('option', { value: 'pad', selected: this.scenario === 'pad' }, '发射台（地球）'),
       h('option', { value: 'leo', selected: this.scenario === 'leo' }, '练习：100 km 地球轨道'),
       h('option', { value: 'llo', selected: this.scenario === 'llo' }, '练习：22 km 环月轨道'),
+      h('option', { value: 'lmo', selected: this.scenario === 'lmo' }, '练习：80 km 火星轨道'),
     );
     launch.appendChild(
       h(

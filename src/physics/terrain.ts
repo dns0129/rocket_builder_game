@@ -1,18 +1,59 @@
 import { Vector3 } from 'three';
-import { EARTH, MOON, type Body } from './bodies';
+import { EARTH, MARS, MERCURY, MOON, VENUS, type Body, type BodyId, dirFromLatLon } from './bodies';
 import { gnoise, hash3, hashToFloat, nextHash, NOISE_OFFSET, NOISE_GLSL } from './noise';
 
 /**
- * 月面地形：低频丘陵 + 月海 + 十个尺度层级的撞击坑（半径 20 km 到 5 m）。
- * 每个层级把空间划分为三维网格，每个格子中至多一个撞击坑，只需检查最近的 2×2×2 个格子。
+ * 岩质天体地形：低频丘陵 + 低地（月海 / 火星北部低地）+ 十个尺度层级的撞击坑（半径 20 km 到 5 m）
+ * + 可选的盾状火山。每个撞击坑层级把空间划分为三维网格，每个格子中至多一个撞击坑，只需检查最近的 2×2×2 个格子。
+ * 月球、水星、金星、火星使用同一套函数、不同参数；CPU（碰撞）与 GPU（贴图）结果一致。
  */
 
 export const CRATER_RMAX = [20000, 8000, 3200, 1300, 520, 210, 85, 34, 14, 5.5];
 export const CRATER_PROB = [0.35, 0.42, 0.5, 0.55, 0.55, 0.6, 0.6, 0.62, 0.62, 0.62];
 export const CRATER_CELL_K = 2.3;
-const CRATER_SEED = 7331;
-const HILL_SEED = 1201;
-const MARE_SEED = 911;
+
+export interface RockyTerrainDef {
+  craterSeed: number;
+  hillSeed: number;
+  mareSeed: number;
+  /** 低地（月海）噪声的特征尺度 m */
+  mareScale: number;
+  /** 低地遮罩的强度（0..1） */
+  mareAmount: number;
+  /** 低地下沉深度 m */
+  mareDepth: number;
+  hillWl: number;
+  hillAmp: number;
+  /** 撞击坑出现概率的倍数 */
+  craterProb: number;
+  /** 撞击坑层级数（浓密大气会烧掉小陨石，金星只有大坑） */
+  craterLevels: number;
+  volcano?: { lat: number; lon: number; height: number; radius: number };
+}
+
+const DEG = Math.PI / 180;
+
+export const TERRAIN: Partial<Record<BodyId, RockyTerrainDef>> = {
+  moon: { craterSeed: 7331, hillSeed: 1201, mareSeed: 911, mareScale: 150_000, mareAmount: 1, mareDepth: 900, hillWl: 50_000, hillAmp: 1300, craterProb: 1, craterLevels: 10 },
+  mercury: { craterSeed: 1307, hillSeed: 2203, mareSeed: 1913, mareScale: 200_000, mareAmount: 0.5, mareDepth: 400, hillWl: 40_000, hillAmp: 900, craterProb: 1.15, craterLevels: 10 },
+  venus: { craterSeed: 4409, hillSeed: 3301, mareSeed: 2917, mareScale: 300_000, mareAmount: 0.7, mareDepth: 900, hillWl: 90_000, hillAmp: 1400, craterProb: 0.12, craterLevels: 3 },
+  mars: {
+    craterSeed: 5519,
+    hillSeed: 4421,
+    mareSeed: 3907,
+    mareScale: 600_000,
+    mareAmount: 1,
+    mareDepth: 1800,
+    hillWl: 80_000,
+    hillAmp: 2000,
+    craterProb: 0.45,
+    craterLevels: 9,
+    // 奥林帕斯山（按 1:10 缩小）
+    volcano: { lat: 18.65 * DEG, lon: -133.8 * DEG, height: 2200, radius: 30_000 },
+  },
+};
+
+const BODY_R: Partial<Record<BodyId, number>> = { moon: MOON.radius, mercury: MERCURY.radius, venus: VENUS.radius, mars: MARS.radius };
 
 function smoothMax(a: number, b: number, k: number): number {
   const d = a - b;
@@ -38,18 +79,18 @@ export function craterProfile(x: number, r: number): number {
   return rimH * (1 - t) * (1 - t);
 }
 
-/** 单个尺度层级的撞击坑高度贡献（P 为月心坐标，单位 m）。 */
-export function craterLevel(px: number, py: number, pz: number, level: number): number {
+/** 单个尺度层级的撞击坑高度贡献（P 为天体中心坐标，单位 m）。 */
+export function craterLevel(px: number, py: number, pz: number, level: number, craterSeed = 7331, probScale = 1): number {
   const rmax = CRATER_RMAX[level];
   const cell = rmax * CRATER_CELL_K;
-  const prob = CRATER_PROB[level];
+  const prob = CRATER_PROB[level] * probScale;
   const gx = px / cell - 0.5;
   const gy = py / cell - 0.5;
   const gz = pz / cell - 0.5;
   const bx = Math.floor(gx);
   const by = Math.floor(gy);
   const bz = Math.floor(gz);
-  const seed = (CRATER_SEED + level * 101) >>> 0;
+  const seed = (craterSeed + level * 101) >>> 0;
   let sum = 0;
   for (let k = 0; k < 8; k++) {
     const cx = bx + (k & 1);
@@ -77,61 +118,80 @@ export function craterLevel(px: number, py: number, pz: number, level: number): 
   return sum;
 }
 
-/** 月海遮罩（0 = 高地，1 = 月海）。 */
-export function moonMare(dx: number, dy: number, dz: number): number {
-  const s = MOON.radius / 150000;
-  const n = gnoise(dx * s, dy * s, dz * s, MARE_SEED) + 0.5 * gnoise(dx * s * 2.1, dy * s * 2.1, dz * s * 2.1, MARE_SEED + 1);
-  return smoothstep(0.12, -0.12, n + 0.42);
+/** 低地遮罩（0 = 高地，1 = 月海 / 低地）。 */
+export function mareMask(T: RockyTerrainDef, R: number, dx: number, dy: number, dz: number): number {
+  const s = R / T.mareScale;
+  const n = gnoise(dx * s, dy * s, dz * s, T.mareSeed) + 0.5 * gnoise(dx * s * 2.1, dy * s * 2.1, dz * s * 2.1, T.mareSeed + 1);
+  return T.mareAmount * smoothstep(0.12, -0.12, n + 0.42);
+}
+
+const _vd = new Vector3();
+
+/** 盾状火山（带破火山口）的高度。 */
+function volcanoHeight(T: RockyTerrainDef, R: number, dx: number, dy: number, dz: number): number {
+  const v = T.volcano;
+  if (!v) return 0;
+  dirFromLatLon(v.lat, v.lon, _vd);
+  const ang = Math.acos(Math.max(-1, Math.min(1, dx * _vd.x + dy * _vd.y + dz * _vd.z)));
+  const x = (ang * R) / v.radius;
+  if (x > 4) return 0;
+  return v.height * (Math.exp(-x * x) - 0.22 * Math.exp(-x * x * 40));
 }
 
 /**
- * 月面高度（相对基准半径，米）。dir 为月球固连系单位向量。
+ * 岩质天体表面高度（相对基准半径，米）。(dx, dy, dz) 为天体固连系单位向量。
  * minFeature：小于此尺度的细节被省略（用于远处网格的 LOD）。
  */
-export function moonHeight(dx: number, dy: number, dz: number, minFeature = 0): number {
-  const R = MOON.radius;
+export function rockyHeight(T: RockyTerrainDef, R: number, dx: number, dy: number, dz: number, minFeature = 0): number {
   const px = dx * R;
   const py = dy * R;
   const pz = dz * R;
-  const mare = moonMare(dx, dy, dz);
-  // 丘陵：波长 50 km 起，逐级减半
+  const mare = mareMask(T, R, dx, dy, dz);
+  // 丘陵：从基准波长起，逐级减半
   let hills = 0;
-  let wl = 50000;
-  let amp = 1300;
+  let wl = T.hillWl;
+  let amp = T.hillAmp;
   for (let o = 0; o < 6; o++) {
     if (wl * 0.5 < minFeature) break;
-    hills += amp * gnoise(px / wl, py / wl, pz / wl, HILL_SEED + o);
+    hills += amp * gnoise(px / wl, py / wl, pz / wl, T.hillSeed + o);
     wl *= 0.5;
     amp *= 0.45;
   }
-  let h = hills * (1 - 0.75 * mare) - 900 * mare;
-  for (let l = 0; l < CRATER_RMAX.length; l++) {
+  let h = hills * (1 - 0.75 * mare) - T.mareDepth * mare;
+  for (let l = 0; l < T.craterLevels; l++) {
     if (CRATER_RMAX[l] < minFeature * 1.2) break;
-    const c = craterLevel(px, py, pz, l);
+    const c = craterLevel(px, py, pz, l, T.craterSeed, T.craterProb);
     h += l < 3 ? c * (1 - 0.6 * mare) : c;
   }
+  if (T.volcano) h += volcanoHeight(T, R, dx, dy, dz);
   return h;
 }
 
+/** 月面高度（保留旧接口）。 */
+export function moonHeight(dx: number, dy: number, dz: number, minFeature = 0): number {
+  return rockyHeight(TERRAIN.moon!, MOON.radius, dx, dy, dz, minFeature);
+}
+
 export function terrainHeight(body: Body, dir: Vector3, minFeature = 0): number {
-  if (body.id === 'moon') return moonHeight(dir.x, dir.y, dir.z, minFeature);
-  return 0;
+  const T = TERRAIN[body.id];
+  if (!T) return 0;
+  return rockyHeight(T, BODY_R[body.id]!, dir.x, dir.y, dir.z, minFeature);
 }
 
 /** 地形法线（天体固连系），用有限差分。 */
 export function terrainNormal(body: Body, dir: Vector3, out = new Vector3()): Vector3 {
-  if (body.id !== 'moon') return out.copy(dir);
+  if (!TERRAIN[body.id]) return out.copy(dir);
   const R = body.radius;
   const eps = 0.5;
   // 构造切向基
   const t1 = Math.abs(dir.y) < 0.9 ? new Vector3(0, 1, 0) : new Vector3(1, 0, 0);
   t1.sub(dir.clone().multiplyScalar(t1.dot(dir))).normalize();
   const t2 = new Vector3().crossVectors(dir, t1);
-  const h0 = moonHeight(dir.x, dir.y, dir.z);
+  const h0 = terrainHeight(body, dir);
   const d1 = dir.clone().addScaledVector(t1, eps / R).normalize();
   const d2 = dir.clone().addScaledVector(t2, eps / R).normalize();
-  const h1 = moonHeight(d1.x, d1.y, d1.z);
-  const h2 = moonHeight(d2.x, d2.y, d2.z);
+  const h1 = terrainHeight(body, d1);
+  const h2 = terrainHeight(body, d2);
   out.copy(dir).multiplyScalar(eps);
   out.addScaledVector(t1, -(h1 - h0));
   out.addScaledVector(t2, -(h2 - h0));
@@ -140,9 +200,9 @@ export function terrainNormal(body: Body, dir: Vector3, out = new Vector3()): Ve
 
 // ------------------------------------------------------------------ GLSL
 
-export const MOON_TERRAIN_GLSL = /* glsl */ `
+/** 各岩质天体共用的 GLSL：撞击坑剖面、撞击坑层级、低地遮罩、火山。 */
+export const ROCKY_COMMON_GLSL = /* glsl */ `
 ${NOISE_GLSL}
-const float MOON_R = ${MOON.radius.toFixed(1)};
 const float CRATER_RMAX[10] = float[10](${CRATER_RMAX.map((v) => v.toFixed(2)).join(',')});
 const float CRATER_PROB[10] = float[10](${CRATER_PROB.map((v) => v.toFixed(3)).join(',')});
 
@@ -163,13 +223,13 @@ float craterProfile(float x, float r) {
 }
 
 // 返回 x = 高度贡献, y = 新鲜撞击坑亮度
-vec2 craterLevel(vec3 p, int level) {
+vec2 craterLevel(vec3 p, int level, int craterSeed, float probScale) {
   float rmax = CRATER_RMAX[level];
   float cell = rmax * ${CRATER_CELL_K.toFixed(2)};
-  float prob = CRATER_PROB[level];
+  float prob = CRATER_PROB[level] * probScale;
   vec3 g = p / cell - 0.5;
   ivec3 b = ivec3(floor(g));
-  uint seed = uint(${CRATER_SEED} + level * 101);
+  uint seed = uint(craterSeed + level * 101);
   vec2 sum = vec2(0.0);
   for (int k = 0; k < 8; k++) {
     ivec3 c = b + ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
@@ -192,34 +252,52 @@ vec2 craterLevel(vec3 p, int level) {
   }
   return sum;
 }
+`;
 
-float moonMare(vec3 d) {
-  float s = MOON_R / 150000.0;
-  float n = gnoise(d * s, ${MARE_SEED}u) + 0.5 * gnoise(d * s * 2.1, ${MARE_SEED + 1}u);
-  return smoothstep(0.12, -0.12, n + 0.42);
+/** 生成某个岩质天体的地形函数：vec3 fn(vec3 d, int maxLevel) 返回 (高度, 低地遮罩, 新鲜撞击坑亮度)。 */
+export function rockyTerrainGLSL(id: BodyId, fn: string): string {
+  const T = TERRAIN[id]!;
+  const R = BODY_R[id]!;
+  const f = (x: number) => x.toFixed(4);
+  const vd = T.volcano ? dirFromLatLon(T.volcano.lat, T.volcano.lon, new Vector3()) : null;
+  return /* glsl */ `
+float ${fn}_mare(vec3 d) {
+  float s = ${f(R)} / ${f(T.mareScale)};
+  float n = gnoise(d * s, ${T.mareSeed}u) + 0.5 * gnoise(d * s * 2.1, ${T.mareSeed + 1}u);
+  return ${f(T.mareAmount)} * smoothstep(0.12, -0.12, n + 0.42);
 }
-
-// 返回 x = 高度, y = 月海遮罩, z = 新鲜撞击坑亮度
-vec3 moonTerrain(vec3 d, int maxLevel) {
-  vec3 p = d * MOON_R;
-  float mare = moonMare(d);
+vec3 ${fn}(vec3 d, int maxLevel) {
+  vec3 p = d * ${f(R)};
+  float mare = ${fn}_mare(d);
   float hills = 0.0;
-  float wl = 50000.0;
-  float amp = 1300.0;
+  float wl = ${f(T.hillWl)};
+  float amp = ${f(T.hillAmp)};
   for (int o = 0; o < 6; o++) {
-    hills += amp * gnoise(p / wl, uint(${HILL_SEED} + o));
+    hills += amp * gnoise(p / wl, uint(${T.hillSeed} + o));
     wl *= 0.5; amp *= 0.45;
   }
-  float h = hills * (1.0 - 0.75 * mare) - 900.0 * mare;
+  float h = hills * (1.0 - 0.75 * mare) - ${f(T.mareDepth)} * mare;
   float fresh = 0.0;
-  for (int l = 0; l < 10; l++) {
+  for (int l = 0; l < ${T.craterLevels}; l++) {
     if (l > maxLevel) break;
-    vec2 c = craterLevel(p, l);
+    vec2 c = craterLevel(p, l, ${T.craterSeed}, ${f(T.craterProb)});
     h += l < 3 ? c.x * (1.0 - 0.6 * mare) : c.x;
     fresh += c.y;
+  }
+  ${
+    vd && T.volcano
+      ? `{
+    float ang = acos(clamp(dot(d, vec3(${f(vd.x)}, ${f(vd.y)}, ${f(vd.z)})), -1.0, 1.0));
+    float x = ang * ${f(R)} / ${f(T.volcano.radius)};
+    if (x < 4.0) h += ${f(T.volcano.height)} * (exp(-x * x) - 0.22 * exp(-x * x * 40.0));
+  }`
+      : ''
   }
   return vec3(h, mare, fresh);
 }
 `;
+}
+
+export const MOON_TERRAIN_GLSL = ROCKY_COMMON_GLSL + `const float MOON_R = ${MOON.radius.toFixed(1)};\n` + rockyTerrainGLSL('moon', 'moonTerrain');
 
 export { EARTH };

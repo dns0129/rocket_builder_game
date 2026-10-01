@@ -1,9 +1,16 @@
 import { Vector3 } from 'three';
-import { G0 } from '../physics/bodies';
+import { G0, type Body } from '../physics/bodies';
 import type { FlightSim } from './flight';
 import { solveCircularize } from './maneuver';
 
 export type APMode = 'off' | 'ascent' | 'node' | 'land';
+
+/** 各天体的默认入轨高度：高于大气层顶端约 30 km；无大气天体 20 km。 */
+export function defaultAscentAlt(body: Body): number {
+  if (body.id === 'earth') return 100_000;
+  if (body.atmosphere) return body.atmosphere.height + 30_000;
+  return 20_000;
+}
 
 const UP = new Vector3(0, 1, 0);
 
@@ -13,6 +20,8 @@ export class Autopilot {
   status = '';
   targetDir: Vector3 | null = null;
   ascentAlt = 100_000;
+  /** 外部（测试或界面）指定了入轨高度时为 true，不再按天体自动选择 */
+  ascentAltLocked = false;
   private phase = '';
   private stageCooldown = 0;
   private sim: FlightSim;
@@ -24,10 +33,16 @@ export class Autopilot {
 
   engage(mode: APMode): void {
     const sim = this.sim;
-    if (mode === 'land' && sim.telemetry.body.atmosphere) {
-      sim.emit({ type: 'msg', msg: '自动着陆仅适用于无大气天体；在地球请使用降落伞。', level: 'warn' });
+    const body = sim.telemetry.body;
+    if (mode === 'land' && body.atmosphere && body.atmosphere.rho0 > 0.2) {
+      sim.emit({ type: 'msg', msg: `自动着陆仅适用于大气稀薄的天体；在${body.name}请使用降落伞。`, level: 'warn' });
       return;
     }
+    if (mode === 'land' && body.kind !== 'rocky') {
+      sim.emit({ type: 'msg', msg: `${body.name}没有可以着陆的表面。`, level: 'warn' });
+      return;
+    }
+    if (mode === 'ascent' && !this.ascentAltLocked) this.ascentAlt = defaultAscentAlt(body);
     if (mode === 'node' && !sim.nodes.length) {
       sim.emit({ type: 'msg', msg: '没有机动节点', level: 'warn' });
       return;
@@ -85,7 +100,8 @@ export class Autopilot {
       this.autoStage(dt);
       const alt = tel.alt;
       const turnStart = 900;
-      const turnEnd = 48_000;
+      // 重力转弯在大气层约 2/3 高度处结束（地球 48 km）；无大气天体沿用同一曲线
+      const turnEnd = tel.body.atmosphere ? (tel.body.atmosphere.height * 48) / 70 : 48_000;
       let pitch = 90;
       if (alt > turnStart) pitch = 90 - 88 * Math.pow(Math.min(1, (alt - turnStart) / (turnEnd - turnStart)), 0.42);
       const pr = (pitch * Math.PI) / 180;

@@ -1,18 +1,23 @@
-import { EARTH } from '../physics/bodies';
-
-/** 单次散射大气（瑞利 + 米氏），地球大气厚度 70 km，标高 7 km。 */
-export const ATMO_R0 = EARTH.radius;
-export const ATMO_R1 = EARTH.radius + 80_000;
-
+/**
+ * 单次散射大气（瑞利 + 米氏）。参数由 uniform 传入，同一段代码用于地球、火星、金星：
+ * 每帧只启用离相机最近的那个有大气的天体（见 planets.ts 中的 setActiveAtmosphere）。
+ */
 export const ATMOSPHERE_GLSL = /* glsl */ `
-const float ATM_R0 = ${ATMO_R0.toFixed(1)};
-const float ATM_R1 = ${ATMO_R1.toFixed(1)};
-const float ATM_HR = 7000.0;
-const float ATM_HM = 1300.0;
-const vec3 ATM_BR = vec3(5.8e-6, 13.5e-6, 33.1e-6);
-const float ATM_BM = 6.0e-6;
-const float ATM_G = 0.78;
+uniform float uAtmR0;
+uniform float uAtmR1;
+uniform float uAtmHR;
+uniform float uAtmHM;
+uniform vec3 uAtmBR;
+uniform vec3 uAtmBM;
+uniform float uAtmG;
 uniform float uSunIntensity;
+#define ATM_R0 uAtmR0
+#define ATM_R1 uAtmR1
+#define ATM_HR uAtmHR
+#define ATM_HM uAtmHM
+#define ATM_BR uAtmBR
+#define ATM_BM uAtmBM
+#define ATM_G uAtmG
 
 vec2 atmRaySphere(vec3 ro, vec3 rd, float r) {
   float b = dot(ro, rd);
@@ -24,8 +29,8 @@ vec2 atmRaySphere(vec3 ro, vec3 rd, float r) {
   return vec2(-b - s, -b + s);
 }
 
-// 从 ro 沿 rd 到 tMax 的散射光与透射率（ro 为相对地心的坐标）
-vec3 atmScatter(vec3 ro, vec3 rd, float tMax, vec3 sunDir, out vec3 trans, const int NS, const int NL) {
+// 从 ro 沿 rd 到 tMax 的散射光与透射率（ro 为相对大气中心的坐标）
+vec3 atmScatter(vec3 ro, vec3 rd, float tMax, vec3 sunDir, out vec3 trans, int NS, const int NL) {
   trans = vec3(1.0);
   vec2 ta = atmRaySphere(ro, rd, ATM_R1);
   if (ta.y < 0.0 || ta.x > ta.y) return vec3(0.0);
@@ -58,9 +63,10 @@ vec3 atmScatter(vec3 ro, vec3 rd, float tMax, vec3 sunDir, out vec3 trans, const
       lR += exp(-hl / ATM_HR) * dsl;
       lM += exp(-hl / ATM_HM) * dsl;
     }
-    // 地球本影
-    vec2 tsh = atmRaySphere(p, sunDir, ATM_R0);
-    float lit = (tsh.x > 0.0) ? 0.0 : 1.0;
+    // 行星本影：背着太阳一侧、离日地连线（过天体中心）的距离小于天体半径的点照不到阳光
+    float pS = dot(p, sunDir);
+    float dPerp = sqrt(max(dot(p, p) - pS * pS, 0.0));
+    float lit = pS > 0.0 ? 1.0 : smoothstep(ATM_R0 - ATM_HR * 0.3, ATM_R0 + ATM_HR * 0.3, dPerp);
     // 晨昏线附近柔化
     float sunH = dot(normalize(p), sunDir);
     lit *= smoothstep(-0.05, 0.02, sunH + 0.08);

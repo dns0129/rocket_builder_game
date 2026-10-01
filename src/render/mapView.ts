@@ -1,11 +1,11 @@
 import * as THREE from 'three';
 import type { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
-import { EARTH, MOON, MOON_ORBIT, type BodyId, bodyPosition } from '../physics/bodies';
+import { BODIES, BODY_BY_ID, HELIO, MOON_ORBIT, type Body, type BodyId, bodyPosition } from '../physics/bodies';
 import type { FlightSim } from '../game/flight';
 import type { Prediction } from '../game/predictor';
 import { DynLine, PolyBuilder, fadeLineMaterial } from './lines';
 import { ScreenLabels } from './labels';
-import { TRAJ, apsisName, deltaHtml, encounterAnchor, segColor, segImpactT, segmentAt } from './trajectoryView';
+import { TRAJ, apsisName, deltaHtml, placeSegments, segColor, segImpactT, type SegPlacement } from './trajectoryView';
 import { fmtDist, fmtTime } from '../ui/format';
 
 /** 二维地图的视平面：right/up 为屏幕方向，normal 指向观察者；extent 为半个屏幕高度对应的距离（米）。 */
@@ -16,9 +16,17 @@ export interface MapBasis {
   extent: number;
 }
 
-export type MapFocus = 'earth' | 'moon' | 'vessel';
+export type MapFocus = BodyId | 'vessel';
 
-const BODY_IDS: BodyId[] = ['earth', 'moon'];
+const BODY_IDS: BodyId[] = BODIES.map((b) => b.id);
+/** 绕上级天体的轨道半径（圆轨道） */
+function orbitRadius(b: Body): number {
+  return b.id === 'moon' ? MOON_ORBIT.a : (HELIO[b.id]?.a ?? 0);
+}
+/** 圆在屏幕上的半径（像素）合适时才显示：太小挤成一团，太大则近似直线横穿画面 */
+function ringAlpha(rPx: number, max: number): number {
+  return THREE.MathUtils.clamp((rPx - 6) / 30, 0, 1) * (1 - THREE.MathUtils.smoothstep(rPx, 2e4, 1e5)) * max;
+}
 const UP = new THREE.Vector3(0, 1, 0);
 
 /** 屏幕空间星空（二维地图的背景，叠加在大气散射天空上）。 */
@@ -60,10 +68,11 @@ export class MapView {
   private tip: DynLine;
   private flowMats: LineMaterial[] = [];
   private flowOffset = 0;
-  private moonOrbit: THREE.LineLoop;
-  private soiRing: THREE.LineLoop;
-  private atmoRing: THREE.LineLoop;
-  private encRing: THREE.LineLoop;
+  private orbits = new Map<BodyId, THREE.LineLoop>();
+  private soiRings = new Map<BodyId, THREE.LineLoop>();
+  private atmoRings = new Map<BodyId, THREE.LineLoop>();
+  private encRings: THREE.LineLoop[] = [];
+  private placements: SegPlacement[] = [];
   private stars: THREE.Mesh;
   private lastTrailVer = -1;
   private lastPred: Prediction | null | undefined = undefined;
@@ -78,7 +87,7 @@ export class MapView {
   constructor(overlay: HTMLDivElement) {
     this.overlay = overlay;
     this.labels = new ScreenLabels(overlay);
-    const mkSet = (make: () => DynLine) => ({ earth: make(), moon: make() }) as Record<BodyId, DynLine>;
+    const mkSet = (make: () => DynLine) => Object.fromEntries(BODY_IDS.map((id) => [id, make()])) as Record<BodyId, DynLine>;
     this.trail = mkSet(() => new DynLine([fadeLineMaterial({ width: 2.6, depthTest: false })], 50));
     this.ghost = mkSet(() => new DynLine([fadeLineMaterial({ width: 2, depthTest: false })], 52));
     this.pred = mkSet(() => {
@@ -91,40 +100,54 @@ export class MapView {
     for (const id of BODY_IDS) for (const l of [this.trail[id], this.ghost[id], this.pred[id]]) l.addTo(this.group);
     this.tip.addTo(this.group);
 
-    const pts: THREE.Vector3[] = [];
-    for (let i = 0; i < 256; i++) {
-      const a = (i / 256) * Math.PI * 2;
-      pts.push(new THREE.Vector3(Math.cos(a), 0, -Math.sin(a)));
-    }
-    const g = new THREE.BufferGeometry().setFromPoints(pts);
-    this.moonOrbit = new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color: 0x8a8f99, transparent: true, opacity: 0.4, depthTest: false }));
-    this.moonOrbit.scale.setScalar(MOON_ORBIT.a);
-    // 影响球与大气层的轮廓：画在视平面内的圆（球体从任何方向看都是圆）
-    const ring = (color: number, opacity: number, dashed: boolean) => {
-      const cp: THREE.Vector3[] = [];
-      for (let i = 0; i < 256; i++) {
-        const a = (i / 256) * Math.PI * 2;
-        cp.push(new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
+    // 天体轨道（黄道面 / 地球赤道面内的圆）
+    const loop = (n: number, xz: boolean) => {
+      const pts: THREE.Vector3[] = [];
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2;
+        pts.push(xz ? new THREE.Vector3(Math.cos(a), 0, -Math.sin(a)) : new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
       }
-      const m = dashed
-        ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, depthTest: false, dashSize: 0.025, gapSize: 0.02 })
-        : new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthTest: false });
-      const l = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(cp), m);
-      if (dashed) l.computeLineDistances();
-      return l;
+      return new THREE.BufferGeometry().setFromPoints(pts);
     };
-    this.soiRing = ring(0xc49bff, 0.35, true);
-    this.soiRing.scale.setScalar(MOON.soi);
-    this.atmoRing = ring(0x6fb8ff, 0.4, true);
-    this.atmoRing.scale.setScalar(EARTH.radius + (EARTH.atmosphere?.height ?? 0));
-    // 相遇时月球的位置（虚线圆）
-    this.encRing = ring(0xc49bff, 0.7, true);
-    this.encRing.scale.setScalar(MOON.radius);
-    for (const o of [this.moonOrbit, this.soiRing, this.atmoRing, this.encRing]) {
+    const orbitGeo = loop(512, true);
+    const add = (o: THREE.LineLoop) => {
       o.frustumCulled = false;
       o.renderOrder = 45;
       this.group.add(o);
+      return o;
+    };
+    for (const b of BODIES) {
+      const a = orbitRadius(b);
+      if (!a) continue;
+      const c = new THREE.Color(b.color).lerp(new THREE.Color(0x8a8f99), 0.5);
+      const o = add(new THREE.LineLoop(orbitGeo, new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: 0.4, depthTest: false })));
+      o.scale.setScalar(a);
+      this.orbits.set(b.id, o);
     }
+    // 影响球与大气层的轮廓：画在视平面内的圆（球体从任何方向看都是圆）
+    const ringGeo = loop(256, false);
+    const ring = (color: number, opacity: number, dashed: boolean) => {
+      const m = dashed
+        ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, depthTest: false, dashSize: 0.025, gapSize: 0.02 })
+        : new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthTest: false });
+      const l = new THREE.LineLoop(ringGeo, m);
+      if (dashed) l.computeLineDistances();
+      return add(l);
+    };
+    for (const b of BODIES) {
+      if (isFinite(b.soi) && b.parent) {
+        const r = ring(b.id === 'moon' ? 0xc49bff : new THREE.Color(b.color).getHex(), 0.35, true);
+        r.scale.setScalar(b.soi);
+        this.soiRings.set(b.id, r);
+      }
+      if (b.atmosphere) {
+        const r = ring(0x6fb8ff, 0.4, true);
+        r.scale.setScalar(b.radius + b.atmosphere.height);
+        this.atmoRings.set(b.id, r);
+      }
+    }
+    // 相遇时目标天体的位置（虚线圆）
+    for (let i = 0; i < 3; i++) this.encRings.push(ring(0xc49bff, 0.7, true));
 
     const starMat = new THREE.ShaderMaterial({
       // 放在远平面并做深度测试：只出现在没有星球遮挡的地方
@@ -152,12 +175,15 @@ export class MapView {
     };
     this.toolbar = document.createElement('div');
     this.toolbar.className = 'map-toolbar panel';
-    this.toolbar.append(
-      btn('auto', '自动', '自动缩放，始终框住整条预测轨迹'),
-      btn('earth', '地球', '以地球为中心（Tab 切换）'),
-      btn('moon', '月球', '以月球为中心'),
-      btn('vessel', '飞船', '跟随飞船'),
-    );
+    this.toolbar.append(btn('auto', '自动', '自动缩放，始终框住整条预测轨迹'), btn('vessel', '飞船', '跟随飞船'));
+    const bodies = document.createElement('span');
+    bodies.className = 'map-bodies';
+    for (const b of BODIES) {
+      const e = btn(b.id, b.apsisChar, `以${b.name}为中心（Tab 切换）`);
+      e.style.setProperty('--bc', `#${new THREE.Color(b.color).getHexString()}`);
+      bodies.append(e);
+    }
+    this.toolbar.append(bodies);
     this.scaleBar = document.createElement('div');
     this.scaleBar.className = 'map-scale';
     this.scaleText = document.createElement('span');
@@ -218,16 +244,15 @@ export class MapView {
 
   private rebuildPred(pred: Prediction | null, lines: Record<BodyId, DynLine>, alpha: number, flat: boolean): void {
     const c = new THREE.Color();
-    const off = new THREE.Vector3();
+    const place = pred ? placeSegments(pred) : [];
+    if (!flat) this.placements = place;
     for (const id of BODY_IDS) {
       const pb = this.pb.clear();
       if (pred) {
-        for (const seg of pred.segments) {
-          // 将来的月球相遇段换算到地心系，画在相遇时月球的位置
-          const anchor = encounterAnchor(pred, seg);
-          if ((anchor !== null ? 'earth' : seg.body.id) !== id) continue;
-          if (anchor !== null) bodyPosition(MOON, anchor, off);
-          else off.set(0, 0, 0);
+        pred.segments.forEach((seg, si) => {
+          // 将来才会进入的天体（相遇）：画在相遇时该天体所在的位置
+          const { host, off } = place[si];
+          if (host !== id) return;
           const n = seg.times.length;
           const impactT = segImpactT(pred, seg);
           const stride = Math.max(1, Math.floor(n / 2000));
@@ -241,7 +266,7 @@ export class MapView {
             }
             pb.push(seg.pts[i * 3] + off.x, seg.pts[i * 3 + 1] + off.y, seg.pts[i * 3 + 2] + off.z, c, alpha);
           }
-        }
+        });
         const N = pb.n;
         for (let i = 0; i < N; i++) if (pb.alpha[i] > 0) pb.alpha[i] *= 1 - 0.5 * (i / Math.max(1, N - 1));
       }
@@ -256,10 +281,7 @@ export class MapView {
     if (!this.visible) return;
     const t = sim.t;
     const pred = sim.destroyed ? null : sim.prediction;
-    const bodyW: Record<BodyId, THREE.Vector3> = {
-      earth: bodyPosition(EARTH, t, new THREE.Vector3()).sub(origin),
-      moon: bodyPosition(MOON, t, new THREE.Vector3()).sub(origin),
-    };
+    const bodyW = Object.fromEntries(BODIES.map((b) => [b.id, bodyPosition(b, t, new THREE.Vector3()).sub(origin)])) as Record<BodyId, THREE.Vector3>;
 
     if (sim.trail.version !== this.lastTrailVer) {
       this.lastTrailVer = sim.trail.version;
@@ -297,43 +319,85 @@ export class MapView {
       m.dashOffset = this.flowOffset;
     }
 
-    // 月球轨道、影响球、大气层边界
-    this.moonOrbit.position.copy(bodyW.earth);
-    const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(view.right, view.up, view.normal));
-    this.soiRing.position.copy(bodyW.moon);
-    this.soiRing.quaternion.copy(q);
-    this.atmoRing.position.copy(bodyW.earth);
-    this.atmoRing.quaternion.copy(q);
-    const encSeg = pred?.segments.find((sg) => encounterAnchor(pred, sg) !== null) ?? null;
-    this.encRing.visible = !!encSeg;
-    if (encSeg) {
-      this.encRing.position.copy(bodyPosition(MOON, encSeg.times[0], new THREE.Vector3())).add(bodyW.earth);
-      this.encRing.quaternion.copy(q);
-    }
+    // 天体轨道、影响球、大气层边界（按屏幕上的大小淡入淡出）
     const mpp = (2 * ext) / Math.max(1, h); // 每像素米数
-    // 放大到能分辨出 70 km 大气层时才显示其边界
-    (this.atmoRing.material as THREE.LineDashedMaterial).opacity = THREE.MathUtils.clamp(((EARTH.atmosphere?.height ?? 0) / mpp - 3) / 10, 0, 0.45);
+    const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(view.right, view.up, view.normal));
+    for (const [id, o] of this.orbits) {
+      const b = BODY_BY_ID[id];
+      o.position.copy(bodyW[b.parent!]);
+      const a = ringAlpha(orbitRadius(b) / mpp, b.id === sim.targetBody ? 0.7 : 0.35);
+      (o.material as THREE.LineBasicMaterial).opacity = a;
+      o.visible = a > 0.005;
+    }
+    for (const [id, r] of this.soiRings) {
+      r.position.copy(bodyW[id]);
+      r.quaternion.copy(q);
+      const a = ringAlpha(BODY_BY_ID[id].soi / mpp, 0.35);
+      (r.material as THREE.LineDashedMaterial).opacity = a;
+      r.visible = a > 0.005;
+    }
+    for (const [id, r] of this.atmoRings) {
+      const b = BODY_BY_ID[id];
+      r.position.copy(bodyW[id]);
+      r.quaternion.copy(q);
+      // 放大到能分辨出大气层时才显示其边界
+      const a = THREE.MathUtils.clamp(((b.atmosphere?.height ?? 0) / mpp - 3) / 10, 0, 0.45) * (1 - THREE.MathUtils.smoothstep(b.radius / mpp, 2e4, 1e5));
+      (r.material as THREE.LineDashedMaterial).opacity = a;
+      r.visible = a > 0.005;
+    }
+    // 相遇：每个将要进入的天体画一个虚线圆（太小时放大到能看见）
+    const place = pred ? this.placements : [];
+    const encs: { body: Body; pos: THREE.Vector3; t: number }[] = [];
+    if (pred) {
+      pred.segments.forEach((sg, i) => {
+        const pl = place[i];
+        if (!pl || pl.anchor === null || encs.length >= this.encRings.length) return;
+        if (i > 0 && pred.segments[i - 1].body === sg.body) return;
+        encs.push({ body: sg.body, pos: pl.off.clone().add(bodyW[pl.host]), t: pl.anchor });
+      });
+    }
+    this.encRings.forEach((r, i) => {
+      const e = encs[i];
+      r.visible = !!e;
+      if (!e) return;
+      r.position.copy(e.pos);
+      r.quaternion.copy(q);
+      r.scale.setScalar(Math.max(e.body.radius, mpp * 9));
+      (r.material as THREE.LineDashedMaterial).color.copy(TRAJ[e.body.id]);
+    });
 
     // ---------------------------------------------------------------- 标记
     if (pred) {
       const seen = new Set<string>();
-      const anchorOf = (body: typeof MOON, time: number) => {
-        const sg = body.id === 'moon' ? segmentAt(pred, time, body) : null;
-        return sg ? encounterAnchor(pred, sg) : null;
+      // 事件位置：所在轨迹段的绘制位置 + 相对天体的位置
+      const posOf = (body: Body, time: number, rel: THREE.Vector3) => {
+        let k = -1;
+        for (let i = 0; i < pred.segments.length; i++) {
+          const s = pred.segments[i];
+          if (s.body === body && time >= s.times[0] - 1e-6 && time <= s.times[s.times.length - 1] + 1e-6) {
+            k = i;
+            break;
+          }
+        }
+        const pl = place[k];
+        return pl ? rel.clone().add(pl.off).add(bodyW[pl.host]) : rel.clone().add(bodyW[body.id]);
       };
       for (const e of pred.events) {
-        const an = anchorOf(e.body, e.t);
-        const p = an !== null ? e.pos.clone().add(bodyPosition(MOON, an, new THREE.Vector3())).add(bodyW.earth) : e.pos.clone().add(bodyW[e.body.id]);
+        const p = posOf(e.body, e.t, e.pos);
         const key = `${e.type}-${e.body.id}-${e.afterNode}`;
         if (e.type === 'ap' || e.type === 'pe') {
           if (seen.has(key)) continue;
           seen.add(key);
+          // 轨道在屏幕上缩成一团时不标拱点（例如日心视图中的近地轨道）
+          if (e.pos.length() / mpp < 14) continue;
           const d = e.afterNode ? '' : deltaHtml(e, g, t);
           this.labels.add(p, `<b>${apsisName(e.type, e.body)}</b> ${fmtDist(e.alt)}${d}<br><small>${fmtTime(e.t - t)}</small>`, e.afterNode ? 'mk-node' : e.type === 'ap' ? 'mk-ap' : 'mk-pe');
         } else if (e.type === 'soiEnter') {
-          this.labels.add(p, `<b>进入月球影响球</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-soi');
+          this.labels.add(p, `<b>进入${e.body.name}影响球</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-soi');
         } else if (e.type === 'soiExit') {
-          this.labels.add(p, `<b>离开月球影响球</b>`, 'mk-soi');
+          const k = pred.segments.findIndex((s) => s.body === e.body && Math.abs(s.times[0] - e.t) < 1e-3);
+          const from = k > 0 ? pred.segments[k - 1].body : null;
+          this.labels.add(p, `<b>离开${from ? from.name : ''}影响球</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-soi');
         } else if (e.type === 'impact') {
           this.labels.add(p, `<b>✖ 撞击${e.body.name}</b><br><small>${fmtTime(e.t - t)}</small>`, 'mk-impact');
         } else if (e.type === 'node') {
@@ -352,9 +416,14 @@ export class MapView {
     }
     const rot = (Math.atan2(sx, sy) * 180) / Math.PI;
     this.labels.add(vesselW, '<svg viewBox="-12 -12 24 24"><path d="M0,-10 L6,7 L0,3.5 L-6,7 Z"/></svg>', 'mk-vessel', rot);
-    this.labels.add(bodyW.earth.clone().addScaledVector(view.up, -EARTH.radius * 1.1), '地球', 'mk-body');
-    this.labels.add(bodyW.moon.clone().addScaledVector(view.up, -MOON.radius * 1.2), '月球', 'mk-body');
-    if (encSeg) this.labels.add(this.encRing.position.clone().addScaledVector(view.up, MOON.radius * 1.3), `月球（相遇时）<br><small>${fmtTime(encSeg.times[0] - t)} 后</small>`, 'mk-body mk-enc');
+    // 天体名称：与上级天体在屏幕上挤在一起时省略
+    for (const b of BODIES) {
+      if (b.parent && bodyW[b.id].distanceTo(bodyW[b.parent]) / mpp < 26) continue;
+      const tgt = b.id === sim.targetBody;
+      const off = Math.max(b.radius * 1.15, mpp * 12);
+      this.labels.add(bodyW[b.id].clone().addScaledVector(view.up, -off), tgt ? `◎ ${b.name}` : b.name, tgt ? 'mk-body mk-target' : 'mk-body');
+    }
+    for (const e of encs) this.labels.add(e.pos.clone().addScaledVector(view.up, Math.max(e.body.radius * 1.3, mpp * 13)), `${e.body.name}（相遇时）<br><small>${fmtTime(e.t - t)} 后</small>`, 'mk-body mk-enc');
     this.labels.layout(camera, w, h);
 
     // 比例尺

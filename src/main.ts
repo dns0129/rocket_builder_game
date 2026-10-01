@@ -354,7 +354,8 @@ class App {
       case 'victory':
         if (!f.victoryShown) {
           f.victoryShown = true;
-          setTimeout(() => this.showVictory(), 2500);
+          const mars = msg?.includes('火星') ?? false;
+          setTimeout(() => this.showVictory(mars), 2500);
         }
         break;
     }
@@ -442,15 +443,15 @@ class App {
     );
   }
 
-  showVictory(): void {
+  showVictory(mars = false): void {
     const f = this.flight;
     if (!f) return;
     this.openModal(
       h(
         'div',
         { class: 'modal panel victory' },
-        h('h2', null, '🌕 任务完成！'),
-        h('p', null, '你的航天员登上了月球，并安全返回了地球。这是一次完美的登月任务！'),
+        h('h2', null, mars ? '🔴 任务完成！' : '🌕 任务完成！'),
+        h('p', null, mars ? '你的航天员踏上了火星，并跨越行星际空间安全返回了地球！' : '你的航天员登上了月球，并安全返回了地球。这是一次完美的登月任务！'),
         h('p', null, `任务总时长 ${fmtMET(f.sim.met)} · 最大过载 ${f.sim.maxG.toFixed(1)} g`),
         h('ul', null, ...MISSIONS.map((m) => h('li', null, `${f.sim.missions.done.has(m.id) ? '✔' : '○'} ${m.title} — ${m.desc}`))),
         h(

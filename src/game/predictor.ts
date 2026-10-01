@@ -1,5 +1,5 @@
 import { Vector3 } from 'three';
-import { EARTH, MOON, MOON_ORBIT, type Body, bodyPosition, bodyVelocity, dominantBody } from '../physics/bodies';
+import { BODIES, EARTH, MOON, MOON_ORBIT, type Body, type BodyId, bodyPosition, bodyVelocity, dominantBody } from '../physics/bodies';
 import { adaptiveStep, rk4Step } from '../physics/integrate';
 import { computeOrbit, keplerPropagate } from '../physics/orbit';
 
@@ -33,6 +33,8 @@ export interface Prediction {
   nodeState: { r: Vector3; v: Vector3; t: number; body: Body; dvWorld: Vector3 } | null;
   moonClosest: { t: number; dist: number; afterNode: boolean } | null;
   moonMinDist: number; // 整条轨迹（节点之后）与月心的最近距离
+  /** 整条轨迹（有节点时为节点之后）与各天体中心的最近距离（步内线性插值） */
+  minDist: Partial<Record<BodyId, { dist: number; t: number }>>;
   earthPeAfterMoon: { t: number; alt: number } | null;
   impact: PredEvent | null;
   endT: number;
@@ -64,14 +66,20 @@ export function nodeDvWorld(r: Vector3, v: Vector3, t: number, dv: Vector3, body
   return new Vector3().addScaledVector(f.pro, dv.x).addScaledVector(f.nor, dv.y).addScaledVector(f.rad, dv.z);
 }
 
+/** 轨道完全落在这个半径以内时视为“闭合轨道”，预测一圈即可。 */
+function closedLimit(body: Body): number {
+  if (body.id === 'earth') return MOON_ORBIT.a - MOON.soi * 1.5;
+  if (body.id === 'sun') return 2e12;
+  return body.soi * 0.9;
+}
+
 function horizonFor(r: Vector3, v: Vector3, t: number, body: Body, maxTime: number): number {
   bodyPosition(body, t, _bp);
   bodyVelocity(body, t, _bv);
   _rel.subVectors(r, _bp);
   _vrel.subVectors(v, _bv);
   const o = computeOrbit(_rel, _vrel, body);
-  const limit = body.id === 'moon' ? MOON.soi : MOON_ORBIT.a - MOON.soi * 1.5;
-  if (!o.hyperbolic && o.ap < limit && isFinite(o.period)) return Math.min(maxTime, o.period * 1.01);
+  if (!o.hyperbolic && o.ap < closedLimit(body) && isFinite(o.period)) return Math.min(maxTime, o.period * 1.01);
   return maxTime;
 }
 
@@ -95,8 +103,30 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
   let impact: PredEvent | null = null;
   let visitedMoon = body.id === 'moon';
   let moonMinDist = Infinity;
+  const minDist: Prediction['minDist'] = {};
   const needAfterNode = pending.length > 0;
   const _mpos = new Vector3();
+  const _bvel = new Vector3();
+  const _pr = new Vector3();
+  const _pv = new Vector3();
+  /** 一步之内与各天体的最近距离：用步首的相对位置、相对速度做线性插值（远距离巡航时步长很大） */
+  const trackClosest = (r0: Vector3, v0: Vector3, t0: number, h: number) => {
+    for (const b of BODIES) {
+      if (b.id === 'sun') continue;
+      bodyPosition(b, t0, _mpos);
+      bodyVelocity(b, t0, _bvel);
+      _pr.subVectors(r0, _mpos);
+      _pv.subVectors(v0, _bvel);
+      const vv = _pv.lengthSq();
+      let tc = vv > 0 ? -_pr.dot(_pv) / vv : 0;
+      tc = Math.max(0, Math.min(h, tc));
+      const d = _pr.addScaledVector(_pv, tc).length();
+      const cur = minDist[b.id];
+      if (!cur || d < cur.dist) minDist[b.id] = { dist: d, t: t0 + tc };
+    }
+  };
+  const _r0 = new Vector3();
+  const _v0 = new Vector3();
 
   const pushPoint = () => {
     bodyPosition(seg.body, t, _bp);
@@ -116,8 +146,7 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
     bodyPosition(body, t, _bp);
     bodyVelocity(body, t, _bv);
     const o = computeOrbit(_rel.subVectors(r, _bp), _vrel.subVectors(v, _bv), body);
-    const limit = body.id === 'moon' ? MOON.soi : MOON_ORBIT.a - MOON.soi * 1.5;
-    return !o.hyperbolic && o.ap < limit ? o.period : Infinity;
+    return !o.hyperbolic && o.ap < closedLimit(body) ? o.period : Infinity;
   })();
   let jumped = false;
 
@@ -150,9 +179,15 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
       h = Math.max(0, pending[0].t - t);
       hitNode = true;
     }
+    const t0 = t;
+    if (!needAfterNode || afterNode) {
+      _r0.copy(r);
+      _v0.copy(v);
+    }
     if (h > 0) rk4Step(r, v, t, h);
     t += h;
     sinceNodeOrSoi++;
+    if (!needAfterNode || afterNode) trackClosest(_r0, _v0, t0, h);
 
     const nb = dominantBody(r, t);
     bodyPosition(nb, t, _bp);
@@ -167,7 +202,7 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
 
     if (nb !== body) {
       pushPoint();
-      events.push({ type: nb.id === 'moon' ? 'soiEnter' : 'soiExit', t, body: nb, pos: _rel.clone(), vel: _vrel.clone(), alt: dist - nb.radius, afterNode });
+      events.push({ type: nb.parent === body.id ? 'soiEnter' : 'soiExit', t, body: nb, pos: _rel.clone(), vel: _vrel.clone(), alt: dist - nb.radius, afterNode });
       body = nb;
       if (nb.id === 'moon') visitedMoon = true;
       seg = { body, pts: [], times: [], afterNode };
@@ -235,6 +270,7 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
     nodeState,
     moonClosest,
     moonMinDist,
+    minDist,
     earthPeAfterMoon,
     impact,
     endT: t,
