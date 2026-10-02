@@ -3,6 +3,7 @@ import type { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import { BODIES, BODY_BY_ID, HELIO, MOON_ORBIT, type Body, type BodyId, bodyPosition } from '../physics/bodies';
 import type { FlightSim } from '../game/flight';
 import type { Prediction } from '../game/predictor';
+import { trailGap } from '../game/trail';
 import { DynLine, PolyBuilder, RingLine, fadeLineMaterial } from './lines';
 import { ScreenLabels } from './labels';
 import { TRAJ, apsisName, deltaHtml, placeSegments, segColor, segImpactT, type SegPlacement } from './trajectoryView';
@@ -240,12 +241,14 @@ export class MapView {
         }
         for (let i = 0; i < n; i++, gi++) {
           const a = 0.3 + 0.65 * (gi / total);
-          if (i === 0 && pb.n) {
+          const k = i * 3;
+          // 换段，或与上一点相隔太远（抽稀过的早期航迹）：用透明线段跳过去
+          if (pb.n && (i === 0 || trailGap(s.pts[k - 3], s.pts[k - 2], s.pts[k - 1], s.pts[k], s.pts[k + 1], s.pts[k + 2]))) {
             const L = pb.n - 1;
             pb.push(pb.pts[L * 3], pb.pts[L * 3 + 1], pb.pts[L * 3 + 2], TRAJ.coast, 0);
-            pb.push(s.pts[0], s.pts[1], s.pts[2], TRAJ.coast, 0);
+            pb.push(s.pts[k], s.pts[k + 1], s.pts[k + 2], TRAJ.coast, 0);
           }
-          pb.push(s.pts[i * 3], s.pts[i * 3 + 1], s.pts[i * 3 + 2], s.powered[i] ? TRAJ.powered : TRAJ.coast, a);
+          pb.push(s.pts[k], s.pts[k + 1], s.pts[k + 2], s.powered[i] ? TRAJ.powered : TRAJ.coast, a);
         }
       }
       pb.flush(this.trail[id]);
@@ -308,13 +311,13 @@ export class MapView {
     }
     for (const id of BODY_IDS) for (const set of [this.trail, this.ghost, this.pred]) set[id].setPosition(bodyW[id]);
 
-    // 航迹末端连到飞船当前位置
+    // 航迹末端连到飞船当前位置（着陆后高倍加速时不再记点，星球转过一大截后就不连了）
     const V = sim.vessel;
     const vesselW = V.r.clone().sub(origin);
     const last = sim.trail.last;
-    if (last && last.times.length) {
-      const n = last.times.length - 1;
-      const bw = bodyW[last.body.id];
+    const n = last ? last.times.length - 1 : -1;
+    const bw = last ? bodyW[last.body.id] : null;
+    if (last && bw && n >= 0 && !trailGap(last.pts[n * 3], last.pts[n * 3 + 1], last.pts[n * 3 + 2], vesselW.x - bw.x, vesselW.y - bw.y, vesselW.z - bw.z)) {
       const col = sim.telemetry.thrust > 0 ? TRAJ.powered : TRAJ.coast;
       this.tip.set(2, [last.pts[n * 3] + bw.x, last.pts[n * 3 + 1] + bw.y, last.pts[n * 3 + 2] + bw.z, vesselW.x, vesselW.y, vesselW.z], [col.r, col.g, col.b, col.r, col.g, col.b], [0.95, 0.95]);
     } else this.tip.visible = false;
