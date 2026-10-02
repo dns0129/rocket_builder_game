@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Vector3 } from 'three';
 import { FlightSim } from '../src/game/flight';
 import { templateDesign } from '../src/rocket/design';
-import { EARTH, MOON } from '../src/physics/bodies';
+import { BODY_ROTATION, EARTH, MOON } from '../src/physics/bodies';
 import { computeOrbit } from '../src/physics/orbit';
 import { solveCapture, solveTLI, solveReturn, solveCorrection } from '../src/game/maneuver';
 import type { FlightSim as FS } from '../src/game/flight';
@@ -118,10 +118,11 @@ describe('landed separation', () => {
     run(sim, 3);
     expect(d!.alive).toBe(true);
     expect(d!.restPos.distanceTo(p0)).toBe(0);
-    // 惯性系位置随地球自转，但相对地面不动
+    // 惯性系位置随地球自转，但相对地面不动（自转关闭时惯性系中也静止）
     const vs = d!.v.length();
     log('rest debris speed (earth rotation)', vs.toFixed(1));
-    expect(vs).toBeGreaterThan(50);
+    if (BODY_ROTATION) expect(vs).toBeGreaterThan(50);
+    else expect(vs).toBeLessThan(1e-6);
   });
 });
 

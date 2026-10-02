@@ -235,7 +235,8 @@ function interplanetary(p: ComputerPilot, target: Body): void {
   p.say(`进入${target.name}影响球：预计近${target.apsisChar}点 ${fmtDist(pe)}`);
 }
 
-function flyMars(p: ComputerPilot, windowT: number): void {
+/** 返回是否稳稳立在火星表面（着陆点碰上陡坡时着陆器会翻倒）。brakeLead：在近火点前多少秒开始减速。 */
+function flyMars(p: ComputerPilot, windowT: number, brakeLead = 20): boolean {
   const sim = p.sim;
   const MARS = BODY_BY_ID.mars;
   p.say('电脑驾驶“登月者 L-1”：飞向火星并着陆');
@@ -260,7 +261,7 @@ function flyMars(p: ComputerPilot, windowT: number): void {
   p.warpTo(tPe - 120, '滑行到近火点附近');
   sim.setSas('retrograde');
   p.say('SAS 逆行：机头对准地表速度的反方向，准备减速');
-  p.run(120, () => sim.t > tPe - 20);
+  p.run(120, () => sim.t > tPe - brakeLead);
   p.say('全推力逆行减速（重力转弯着陆）：先减掉约 1 km/s 的水平速度');
   sim.vessel.throttle = 1;
   p.run(600, () => {
@@ -269,8 +270,10 @@ function flyMars(p: ComputerPilot, windowT: number): void {
   });
   sim.vessel.throttle = 0;
   p.land('火星表面：剩下的速度交给自动着陆');
+  if (!sim.missions.done.has('marsLand')) return false;
   p.say(`火星着陆成功！着陆级还剩 Δv ${sim.telemetry.stageDv.toFixed(0)} m/s`);
   p.run(5);
+  return true;
 }
 
 function flyJupiter(p: ComputerPilot): void {
@@ -308,13 +311,31 @@ export const DEMO_NAMES: Record<DemoTarget, string> = {
   jupiter: '电脑演示：飞向木星',
 };
 
+/**
+ * 火星减速点火时刻的候选（近火点前多少秒）：着陆点恰好落在陡坡上时会翻倒，
+ * 换一个时刻重飞，着陆点沿地面轨迹前后移动几十公里。
+ */
+const MARS_BRAKE_LEADS = [20, 35, 5, 50, -10];
+
 /** 用默认火箭飞一次完整任务，返回录下的 demo。 */
 export function flyDemo(target: DemoTarget, log: (...a: unknown[]) => void = () => {}): DemoData {
-  const sim = new FlightSim(templateDesign(DEMO_DESIGN));
-  const p = new ComputerPilot(sim, log);
-  if (target === 'moon') flyMoon(p);
-  else if (target === 'mars') flyMars(p, marsWindow());
-  else flyJupiter(p);
+  let p: ComputerPilot | null = null;
+  if (target === 'mars') {
+    const windowT = marsWindow();
+    for (const lead of MARS_BRAKE_LEADS) {
+      const cand = new ComputerPilot(new FlightSim(templateDesign(DEMO_DESIGN)), log);
+      if (flyMars(cand, windowT, lead)) {
+        p = cand;
+        break;
+      }
+      log(`近火点前 ${lead} 秒开始减速：着陆点坡度太陡，着陆器翻倒，换一个减速时刻重飞`);
+    }
+    if (!p) throw new Error('火星着陆多次翻倒');
+  } else {
+    p = new ComputerPilot(new FlightSim(templateDesign(DEMO_DESIGN)), log);
+    if (target === 'moon') flyMoon(p);
+    else flyJupiter(p);
+  }
   const d = p.rec.finish(DEMO_NAMES[target], { id: `builtin-${target}`, builtin: target });
   d.meta.createdAt = 0;
   return d;
