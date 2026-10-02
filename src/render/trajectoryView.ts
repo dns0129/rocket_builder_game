@@ -8,8 +8,6 @@ import { fmtDist, fmtTime } from '../ui/format';
 
 /** 轨迹配色（线性空间）。 */
 export const TRAJ = {
-  powered: new THREE.Color(0xff8a2a),
-  coast: new THREE.Color(0x9fc8ff),
   earth: new THREE.Color(0x35d0ff),
   moon: new THREE.Color(0xc49bff),
   sun: new THREE.Color(0xffcf70),
@@ -168,8 +166,7 @@ const _q = new THREE.Vector3();
 const _c = new THREE.Color();
 
 /**
- * 飞行视图中的轨迹：
- * - 已飞过的航迹（橙色 = 发动机工作，淡蓝 = 滑行），
+ * 飞行视图中的轨迹（不画已飞过的航迹）：
  * - 从火箭出发的预测弹道（蓝色，将要撞地的一段变红），
  * - 1 秒多以前的“幽灵”弹道（白色），操纵时两条线分开，
  * - 远地点 / 落点标签及其变化量。
@@ -177,7 +174,6 @@ const _c = new THREE.Color();
  */
 export class FlightTrajectory {
   group = new THREE.Group();
-  private trail: DynLine;
   private pred: DynLine;
   private ghost: DynLine;
   private labels: ScreenLabels;
@@ -185,15 +181,14 @@ export class FlightTrajectory {
   visible = true;
 
   constructor(overlay: HTMLElement) {
-    this.trail = new DynLine([fadeLineMaterial({ width: 2.4 })], 40);
     this.ghost = new DynLine([fadeLineMaterial({ width: 1.8 })], 42);
     this.pred = new DynLine([fadeLineMaterial({ width: 5, opacity: 0.12 }), fadeLineMaterial({ width: 2.2 })], 44);
-    for (const l of [this.trail, this.ghost, this.pred]) l.addTo(this.group);
+    for (const l of [this.ghost, this.pred]) l.addTo(this.group);
     this.labels = new ScreenLabels(overlay);
   }
 
   setResolution(w: number, h: number): void {
-    for (const l of [this.trail, this.ghost, this.pred]) for (const o of l.objects) o.material.resolution.set(w, h);
+    for (const l of [this.ghost, this.pred]) for (const o of l.objects) o.material.resolution.set(w, h);
   }
 
   setVisible(v: boolean): void {
@@ -220,23 +215,6 @@ export class FlightTrajectory {
       rotateY(_q, th - bodyRotation(body, ti), out);
       return out.add(bp);
     };
-
-    // ---------------------------------------------------------------- 航迹
-    const pb = this.pb.clear();
-    const seg = sim.trail.last;
-    if (seg && seg.body === body) {
-      // 最近 300 个点逐点画，更早的隔点抽稀（远处看不出差别，每帧少算很多）
-      const n = seg.times.length;
-      const i0 = Math.max(0, n - 1500);
-      const dense = Math.max(i0, n - 300);
-      for (let i = i0; i < n; i += i < dense ? 3 : 1) {
-        place(seg.pts[i * 3], seg.pts[i * 3 + 1], seg.pts[i * 3 + 2], seg.times[i], _p);
-        const f = (i - i0) / Math.max(1, n - i0);
-        pb.push(_p.x, _p.y, _p.z, seg.powered[i] ? TRAJ.powered : TRAJ.coast, 0.2 + 0.75 * f);
-      }
-      if (n) pb.push(vesselRel.x, vesselRel.y, vesselRel.z, tel.thrust > 0 ? TRAJ.powered : TRAJ.coast, 0.95);
-    }
-    pb.flush(this.trail);
 
     // ---------------------------------------------------------------- 预测弹道与幽灵
     const pred = sim.destroyed || sim.landed ? null : sim.prediction;
@@ -323,7 +301,7 @@ export class FlightTrajectory {
   }
 
   dispose(): void {
-    for (const l of [this.trail, this.ghost, this.pred]) l.dispose();
+    for (const l of [this.ghost, this.pred]) l.dispose();
     this.labels.dispose();
   }
 }

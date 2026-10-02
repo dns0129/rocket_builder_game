@@ -12,18 +12,6 @@ export interface TrailSegment {
 }
 
 const _bp = new Vector3();
-/** 相邻两点相对天体中心的张角超过 10° 就不再连线 */
-const GAP_COS = Math.cos((10 * Math.PI) / 180);
-
-/**
- * 两个相邻航迹点（相对同一天体中心）之间是否该断开。正常取点相隔不到 1°；
- * 但长时间加速后较早的航迹被反复隔点抽稀，或着陆后加速一段时间再起飞，相邻点可能相隔大半圈，
- * 直接连线会横穿星球，在地图上画成一团乱线。
- */
-export function trailGap(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
-  const dot = ax * bx + ay * by + az * bz;
-  return dot <= 0 || dot * dot < (ax * ax + ay * ay + az * az) * (bx * bx + by * by + bz * bz) * GAP_COS * GAP_COS;
-}
 
 /**
  * 已飞过的轨迹。按距离抽样（越高越稀），动力/滑行切换处一定取点，

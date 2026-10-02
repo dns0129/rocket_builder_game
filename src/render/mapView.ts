@@ -3,7 +3,6 @@ import type { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import { BODIES, BODY_BY_ID, HELIO, MOON_ORBIT, type Body, type BodyId, bodyPosition } from '../physics/bodies';
 import type { FlightSim } from '../game/flight';
 import type { Prediction } from '../game/predictor';
-import { trailGap } from '../game/trail';
 import { DynLine, PolyBuilder, RingLine, fadeLineMaterial } from './lines';
 import { ScreenLabels } from './labels';
 import { TRAJ, apsisName, deltaHtml, placeSegments, segColor, segImpactT, type SegPlacement } from './trajectoryView';
@@ -55,7 +54,7 @@ void main() {
 /**
  * 二维地图：相机始终垂直于飞船的轨道平面俯视，只能平移与缩放（不再三维旋转），
  * 但地球、月球、大气辉光仍用飞行视图同一套三维着色器渲染，保持原来的质感。
- * 画面内容：已飞过的航迹、预测轨迹（带流动光点）、1 秒前的幽灵轨迹、月球轨道、影响球、大气层边界，
+ * 画面内容：飞船当前的预测轨迹（带流动光点，不画已飞过的航迹）、1 秒前的幽灵轨迹、月球轨道、影响球、大气层边界，
  * 以及远/近拱点（含变化量）、落点、进出影响球、机动节点等标记。
  */
 export class MapView {
@@ -63,10 +62,8 @@ export class MapView {
   private overlay: HTMLDivElement;
   private labels: ScreenLabels;
   private pb = new PolyBuilder();
-  private trail: Record<BodyId, DynLine>;
   private pred: Record<BodyId, DynLine>;
   private ghost: Record<BodyId, DynLine>;
-  private tip: DynLine;
   private flowMats: LineMaterial[] = [];
   private flowOffset = 0;
   private orbits = new Map<BodyId, RingLine>();
@@ -76,7 +73,6 @@ export class MapView {
   private allRings: RingLine[] = [];
   private placements: SegPlacement[] = [];
   private stars: THREE.Mesh;
-  private lastTrailVer = -1;
   private lastPred: Prediction | null | undefined = undefined;
   private lastGhost: Prediction | null | undefined = undefined;
   private toolbar: HTMLDivElement;
@@ -96,7 +92,6 @@ export class MapView {
     this.labels = new ScreenLabels(overlay);
     const mkSet = (make: () => DynLine) => Object.fromEntries(BODY_IDS.map((id) => [id, make()])) as Record<BodyId, DynLine>;
     // 线宽含两侧各约 1 像素的抗锯齿渐变；流动光点亮度低于泛光阈值，避免泛光把细线糊成一串方块
-    this.trail = mkSet(() => new DynLine([fadeLineMaterial({ width: 2.2, depthTest: false })], 50));
     this.ghost = mkSet(() => new DynLine([fadeLineMaterial({ width: 1.8, depthTest: false })], 52));
     this.pred = mkSet(() => {
       const flow = fadeLineMaterial({ width: 2.4, depthTest: false, dashed: true });
@@ -104,9 +99,7 @@ export class MapView {
       this.flowMats.push(flow);
       return new DynLine([fadeLineMaterial({ width: 6, opacity: 0.1, depthTest: false }), fadeLineMaterial({ width: 2.2, depthTest: false }), flow], 54);
     });
-    this.tip = new DynLine([fadeLineMaterial({ width: 2.2, depthTest: false })], 51);
-    for (const id of BODY_IDS) for (const l of [this.trail[id], this.ghost[id], this.pred[id]]) l.addTo(this.group);
-    this.tip.addTo(this.group);
+    for (const id of BODY_IDS) for (const l of [this.ghost[id], this.pred[id]]) l.addTo(this.group);
 
     // 天体轨道（黄道面 / 地球赤道面内的圆）：抗锯齿细线
     const add = (r: RingLine) => {
@@ -194,8 +187,7 @@ export class MapView {
   }
 
   setResolution(w: number, h: number): void {
-    for (const set of [this.trail, this.ghost, this.pred]) for (const id of BODY_IDS) for (const o of set[id].objects) o.material.resolution.set(w, h);
-    for (const o of this.tip.objects) o.material.resolution.set(w, h);
+    for (const set of [this.ghost, this.pred]) for (const id of BODY_IDS) for (const o of set[id].objects) o.material.resolution.set(w, h);
     for (const r of this.allRings) r.mat.resolution.set(w, h);
   }
 
@@ -226,34 +218,6 @@ export class MapView {
   }
 
   // ---------------------------------------------------------------- 重建几何（数据变化时）
-
-  private rebuildTrail(sim: FlightSim): void {
-    const segs = sim.trail.segments;
-    const total = Math.max(1, sim.trail.count);
-    for (const id of BODY_IDS) {
-      const pb = this.pb.clear();
-      let gi = 0;
-      for (const s of segs) {
-        const n = s.times.length;
-        if (s.body.id !== id) {
-          gi += n;
-          continue;
-        }
-        for (let i = 0; i < n; i++, gi++) {
-          const a = 0.3 + 0.65 * (gi / total);
-          const k = i * 3;
-          // 换段，或与上一点相隔太远（抽稀过的早期航迹）：用透明线段跳过去
-          if (pb.n && (i === 0 || trailGap(s.pts[k - 3], s.pts[k - 2], s.pts[k - 1], s.pts[k], s.pts[k + 1], s.pts[k + 2]))) {
-            const L = pb.n - 1;
-            pb.push(pb.pts[L * 3], pb.pts[L * 3 + 1], pb.pts[L * 3 + 2], TRAJ.coast, 0);
-            pb.push(s.pts[k], s.pts[k + 1], s.pts[k + 2], TRAJ.coast, 0);
-          }
-          pb.push(s.pts[k], s.pts[k + 1], s.pts[k + 2], s.powered[i] ? TRAJ.powered : TRAJ.coast, a);
-        }
-      }
-      pb.flush(this.trail[id]);
-    }
-  }
 
   private rebuildPred(pred: Prediction | null, lines: Record<BodyId, DynLine>, alpha: number, flat: boolean): void {
     const c = new THREE.Color();
@@ -296,10 +260,6 @@ export class MapView {
     const pred = sim.destroyed ? null : sim.prediction;
     const bodyW = Object.fromEntries(BODIES.map((b) => [b.id, bodyPosition(b, t, new THREE.Vector3()).sub(origin)])) as Record<BodyId, THREE.Vector3>;
 
-    if (sim.trail.version !== this.lastTrailVer) {
-      this.lastTrailVer = sim.trail.version;
-      this.rebuildTrail(sim);
-    }
     if (pred !== this.lastPred) {
       this.lastPred = pred;
       this.rebuildPred(pred, this.pred, 1, false);
@@ -309,18 +269,9 @@ export class MapView {
       this.lastGhost = g;
       this.rebuildPred(g, this.ghost, 0.45, true);
     }
-    for (const id of BODY_IDS) for (const set of [this.trail, this.ghost, this.pred]) set[id].setPosition(bodyW[id]);
-
-    // 航迹末端连到飞船当前位置（着陆后高倍加速时不再记点，星球转过一大截后就不连了）
+    for (const id of BODY_IDS) for (const set of [this.ghost, this.pred]) set[id].setPosition(bodyW[id]);
     const V = sim.vessel;
     const vesselW = V.r.clone().sub(origin);
-    const last = sim.trail.last;
-    const n = last ? last.times.length - 1 : -1;
-    const bw = last ? bodyW[last.body.id] : null;
-    if (last && bw && n >= 0 && !trailGap(last.pts[n * 3], last.pts[n * 3 + 1], last.pts[n * 3 + 2], vesselW.x - bw.x, vesselW.y - bw.y, vesselW.z - bw.z)) {
-      const col = sim.telemetry.thrust > 0 ? TRAJ.powered : TRAJ.coast;
-      this.tip.set(2, [last.pts[n * 3] + bw.x, last.pts[n * 3 + 1] + bw.y, last.pts[n * 3 + 2] + bw.z, vesselW.x, vesselW.y, vesselW.z], [col.r, col.g, col.b, col.r, col.g, col.b], [0.95, 0.95]);
-    } else this.tip.visible = false;
 
     // 预测轨迹上流动的光点，指示运动方向
     const ext = view.extent;
@@ -465,8 +416,7 @@ export class MapView {
   }
 
   dispose(): void {
-    for (const id of BODY_IDS) for (const set of [this.trail, this.ghost, this.pred]) set[id].dispose();
-    this.tip.dispose();
+    for (const id of BODY_IDS) for (const set of [this.ghost, this.pred]) set[id].dispose();
     for (const r of this.allRings) r.dispose();
     this.labels.dispose();
     this.toolbar.remove();
