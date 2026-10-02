@@ -42,8 +42,11 @@ export class BuilderUI {
   panel: Panel = 'parts';
   expanded = true;
   scenario: Scenario = 'pad';
+  /** 无限燃料模式（由 App 保存设置；设置菜单中也能切换，切换后调用 setInfiniteFuel 同步） */
+  infiniteFuel = false;
   stats!: DesignStats;
   onLaunch: (d: RocketDesign, s: Scenario) => void = () => {};
+  onInfiniteFuel: (on: boolean) => void = () => {};
   onHelp: () => void = () => {};
   onSettings: () => void = () => {};
   private scene: BuilderScene;
@@ -501,6 +504,15 @@ export class BuilderUI {
       h('div', { class: 'part-stats', style: { marginTop: '8px' } }, '参考 Δv（m/s）：入轨≈3400 · 奔月≈950 · 月球捕获+着陆≈1000 · 月面起飞≈750 · 返回≈300（地球再入靠大气减速）'),
     );
     for (const e of s.hints.slice(0, 3)) this.body.appendChild(h('div', { class: 'msg hint' }, e));
+    if (this.infiniteFuel)
+      this.body.appendChild(h('div', { class: 'msg hint' }, '无限燃料已开启：液体燃料不会消耗，带液体发动机的级 Δv 不受限；固体助推器照常烧完并自动分离。'));
+  }
+
+  /** 同步无限燃料设置并刷新底部面板 */
+  setInfiniteFuel(on: boolean): void {
+    if (on === this.infiniteFuel) return;
+    this.infiniteFuel = on;
+    this.renderSheet();
   }
 
   // ---------------------------------------------------------------- 弹窗：设计菜单与发射
@@ -622,6 +634,20 @@ export class BuilderUI {
         h('h2', null, `发射「${this.design.name || '未命名'}」`),
         ...s.errors.map((e) => h('div', { class: 'msg err' }, e)),
         ...s.warnings.slice(0, 2).map((e) => h('div', { class: 'msg warn' }, e)),
+        h(
+          'label',
+          { class: `launch-opt${this.infiniteFuel ? ' on' : ''}` },
+          h('input', {
+            type: 'checkbox',
+            checked: this.infiniteFuel,
+            onchange: (e: Event) => {
+              const on = (e.target as HTMLInputElement).checked;
+              this.onInfiniteFuel(on);
+              (e.target as HTMLInputElement).parentElement!.classList.toggle('on', on);
+            },
+          }),
+          '∞ 无限燃料模式（液体燃料不消耗，固体助推器照常烧完）',
+        ),
         h(
           'div',
           { class: 'mb-scns' },

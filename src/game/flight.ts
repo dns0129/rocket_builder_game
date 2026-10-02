@@ -62,6 +62,11 @@ export type SasMode = 'stability' | 'prograde' | 'retrograde' | 'normal' | 'anti
 export type SpeedMode = 'auto' | 'surface' | 'orbit';
 export type Scenario = 'pad' | 'leo' | 'llo' | 'lmo';
 
+export interface FlightOptions {
+  /** 无限燃料模式（见 Vessel.infiniteFuel） */
+  infiniteFuel?: boolean;
+}
+
 export interface FlightEvent {
   type: string;
   msg?: string;
@@ -213,14 +218,34 @@ export class FlightSim {
   contactCount = 0;
   tempLimit = 1500;
   private warnedFlameout = new Set<string>();
+  /** 本次飞行中是否开启过无限燃料（任务完成时注明） */
+  infiniteFuelUsed = false;
 
-  constructor(design: RocketDesign, scenario: Scenario = 'pad') {
+  constructor(design: RocketDesign, scenario: Scenario = 'pad', opts: FlightOptions = {}) {
     this.vessel = new Vessel(design);
     this.scenario = scenario;
     this.autopilot = new Autopilot(this);
     this.missions = new MissionTracker(this);
+    if (opts.infiniteFuel) this.setInfiniteFuel(true, false);
     this.setupScenario(scenario);
     this.updateTelemetry();
+  }
+
+  /** 开关无限燃料（飞行中也可以切换）；打开时加满液体燃料箱，熄火的液体发动机重新工作。 */
+  setInfiniteFuel(on: boolean, announce = true): void {
+    if (this.destroyed || on === this.vessel.infiniteFuel) return;
+    const relit = this.vessel.setInfiniteFuel(on);
+    if (on) {
+      this.infiniteFuelUsed = true;
+      for (const k of relit) this.warnedFlameout.delete(k);
+    }
+    if (announce) {
+      this.emit({
+        type: 'msg',
+        msg: on ? '无限燃料：已加满液体燃料箱，液体燃料不再消耗' : '无限燃料已关闭：从现在起正常消耗燃料',
+        level: 'info',
+      });
+    }
   }
 
   get warp(): number {
@@ -1342,6 +1367,8 @@ export class FlightSim {
       thrust = V.nextStageThrust();
       mdot = thrust / (320 * G0);
     }
+    // 无限燃料：质量不变，相当于排气速度无穷大（燃烧时间 = m·Δv/F）
+    if (V.infiniteFuel) mdot = thrust / 1e9;
     return f(dv, V.mass, thrust, mdot);
   }
 

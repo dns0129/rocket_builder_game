@@ -136,7 +136,12 @@ export class FlightHUD {
       'div',
       { class: 'gauges panel' },
       h('div', { class: 'gauge-col' }, thrGauge, (E.thrLbl = h('div', { class: 'gauge-label num' }))),
-      h('div', { class: 'gauge-col' }, h('div', { class: 'gauge fuel', title: '当前级燃料' }, (E.fuelFill = h('div', { class: 'fill' }))), h('div', { class: 'gauge-label' }, '燃料')),
+      h(
+        'div',
+        { class: 'gauge-col' },
+        (E.fuelGauge = h('div', { class: 'gauge fuel', title: '当前级燃料' }, (E.fuelFill = h('div', { class: 'fill' })))),
+        (E.fuelLbl = h('div', { class: 'gauge-label' }, '燃料')),
+      ),
       h('div', { class: 'gauge-col' }, h('div', { class: 'gauge heat', title: '蒙皮温度（相对极限）' }, (E.heatFill = h('div', { class: 'fill' }))), h('div', { class: 'gauge-label' }, '温度')),
     );
     // 姿态面板：左边导航球 + 速度，右边方向舵（紧凑布局）
@@ -566,7 +571,14 @@ export class FlightHUD {
     setText(E.apStatus, sim.autopilot.mode !== 'off' ? sim.autopilot.status : '');
 
     // 分级
-    setText(E.sdv, `${tel.stageDv.toFixed(0)} m/s`);
+    setText(E.sdv, isFinite(tel.stageDv) ? `${tel.stageDv.toFixed(0)} m/s` : '∞');
+    // 无限燃料：燃料条换成金色，标签显示 ∞
+    const inf = V.infiniteFuel;
+    if (E.fuelGauge.classList.contains('inf') !== inf) {
+      E.fuelGauge.classList.toggle('inf', inf);
+      E.fuelGauge.title = inf ? '无限燃料：液体燃料不会减少（固体助推器照常烧完；设置中可关闭）' : '当前级燃料';
+      E.fuelLbl.textContent = inf ? '∞ 燃料' : '燃料';
+    }
     setText(E.twr, tel.thrust > 0 ? tel.twr.toFixed(2) : `(${(V.maxThrustVac().thrust / (V.mass * tel.gLocal)).toFixed(2)})`);
     setText(E.mass, fmtMass(V.mass));
     const sk = `${V.stageIndex}|${V.parts.length}|${V.chuteState}`;

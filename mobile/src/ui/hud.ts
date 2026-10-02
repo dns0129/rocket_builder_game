@@ -201,7 +201,8 @@ export class FlightHUD {
         },
         label,
       );
-    const bar = (cls: string, key: string, label: string) => h('div', { class: 'mini-gauge-col' }, h('div', { class: `mini-gauge ${cls}` }, (E[key] = h('div', { class: 'fill' }))), h('div', { class: 'gl' }, label));
+    const bar = (cls: string, key: string, label: string) =>
+      h('div', { class: 'mini-gauge-col' }, (E[`${key}Gauge`] = h('div', { class: `mini-gauge ${cls}` }, (E[key] = h('div', { class: 'fill' })))), (E[`${key}Lbl`] = h('div', { class: 'gl' }, label)));
     // 油门两侧：燃料（油）与蒙皮温度（温）
     const bottom = h('div', { class: 'f-bottom' });
     this.root.appendChild(bottom);
@@ -675,6 +676,11 @@ export class FlightHUD {
     const E = this.els;
     this.throttle.update(V.throttle);
     E.fuelFill.style.height = `${V.stageFuelFraction() * 100}%`;
+    // 无限燃料：燃料条换成金色，标签显示 ∞
+    if (E.fuelFillGauge.classList.contains('inf') !== V.infiniteFuel) {
+      E.fuelFillGauge.classList.toggle('inf', V.infiniteFuel);
+      E.fuelFillLbl.textContent = V.infiniteFuel ? '∞' : '油';
+    }
     E.heatFill.style.height = `${Math.min(100, Math.max(0, ((tel.temp - 250) / Math.max(1, tel.tempMax - 250)) * 100))}%`;
     this.updateRudder();
 
@@ -767,7 +773,7 @@ export class FlightHUD {
       setText(E.stageSub, this.stageShort(i));
       E.stageBtn.classList.toggle('empty', !st);
     }
-    setText(E.stInfo, `Δv ${tel.stageDv.toFixed(0)} · TWR ${tel.thrust > 0 ? tel.twr.toFixed(2) : (V.maxThrustVac().thrust / (V.mass * tel.gLocal)).toFixed(2)}`);
+    setText(E.stInfo, `Δv ${isFinite(tel.stageDv) ? tel.stageDv.toFixed(0) : '∞'} · TWR ${tel.thrust > 0 ? tel.twr.toFixed(2) : (V.maxThrustVac().thrust / (V.mass * tel.gLocal)).toFixed(2)}`);
     setText(E.mass, fmtMass(V.mass));
 
     // 着陆辅助

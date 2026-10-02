@@ -664,6 +664,28 @@ table.stages th:first-child {
 }
 
 /* 发射场景选择 */
+.launch-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 2px;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.launch-opt input {
+  width: 18px;
+  height: 18px;
+  accent-color: #ffc24a;
+  margin: 0;
+}
+
+.launch-opt.on {
+  color: #ffd75a;
+}
+
 .mb-scns {
   display: flex;
   flex-direction: column;
@@ -1149,6 +1171,15 @@ table.stages th:first-child {
 
 .mini-gauge.fuel .fill {
   background: linear-gradient(0deg, #1e9e5a, #58e08e);
+}
+
+/* 无限燃料：金色燃料条 */
+.mini-gauge.fuel.inf .fill {
+  background: linear-gradient(0deg, #c98a10, #ffd75a);
+}
+
+.mini-gauge.fuel.inf + .gl {
+  color: #ffd75a;
 }
 
 .mini-gauge.heat .fill {
