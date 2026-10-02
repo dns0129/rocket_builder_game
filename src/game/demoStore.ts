@@ -101,7 +101,7 @@ export interface BuiltinDemo {
 export const BUILTIN_DEMOS: BuiltinDemo[] = [
   { id: 'moon', file: 'demos/moon.json', icon: '🌕', title: '登月往返', desc: '发射入轨 → 奔月 → 环月 → 月面着陆 → 起飞返回 → 再入溅落' },
   { id: 'mars', file: 'demos/mars.json', icon: '🔴', title: '飞向火星', desc: '在发射台等待窗口 → 入轨 → 行星际转移 → 中途修正 → 火星捕获 → 着陆火星' },
-  { id: 'jupiter', file: 'demos/jupiter.json', icon: '🪐', title: '飞向木星', desc: '发射入轨 → 等待窗口 → 约 280 天的转移 → 中途修正 → 木星捕获，环绕木星' },
+  { id: 'jupiter', file: 'demos/jupiter.json', icon: '🪐', title: '飞向木星', desc: '发射入轨 → 等待窗口 → 约 260 天的转移 → 中途修正 → 木星捕获，环绕木星' },
 ];
 
 const builtinCache = new Map<string, Promise<DemoData>>();

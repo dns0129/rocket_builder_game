@@ -2,3 +2,6 @@
 # 按原样存储（不做换行转换），这样无论 git clone 还是 GitHub 的 Download ZIP 拿到的都是 CRLF。
 *.cmd -text
 *.bat -text
+# macOS 的 .command 启动脚本必须使用 LF 换行，否则 bash 会报 $'\r': command not found。
+*.command text eol=lf
+*.sh text eol=lf

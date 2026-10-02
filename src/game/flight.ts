@@ -28,8 +28,9 @@ import { computeOrbit, type OrbitInfo } from '../physics/orbit';
 import { terrainHeight, terrainNormal } from '../physics/terrain';
 import type { RocketDesign } from '../rocket/design';
 import { Debris, Vessel, type RuntimePart } from './vessel';
-import { predict, nodeDvWorld, type NodeSpec, type Prediction } from './predictor';
-import { burnTime, solveTransfer } from './maneuver';
+import { predict, predictSteps, nodeDvWorld, type JumpCache, type NodeSpec, type Prediction, type PredictOptions } from './predictor';
+import { burnLead, burnTime, solveTransfer } from './maneuver';
+import { makeBurnTarget, velocityToGain, type BurnTarget } from './guidance';
 import { Autopilot } from './autopilot';
 import { MissionTracker } from './missions';
 import { FlightTrail } from './trail';
@@ -37,8 +38,12 @@ import type { FlightRecorder } from './recorder';
 
 export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000, 1000000];
 export const PHYS_WARP_MAX = 3;
-/** 方向舵最大倾角：±90°（水平向西 / 向东） */
-export const RUDDER_MAX = Math.PI / 2;
+/** 方向舵设定与实际倾角相差较大时，每次只朝设定方向领先这么多，让火箭在“竖直—正东”平面内转过去 */
+const RUDDER_LEAD = (60 * Math.PI) / 180;
+/** 机动节点在点火前多久锁定（开始闭环制导） */
+const NODE_LOCK_LEAD = 20;
+/** 自动执行机动时，时间加速在点火前多久停下（留出转向的时间） */
+const BURN_WARP_MARGIN = 15;
 /** 级间分离后上面级延迟点火的时间 s（期间沉底发动机工作，下面级靠反推火箭拉开距离） */
 export const IGNITION_DELAY = 0.8;
 /** 沉底发动机提供的加速度 m/s² */
@@ -48,9 +53,20 @@ const IMPACT_TOLERANCE_SCALE = 1.5;
 /** 简化难度：再入热流的缩放 */
 const HEAT_SCALE = 0.8;
 
+/** 每帧推进不超过 remain/3 的最高时间加速档位。 */
+function warpIndexWithin(remain: number, dtReal: number): number {
+  for (let i = WARP_LEVELS.length - 1; i > 0; i--) if (WARP_LEVELS[i] * dtReal * 3 < remain) return i;
+  return 0;
+}
+
 export type SasMode = 'stability' | 'prograde' | 'retrograde' | 'normal' | 'antinormal' | 'radialOut' | 'radialIn' | 'maneuver' | 'rudder';
 export type SpeedMode = 'auto' | 'surface' | 'orbit';
 export type Scenario = 'pad' | 'leo' | 'llo' | 'lmo';
+
+export interface FlightOptions {
+  /** 无限燃料模式（见 Vessel.infiniteFuel） */
+  infiniteFuel?: boolean;
+}
 
 export interface FlightEvent {
   type: string;
@@ -101,13 +117,31 @@ export interface Telemetry {
 
 export interface ManeuverNode extends NodeSpec {
   fixedDv: Vector3 | null; // 开始执行后锁定的惯性系 Δv 矢量
+  /** 剩余（待增）Δv：锁定后由闭环制导每帧重新计算，点火时按推力积分 */
   remaining: Vector3 | null;
+  /** 闭环制导的目标（计划轨道上的一点）；退化轨道为 null，按固定惯性方向执行 */
+  target?: BurnTarget | null;
+  /** 当前点火方向（单位矢量），用于判断是否已经“烧过头” */
+  burnDir?: Vector3 | null;
+  /** 临近关机：不再更新制导，只按推力积分 */
+  frozen?: boolean;
+  /** 飞行辅助已在物理子步内精确关机 */
+  done?: boolean;
   /** 行星际转移：到这个时刻自动重新精确计算节点 */
   replanAt?: number | null;
   replanTarget?: BodyId;
 }
 
 const UP = new Vector3(0, 1, 0);
+
+/** 把角度规整到 (-π, π]。 */
+export function wrapAngle(a: number): number {
+  a %= 2 * Math.PI;
+  if (a > Math.PI) a -= 2 * Math.PI;
+  else if (a <= -Math.PI) a += 2 * Math.PI;
+  return a;
+}
+
 const _v1 = new Vector3();
 const _v2 = new Vector3();
 const _v3 = new Vector3();
@@ -126,7 +160,7 @@ export class FlightSim {
   controlCmd = new Vector3(); // 实际控制量（x 俯仰, y 滚转, z 偏航），用于喷管摆动显示
   sasOn = true;
   sasMode: SasMode = 'stability';
-  /** 方向舵设定的倾角（弧度）：0 竖直向上，正值向东，负值向西 */
+  /** 方向舵设定的倾角（弧度，-π..π，可以转满一圈）：0 竖直向上，正值向东，负值向西，±π 竖直向下 */
   rudderAngle = 0;
   /** 沉底发动机剩余工作时间 s */
   ullageT = 0;
@@ -150,6 +184,18 @@ export class FlightSim {
   trail = new FlightTrail();
   prediction: Prediction | null = null;
   predictionAge = 999;
+  /**
+   * 实时轨迹预测（由主循环调用 pumpPrediction 驱动）：分片计算，每帧在时间预算内推进，
+   * 算完立即开始下一次，因此预测轨迹几乎每帧都在更新，又不会让某一帧卡顿。
+   * 关闭时（测试、无主循环）按固定间隔整段计算。
+   */
+  livePrediction = false;
+  private predJob: { it: Generator<void, Prediction, void>; ver: number } | null = null;
+  /** 机动节点每次增删改都加一，丢弃按旧节点算出来的预测 */
+  private nodesVer = 0;
+  /** 飞船受到引力以外的力（推力、气动、接触、分离）时加一：滑行状态变了，远期节点的跳跃缓存随之失效 */
+  private coastEpoch = 0;
+  private jumpCache: { cache: JumpCache; epoch: number; nodeT: number } | null = null;
   autopilot: Autopilot;
   missions: MissionTracker;
   isWater: (body: Body, dirBf: Vector3) => boolean = () => false;
@@ -175,16 +221,36 @@ export class FlightSim {
   contactCount = 0;
   tempLimit = 1500;
   private warnedFlameout = new Set<string>();
+  /** 本次飞行中是否开启过无限燃料（任务完成时注明） */
+  infiniteFuelUsed = false;
   /** 飞行记录仪（demo）：每次 update 之后取样，并接收所有事件 */
   recorder: FlightRecorder | null = null;
 
-  constructor(design: RocketDesign, scenario: Scenario = 'pad') {
+  constructor(design: RocketDesign, scenario: Scenario = 'pad', opts: FlightOptions = {}) {
     this.vessel = new Vessel(design);
     this.scenario = scenario;
     this.autopilot = new Autopilot(this);
     this.missions = new MissionTracker(this);
+    if (opts.infiniteFuel) this.setInfiniteFuel(true, false);
     this.setupScenario(scenario);
     this.updateTelemetry();
+  }
+
+  /** 开关无限燃料（飞行中也可以切换）；打开时加满液体燃料箱，熄火的液体发动机重新工作。 */
+  setInfiniteFuel(on: boolean, announce = true): void {
+    if (this.destroyed || on === this.vessel.infiniteFuel) return;
+    const relit = this.vessel.setInfiniteFuel(on);
+    if (on) {
+      this.infiniteFuelUsed = true;
+      for (const k of relit) this.warnedFlameout.delete(k);
+    }
+    if (announce) {
+      this.emit({
+        type: 'msg',
+        msg: on ? '无限燃料：已加满液体燃料箱，液体燃料不再消耗' : '无限燃料已关闭：从现在起正常消耗燃料',
+        level: 'info',
+      });
+    }
   }
 
   get warp(): number {
@@ -266,6 +332,7 @@ export class FlightSim {
     const origin = V.r.clone().sub(V.com.clone().applyQuaternion(V.q));
     const res = V.activateStage();
     if (!res) return;
+    this.coastEpoch++;
     const wasLanded = this.landed;
     if (this.landed) {
       this.landed = false;
@@ -376,13 +443,13 @@ export class FlightSim {
   }
 
   /**
-   * 方向舵：直接设定箭体倾角（0 竖直向上，+90° 水平向东，-90° 水平向西），
+   * 方向舵：直接设定箭体倾角，可以转满一圈（0 竖直向上，+90° 水平向东，-90° 水平向西，±180° 竖直向下），
    * 姿态控制系统（喷管摆动 + 尾翼 + 姿控）自动把火箭转过去并保持。
    */
   setRudder(angle: number): void {
     if (this.destroyed) return;
     if (this.autopilot.mode !== 'off') this.autopilot.disengage('手动操纵方向舵，飞行辅助已关闭（油门保持不变）', true);
-    this.rudderAngle = Math.max(-RUDDER_MAX, Math.min(RUDDER_MAX, angle));
+    this.rudderAngle = wrapAngle(angle);
     this.sasOn = true;
     this.sasMode = 'rudder';
     this.sasHold = null;
@@ -480,18 +547,22 @@ export class FlightSim {
         this.autoWarpTo = null;
         this.warpIndex = 0;
       } else {
-        let idx = 0;
-        for (let i = WARP_LEVELS.length - 1; i >= 0; i--) {
-          if (WARP_LEVELS[i] * dtReal * 3 < remain) {
-            idx = i;
-            break;
-          }
-        }
-        this.warpIndex = Math.min(idx, this.maxWarpIndex());
+        this.warpIndex = Math.min(warpIndexWithin(remain, dtReal), this.maxWarpIndex());
       }
     }
     if (this.warpIndex > this.maxWarpIndex()) {
       this.warpIndex = this.maxWarpIndex();
+    }
+    // 飞行辅助负责的机动还没烧完：无论手动还是自动加速，“定轨”高倍加速都不能越过点火前 BURN_WARP_MARGIN 秒；
+    // 之后（包括点火时还没对准、仍在转向）只允许 ×4 以内的物理加速
+    const hold = this.autopilot.burnWarpHold();
+    if (hold !== null) {
+      const remain = hold - BURN_WARP_MARGIN - this.t;
+      const cap = Math.max(Math.min(PHYS_WARP_MAX, this.warpIndex), remain > 0.5 ? warpIndexWithin(remain, dtReal) : 0);
+      if (this.warpIndex > cap) {
+        this.warpIndex = cap;
+        if (this.autoWarpTo !== null && remain <= 0.5) this.autoWarpTo = null;
+      }
     }
     const simDt = dtReal * this.warp;
     this.lastSimDt = simDt;
@@ -502,6 +573,7 @@ export class FlightSim {
     } else if (this.warpIndex > PHYS_WARP_MAX) {
       // 着陆状态（或已损毁）下的高倍时间加速：直接推进时间，不必逐小步积分
       this.t += simDt;
+      this.coastEpoch++;
       if (this.landed && !this.destroyed) this.applyLanded();
     } else {
       const near = this.telemetry ? this.telemetry.radarAlt < 200 : true;
@@ -519,31 +591,87 @@ export class FlightSim {
     this.updateNodes();
     this.checkReplan();
     this.predictionAge += dtReal;
-    const thrusting = this.vessel.parts.some((rp) => rp.thrustNow > 0);
-    const interval = thrusting ? 0.25 : this.warpIndex > PHYS_WARP_MAX ? 0.1 : 0.5;
-    if (this.predictionAge > interval) this.refreshPrediction();
+    if (!this.livePrediction) {
+      const interval = this.maneuvering() ? 0.25 : this.warpIndex > PHYS_WARP_MAX ? 0.1 : 0.5;
+      if (this.predictionAge > interval) this.refreshPrediction();
+    }
     this.recorder?.sample(dtReal);
   }
 
-  refreshPrediction(): void {
-    this.predictionAge = 0;
-    if (this.destroyed || (this.landed && this.nodes.length === 0)) {
-      this.prediction = null;
-      return;
-    }
+  /** 发动机（或沉底发动机）正在工作：轨迹时刻在变，需要连续刷新预测。 */
+  private maneuvering(): boolean {
+    return this.ullageT > 0 || this.vessel.parts.some((rp) => rp.thrustNow > 0);
+  }
+
+  /** 预测的起始状态；返回 null 表示此时不需要预测（已损毁、停在地面上、贴地低速）。 */
+  private predictionInput(): { r: Vector3; v: Vector3; t: number; nodes: NodeSpec[]; opts: PredictOptions } | null {
+    if (this.destroyed || (this.landed && this.nodes.length === 0)) return null;
     const V = this.vessel;
     const tel = this.telemetry;
     // 在地表附近低速飞行时轨迹没有意义
-    if (tel && tel.radarAlt < 50 && tel.surfSpeed < 5) {
-      this.prediction = null;
-      return;
-    }
+    if (tel && tel.radarAlt < 50 && tel.surfSpeed < 5) return null;
     // 行星际航行：预测要覆盖数月的日心轨道
     const o = tel.orbit;
     const far = tel.body.id === 'sun' || (tel.body.id !== 'moon' && (o.hyperbolic || o.ap > tel.body.soi * 0.8)) || this.nodes.length > 0;
-    this.prediction = far
-      ? predict(V.r, V.v, this.t, this.nodes, { maxSteps: 4000, eta: 0.02, maxTime: 9e7 })
-      : predict(V.r, V.v, this.t, this.nodes, { maxSteps: 2500, eta: 0.02 });
+    // 远期节点：节点前的滑行段用数值积分跳过，结果在飞船一直滑行、节点时刻不变时可以复用
+    const n0 = this.nodes[0];
+    let jump: JumpCache | undefined;
+    if (n0) {
+      const jc = this.jumpCache;
+      if (!jc || jc.epoch !== this.coastEpoch || jc.nodeT !== n0.t) this.jumpCache = { cache: { state: null }, epoch: this.coastEpoch, nodeT: n0.t };
+      jump = this.jumpCache!.cache;
+    }
+    return {
+      r: V.r.clone(),
+      v: V.v.clone(),
+      t: this.t,
+      // 快照：分片计算期间节点可能被修改
+      nodes: this.nodes.map((n) => ({ t: n.t, dv: n.dv.clone() })),
+      opts: far ? { maxSteps: 4000, eta: 0.02, maxTime: 9e7, jump } : { maxSteps: 2500, eta: 0.02, jump },
+    };
+  }
+
+  /** 状态被外部直接改写（回放、跳转）之后：丢弃进行中的预测与远期节点的跳跃缓存。 */
+  invalidatePrediction(): void {
+    this.nodesVer++;
+    this.coastEpoch++;
+    this.predJob = null;
+    this.jumpCache = null;
+    this.predictionAge = 999;
+  }
+
+  /** 立即（同步）重新计算预测轨迹。 */
+  refreshPrediction(): void {
+    this.predictionAge = 0;
+    this.predJob = null;
+    const inp = this.predictionInput();
+    this.prediction = inp ? predict(inp.r, inp.v, inp.t, inp.nodes, inp.opts) : null;
+  }
+
+  /**
+   * 实时预测：在 budgetMs 毫秒内推进当前的分片计算；算完就换上新结果，下一帧接着从最新状态开始。
+   * 发动机工作或高倍时间加速时连续刷新（通常每一两帧一次）；滑行时轨迹基本不变，每 0.1 s 刷新一次。
+   */
+  pumpPrediction(budgetMs: number): void {
+    if (!this.livePrediction || this.paused) return;
+    const t0 = performance.now();
+    if (!this.predJob) {
+      const busy = this.maneuvering() || this.warpIndex > PHYS_WARP_MAX || (this.autopilot.mode !== 'off' && this.autopilot.mode !== 'node');
+      if (!busy && this.predictionAge < 0.1) return;
+      const inp = this.predictionInput();
+      this.predictionAge = 0;
+      if (!inp) {
+        this.prediction = null;
+        return;
+      }
+      this.predJob = { it: predictSteps(inp.r, inp.v, inp.t, inp.nodes, inp.opts), ver: this.nodesVer };
+    }
+    const job = this.predJob;
+    let res = job.it.next();
+    while (!res.done && performance.now() - t0 < budgetMs) res = job.it.next();
+    if (!res.done) return;
+    this.predJob = null;
+    if (job.ver === this.nodesVer) this.prediction = res.value;
   }
 
   private checkSoi(): void {
@@ -623,8 +751,8 @@ export class FlightSim {
       const h = remaining / n;
       for (let i = 0; i < Math.min(n, 400); i++) this.stepPhysics(h);
     }
-    // 定轨加速时直接对准 SAS 目标
-    if (this.sasOn && this.sasMode !== 'stability') {
+    // 定轨加速时直接对准 SAS（或飞行辅助）的目标，加速结束时已经指向点火方向
+    if ((this.sasOn && this.sasMode !== 'stability') || (this.autopilot.mode !== 'off' && this.autopilot.targetDir)) {
       const d = this.sasTargetDir();
       if (d) {
         const fwd = UP.clone().applyQuaternion(V.q);
@@ -653,6 +781,7 @@ export class FlightSim {
         this.settle = 0;
       } else {
         this.applyLanded();
+        this.coastEpoch++;
         this.t += h;
         V.chuteDeploy = Math.max(0, V.chuteDeploy - h * 0.5);
         return;
@@ -687,18 +816,37 @@ export class FlightSim {
       }
     }
     if (lit) this.emit({ type: 'ignite' });
-    const thrust = V.computeThrust(pressure / 101325, true);
+    let thrust = V.computeThrust(pressure / 101325, true);
 
     const F = new Vector3();
     const tauB = new Vector3();
     const fwd = UP.clone().applyQuaternion(V.q);
+    const ullage = this.ullageT > 0 ? ULLAGE_ACC : 0;
+    // 飞行辅助执行机动：在物理子步内精确关机（最后一个子步按比例缩小推力），不必等到下一帧再判断，
+    // 否则在 ×4 物理加速下一帧就可能多烧零点几 m/s——奔月时这意味着远地点差出几百公里
+    const node = this.nodes[0];
+    if (thrust > 0 && node?.remaining && !node.done && this.autopilot.executingNode) {
+      const along = node.remaining.dot(fwd);
+      const dvStep = (thrust / m + ullage) * h;
+      if (along <= dvStep) {
+        const k = Math.max(0, along - ullage * h) / (dvStep - ullage * h);
+        for (const rp of V.parts) {
+          rp.thrustNow *= k;
+          rp.throttleEff *= k;
+        }
+        thrust *= k;
+        node.done = true;
+        V.throttle = 0;
+      }
+    }
     F.addScaledVector(fwd, thrust);
     // 沉底发动机：小型固体火箭，给上面级一个向前的小加速度
-    if (this.ullageT > 0) {
-      F.addScaledVector(fwd, m * ULLAGE_ACC);
+    if (ullage > 0) {
+      F.addScaledVector(fwd, m * ullage);
       this.ullageT = Math.max(0, this.ullageT - h);
     }
-    this.lastThrustAccel.copy(fwd).multiplyScalar(thrust / m);
+    // 计入沉底发动机：它同样改变速度，机动的剩余 Δv 要扣掉
+    this.lastThrustAccel.copy(fwd).multiplyScalar(thrust / m + ullage);
 
     // ------------------------------------------------ 气动
     const vSurf = surfaceVelocity(body, this.t, V.r, _v3);
@@ -867,6 +1015,7 @@ export class FlightSim {
     const g = gravityAccel(V.r, this.t, new Vector3());
     const nonGrav = F.clone().divideScalar(m);
     this.lastNonGravAcc = nonGrav.length();
+    if (this.lastNonGravAcc > 1e-9) this.coastEpoch++;
     V.v.addScaledVector(g, h).addScaledVector(nonGrav, h);
     V.r.addScaledVector(V.v, h);
 
@@ -1086,7 +1235,15 @@ export class FlightSim {
         return d && d.lengthSq() > 1e-6 ? d.clone().normalize() : null;
       }
       case 'rudder': {
-        const a = this.rudderAngle;
+        // 设定角与实际倾角相差很大（例如直接拖到背面）时，目标只领先实际姿态 RUDDER_LEAD，
+        // 让火箭沿较短的方向在“竖直—正东”平面内转过去，而不是绕一个不确定的轴翻转
+        let a = this.rudderAngle;
+        const fwd = UP.clone().applyQuaternion(V.q);
+        if (Math.abs(fwd.dot(tel.north)) < 0.7) {
+          const cur = Math.atan2(fwd.dot(tel.east), fwd.dot(tel.up));
+          const d = wrapAngle(a - cur);
+          if (Math.abs(d) > RUDDER_LEAD) a = cur + Math.sign(d) * RUDDER_LEAD;
+        }
         return tel.up.clone().multiplyScalar(Math.cos(a)).addScaledVector(tel.east, Math.sin(a)).normalize();
       }
       default:
@@ -1152,7 +1309,23 @@ export class FlightSim {
 
   addNode(n: NodeSpec, replan?: { at: number; target: BodyId } | null): void {
     this.nodes = [{ t: n.t, dv: n.dv.clone(), fixedDv: null, remaining: null, replanAt: replan?.at ?? null, replanTarget: replan?.target }];
+    this.nodesVer++;
     this.predictionAge = 999;
+    this.refreshPrediction();
+  }
+
+  /** 节点的 Δv 或时刻被手动修改：解除锁定，重新预测。 */
+  nodeEdited(): void {
+    const n = this.nodes[0];
+    if (n) {
+      n.fixedDv = null;
+      n.remaining = null;
+      n.target = null;
+      n.burnDir = null;
+      n.frozen = false;
+      n.done = false;
+    }
+    this.nodesVer++;
     this.refreshPrediction();
   }
 
@@ -1171,28 +1344,39 @@ export class FlightSim {
     if (res.node) {
       this.addNode(res.node, res.replanAt != null && res.target ? { at: res.replanAt, target: res.target.id } : null);
       // 正在“加速到节点前”时，改为加速到新的节点之前
-      if (this.autoWarpTo !== null) this.autoWarpTo = Math.min(this.autoWarpTo, res.node.t - this.nodeBurnTime() / 2 - 60);
+      if (this.autoWarpTo !== null) this.autoWarpTo = Math.min(this.autoWarpTo, res.node.t - this.nodeBurnLead() - 60);
       this.emit({ type: 'msg', msg: `已重新精确计算：${res.msg}`, level: 'good' });
     } else this.emit({ type: 'msg', msg: res.msg, level: 'warn' });
   }
 
-  removeNode(): void {
+  /** 删除机动节点；stopAutopilot 为 false 时由飞行辅助自己收尾（显示“机动执行完毕”）。 */
+  removeNode(stopAutopilot = true): void {
     this.nodes = [];
-    if (this.autopilot.mode === 'node') this.autopilot.mode = 'off';
+    this.nodesVer++;
+    if (stopAutopilot && this.autopilot.mode === 'node') this.autopilot.disengage();
     this.predictionAge = 999;
   }
 
-  /** 机动节点的惯性系 Δv（开始执行后为剩余量）。 */
+  /** 机动节点的惯性系 Δv（锁定后为闭环制导给出的剩余量）。 */
   nodeBurnVector(): Vector3 | null {
     const n = this.nodes[0];
     if (!n) return null;
     if (n.remaining) return n.remaining;
     const ns = this.prediction?.nodeState;
-    if (ns) return nodeDvWorld(ns.r, ns.v, ns.t, n.dv, ns.body);
+    if (ns && Math.abs(ns.t - n.t) < 1e-6) return nodeDvWorld(ns.r, ns.v, ns.t, n.dv, ns.body);
     return nodeDvWorld(this.vessel.r, this.vessel.v, this.t, n.dv, this.body);
   }
 
   nodeBurnTime(): number {
+    return this.nodeBurnEstimate(burnTime);
+  }
+
+  /** 应该在节点前多久点火：使 Δv 的加权中心落在节点上（见 burnLead）。 */
+  nodeBurnLead(): number {
+    return this.nodeBurnEstimate(burnLead);
+  }
+
+  private nodeBurnEstimate(f: (dv: number, mass: number, thrust: number, mdot: number) => number): number {
     const n = this.nodes[0];
     if (!n) return 0;
     const dv = this.nodeBurnVector()?.length() ?? 0;
@@ -1202,32 +1386,73 @@ export class FlightSim {
       thrust = V.nextStageThrust();
       mdot = thrust / (320 * G0);
     }
-    return burnTime(dv, V.mass, thrust, mdot);
+    // 无限燃料：质量不变，相当于排气速度无穷大（燃烧时间 = m·Δv/F）
+    if (V.infiniteFuel) mdot = thrust / 1e9;
+    return f(dv, V.mass, thrust, mdot);
   }
 
   private updateNodes(): void {
     const n = this.nodes[0];
     if (!n) return;
     const bt = this.nodeBurnTime();
-    if (!n.remaining && this.t > n.t - bt / 2 - 20) {
-      const dv = this.nodeBurnVector();
-      if (dv) {
-        n.fixedDv = dv.clone();
-        n.remaining = dv.clone();
-      }
-    }
-    if (n.remaining && n.fixedDv) {
-      const done = n.remaining.dot(n.fixedDv) < 0 || n.remaining.length() < 0.2;
-      if (done && this.autopilot.mode !== 'node') {
+    if (!n.remaining && this.t > n.t - this.nodeBurnLead() - NODE_LOCK_LEAD) this.lockNode(n, bt);
+    const byAutopilot = this.autopilot.executingNode;
+    if (n.remaining && n.burnDir && !byAutopilot) {
+      // 手动点火：烧过头或剩余量很小时结束（飞行辅助执行时由它在物理子步内精确关机）
+      if (n.remaining.dot(n.burnDir) < 0 || n.remaining.length() < 0.2) {
         this.emit({ type: 'msg', msg: '机动完成', level: 'good' });
-        this.nodes = [];
-        this.predictionAge = 999;
+        this.removeNode();
+        return;
       }
     }
-    if (this.t > n.t + Math.max(600, bt * 3) && this.autopilot.mode !== 'node') {
-      this.nodes = [];
-      this.predictionAge = 999;
+    if (n.remaining) this.guideNode(n);
+    if (this.t > n.t + Math.max(600, bt * 3) && !byAutopilot) this.removeNode();
+  }
+
+  /**
+   * 锁定节点：从当前状态数值外推到节点时刻（不依赖可能已经过时的轨迹预测），
+   * 求出惯性系 Δv，并生成闭环制导的目标（见 guidance.ts）。
+   */
+  private lockNode(n: ManeuverNode, bt: number): void {
+    const r = this.vessel.r.clone();
+    const v = this.vessel.v.clone();
+    let t = this.t;
+    // 节点已经过去时向后积分（只有引力，时间可逆）
+    for (let guard = 0; Math.abs(n.t - t) > 1e-9 && guard < 20_000; guard++) {
+      const h = Math.sign(n.t - t) * Math.min(Math.abs(n.t - t), adaptiveStep(r, t, 0.004));
+      rk4Step(r, v, t, h);
+      t += h;
     }
+    const body = dominantBody(r, n.t);
+    const dv = nodeDvWorld(r, v, n.t, n.dv, body);
+    const l = dv.length();
+    n.fixedDv = dv.clone();
+    n.remaining = dv.clone();
+    n.burnDir = l > 1e-9 ? dv.clone().divideScalar(l) : this.telemetry.vOrbVec.clone().normalize();
+    n.frozen = false;
+    n.done = false;
+    // 目标点离节点多远：点火开始时飞船还在节点之前，要保证那时到目标点的转移角仍小于 180°
+    const rel = r.clone().sub(bodyPosition(body, n.t, _v1));
+    const vrel = v.clone().sub(bodyVelocity(body, n.t, _v2));
+    const rate = Math.max(rel.clone().cross(vrel).length(), rel.clone().cross(vrel.add(dv)).length()) / rel.lengthSq();
+    const sweep = Math.min((2 * Math.PI) / 3, (165 * Math.PI) / 180 - rate * (this.nodeBurnLead() + 5));
+    n.target = l > 0.05 && sweep > (40 * Math.PI) / 180 ? makeBurnTarget(r, v, n.t, dv, body, sweep) : null;
+    this.guideNode(n);
+  }
+
+  /** 闭环制导：按当前状态重新计算待增速度；临近关机时冻结方向，只按推力积分。 */
+  private guideNode(n: ManeuverNode): void {
+    if (!n.target || n.frozen || n.done || !n.remaining) return;
+    const vg = velocityToGain(n.target, this.vessel.r, this.vessel.v, this.t, _v3);
+    if (!vg) return;
+    const fixed = n.fixedDv ? n.fixedDv.length() : 0;
+    const l = vg.length();
+    // 错过节点太久、兰伯特解已经不合理时，保留原来的积分值
+    if (l > Math.max(2 * fixed, fixed + 100)) return;
+    n.remaining.copy(vg);
+    if (l > 1e-9) (n.burnDir ??= new Vector3()).copy(vg).divideScalar(l);
+    const aMax = this.vessel.maxThrustVac().thrust / this.vessel.mass;
+    if (this.maneuvering() && l < Math.max(0.3, aMax)) n.frozen = true;
   }
 
   // ---------------------------------------------------------------- 遥测

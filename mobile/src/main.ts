@@ -18,6 +18,7 @@ import { bindCanvasGestures, haptic } from './ui/touch';
 const QUALITY_KEY = 'rocket-mobile-quality';
 const VOLUME_KEY = 'rocket-mobile-volume';
 const HAPTIC_KEY = 'rocket-mobile-haptic';
+const INFINITE_FUEL_KEY = 'rocket-mobile-infinite-fuel';
 
 function lsGet(k: string): string | null {
   try {
@@ -66,6 +67,8 @@ class App {
   quality: Quality;
   realTime = 0;
   hapticsOn: boolean;
+  /** 无限燃料模式（保存在本地，下次打开仍然有效） */
+  infiniteFuel: boolean;
   private lastSepSound = -1;
   private wakeLock: WakeLockLike | null = null;
   /** 调试与自动化测试用 */
@@ -79,6 +82,7 @@ class App {
     const vol = parseFloat(lsGet(VOLUME_KEY) ?? '0.7');
     this.sound.volume = isFinite(vol) ? vol : 0.7;
     this.hapticsOn = lsGet(HAPTIC_KEY) !== '0';
+    this.infiniteFuel = lsGet(INFINITE_FUEL_KEY) === '1';
   }
 
   async init(): Promise<void> {
@@ -92,6 +96,8 @@ class App {
       click: () => this.click(),
     });
     this.builderUI.onLaunch = (d, s) => this.startFlight(d, s);
+    this.builderUI.setInfiniteFuel(this.infiniteFuel);
+    this.builderUI.onInfiniteFuel = (on) => this.setInfiniteFuel(on);
     this.builderUI.onHelp = () => this.showHelp();
     this.builderUI.onSettings = () => this.showSettings();
     this.bindInput();
@@ -116,7 +122,9 @@ class App {
     if (this.flight) this.endFlight(false);
     this.builderUI.show(false);
     this.builderScene.controls.enabled = false;
-    const sim = new FlightSim(design, scenario);
+    const sim = new FlightSim(design, scenario, { infiniteFuel: this.infiniteFuel });
+    // 轨迹预测由主循环逐帧推进（见 FlightSim.pumpPrediction）
+    sim.livePrediction = true;
     sim.isWater = (_b, dir) => sampleWater(this.maps, dir);
     const scene = new FlightScene(this.engine, this.maps, sim, this.mapOverlay);
     const hud = new FlightHUD(this.ui, sim, scene, {
@@ -136,7 +144,16 @@ class App {
     } else {
       hud.toast(scenario === 'llo' ? '环月轨道：先“规划 → 降低近月点”，再用“辅助 → 自动着陆”或手动着陆' : '地球轨道练习：点“规划”尝试奔月转移', 'info');
     }
+    if (this.infiniteFuel) hud.toast('∞ 无限燃料：液体燃料不会消耗，固体助推器照常烧完（可在“设置”中关闭）', 'info');
     if (window.innerHeight > window.innerWidth) hud.toast('把手机横过来，视野更开阔', 'info');
+  }
+
+  /** 开关无限燃料：保存设置，同步总装车间，并立即作用于当前飞行。 */
+  setInfiniteFuel(on: boolean): void {
+    this.infiniteFuel = on;
+    lsSet(INFINITE_FUEL_KEY, on ? '1' : '0');
+    this.builderUI.setInfiniteFuel(on);
+    this.flight?.sim.setInfiniteFuel(on);
   }
 
   endFlight(showBuilder = true): void {
@@ -340,6 +357,8 @@ class App {
     this.applyControls(dt);
     sim.paused = !!this.modal;
     sim.update(dt);
+    // 实时轨迹预测：每帧最多花几毫秒，算完立即开始下一次；帧率偏低（低于约 45 帧）时少花一些
+    sim.pumpPrediction(rawDt > 1 / 45 ? 1.2 : 2.5);
     const events = sim.drainEvents();
     for (const e of events) this.onEvent(e.type, e.msg, e.level, e.size);
     // 分离、爆炸等事件也要交给三维场景（生成残骸模型与特效）
@@ -479,6 +498,7 @@ class App {
         h('h2', null, '🌕 任务完成！'),
         h('p', null, '你的航天员登上了月球，并安全返回了地球。这是一次完美的登月任务！'),
         h('p', null, `任务总时长 ${fmtMET(f.sim.met)} · 最大过载 ${f.sim.maxG.toFixed(1)} g`),
+        f.sim.infiniteFuelUsed ? h('p', { style: { color: '#ffd75a' } }, '∞ 本次飞行开启过无限燃料模式') : null,
         h('ul', null, ...MISSIONS.map((m) => h('li', null, `${f.sim.missions.done.has(m.id) ? '✔' : '○'} ${m.title} — ${m.desc}`))),
         h('div', { class: 'actions stack' }, h('button', { class: 'primary', onclick: () => this.closeModal() }, '继续'), h('button', { onclick: () => this.backToBuilder() }, '🔧 返回总装车间')),
       ),
@@ -508,7 +528,7 @@ class App {
           { class: 'keys' },
           ...k('分级', '左下角橙色按钮：点火 / 分离下面级 / 抛离助推器 / 启用降落伞（上方卡片显示下一级的动作，点卡片查看全部分级）'),
           ...k('油门', '左侧滑杆上下拖动；“满”“关”一键全开 / 关闭'),
-          ...k('方向舵', '拖动导航球旁半圆刻度盘上的旋钮，直接设定火箭倾角（0° 竖直，右边向东）；火箭自动转过去并保持'),
+          ...k('方向舵', '拖动导航球旁圆形刻度盘上的旋钮，直接设定火箭倾角（0° 竖直，右边向东，180° 竖直向下，可以转满一圈）；火箭自动转过去并保持'),
           ...k('摇杆', '右下角：上下 = 俯仰（上推低头），左右 = 偏航；⟲ ⟳ 按住滚转'),
           ...k('SAS', '姿态稳定：保持 / 顺行 / 逆行 / 法向 / 径向 / 机动方向'),
           ...k('辅助', '飞行辅助：自动入轨 / 执行机动 / 自动着陆'),
@@ -602,6 +622,34 @@ class App {
         h('p', { class: 'muted small' }, `当前渲染分辨率 ${Math.round(this.engine.pixelRatio * 100)}%（帧率不足时自动降低）。手机发烫或掉帧时请选“流畅”。`),
         h('p', { style: { marginTop: '14px' } }, '音量'),
         vol,
+        h('p', { style: { marginTop: '14px' } }, '∞ 无限燃料'),
+        h(
+          'div',
+          { class: 'actions seg' },
+          h(
+            'button',
+            {
+              class: this.infiniteFuel ? 'on' : '',
+              onclick: () => {
+                this.setInfiniteFuel(true);
+                this.showSettings();
+              },
+            },
+            '开',
+          ),
+          h(
+            'button',
+            {
+              class: this.infiniteFuel ? '' : 'on',
+              onclick: () => {
+                this.setInfiniteFuel(false);
+                this.showSettings();
+              },
+            },
+            '关（正常）',
+          ),
+        ),
+        h('p', { class: 'muted small' }, '液体燃料箱始终是满的，液体发动机不会熄火；固体助推器无法关机，照常烧完。飞行中切换立即生效。'),
         h('div', { class: 'actions' }, hapticBtn, fsBtn),
         h('p', { class: 'muted small' }, standaloneHint()),
         h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => (this.flight ? this.showPause() : this.closeModal()) }, '完成')),

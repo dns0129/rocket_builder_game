@@ -112,6 +112,7 @@ export class FlightRecorder {
     met: false,
     dead: false,
     speed: '',
+    inf: false,
   };
   private bodiesSeen: BodyId[] = [];
   maxAlt = 0;
@@ -373,6 +374,10 @@ export class FlightRecorder {
     if (sim.metStarted && !S.met) {
       S.met = true;
       this.push({ t, k: 'met', t0: t - sim.met });
+    }
+    if (V.infiniteFuel !== S.inf) {
+      S.inf = V.infiniteFuel;
+      this.push({ t, k: 'inf', on: S.inf });
     }
     if (sim.speedMode !== S.speed) {
       S.speed = sim.speedMode;

@@ -246,6 +246,11 @@ export const EARTH_TEXTURE_FILES = {
   water: 'textures/earth/water.png',
   topo: 'textures/earth/topo.png',
 };
+/**
+ * 真实月球贴图（2048×1024 等距柱状投影，北在上、经度 0 在图中央）：
+ * Solar System Scope（CC BY 4.0），基于 NASA LRO 影像。加载失败时退回程序化月面。
+ */
+export const MOON_TEXTURE_FILE = 'textures/planets/moon.jpg';
 /** 水体遮罩中水面为白色。 */
 const WATER_IS_WHITE = true;
 
@@ -304,6 +309,11 @@ ${MOON_TERRAIN_GLSL}
 layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oNormal;
 uniform int uMaxLevel;
+// 真实月球贴图（有则取代程序化颜色）；uRelief 缩放法线起伏（贴图本身已带地形明暗，减弱一些）
+uniform sampler2D uReal;
+uniform float uUseReal;
+uniform float uRelief;
+uniform float uGain;
 
 void main() {
   vec2 uv = gl_FragCoord.xy / uRes;
@@ -315,7 +325,7 @@ void main() {
   float hE = moonTerrain(dirFromLatLon(lat, lon + eps), uMaxLevel).x;
   float hN = moonTerrain(dirFromLatLon(lat + eps, lon), uMaxLevel).x;
   float dist = eps * MOON_R;
-  vec3 n = normalize(vec3(-(hE - t.x) / (dist * max(cos(lat), 0.05)), -(hN - t.x) / dist, 1.0));
+  vec3 n = normalize(vec3(-(hE - t.x) * uRelief / (dist * max(cos(lat), 0.05)), -(hN - t.x) * uRelief / dist, 1.0));
   oNormal = vec4(n * 0.5 + 0.5, 1.0);
   float mare = t.y;
   float hl = 0.5 + 0.07 * gnoise(d * 40.0, 91u) + 0.04 * gnoise(d * 160.0, 93u);
@@ -324,6 +334,7 @@ void main() {
   vec3 col = mix(high, low, mare);
   col += vec3(0.28) * clamp(t.z, 0.0, 1.2);
   col *= 0.92 + 0.08 * smoothstep(-2000.0, 3000.0, t.x);
+  if (uUseReal > 0.5) col = pow(texture(uReal, uv).rgb, vec3(2.2)) * uGain;
   oColor = vec4(srgb(col), clamp(t.x / 8000.0 * 0.5 + 0.5, 0.0, 1.0));
 }
 `;
@@ -366,8 +377,22 @@ export async function bakePlanets(
   quality: 'low' | 'medium' | 'high',
   onProgress: (f: number) => void,
 ): Promise<PlanetMaps & { realEarth: boolean }> {
-  // 进度：前 35% 下载真实地球贴图，其余为 GPU 烘焙
-  const src = await loadEarthSources((f) => onProgress(f * 0.35));
+  // 进度：前 35% 下载真实贴图（地球 4 张、月球 1 张，同时下载），其余为 GPU 烘焙
+  let earthF = 0;
+  let moonF = 0;
+  const dlProgress = () => onProgress(((earthF * 4 + moonF) / 5) * 0.35);
+  const [src, moonSrc] = await Promise.all([
+    loadEarthSources((f) => {
+      earthF = f;
+      dlProgress();
+    }),
+    loadTexture(MOON_TEXTURE_FILE).then((t) => {
+      moonF = 1;
+      dlProgress();
+      if (!t) console.warn(`月球贴图 ${MOON_TEXTURE_FILE} 加载失败，改用程序化生成的月面。`);
+      return t;
+    }),
+  ]);
   const bakeProgress = (f: number) => onProgress(0.35 + f * 0.65);
   const maxTex = renderer.capabilities.maxTextureSize;
   const mw = quality === 'low' ? 1024 : 2048;
@@ -455,7 +480,14 @@ export async function bakePlanets(
       glslVersion: THREE.GLSL3,
       vertexShader: VERT,
       fragmentShader: MOON_FRAG,
-      uniforms: { uRes: { value: new THREE.Vector2(mw, mw / 2) }, uMaxLevel: { value: quality === 'low' ? 3 : 4 } },
+      uniforms: {
+        uRes: { value: new THREE.Vector2(mw, mw / 2) },
+        uMaxLevel: { value: quality === 'low' ? 3 : 4 },
+        uReal: { value: moonSrc },
+        uUseReal: { value: moonSrc ? 1 : 0 },
+        uRelief: { value: moonSrc ? 0.45 : 1 },
+        uGain: { value: 0.8 },
+      },
     }),
   });
 
@@ -505,6 +537,7 @@ export async function bakePlanets(
   for (const j of jobs) j.mat.dispose();
   quad.geometry.dispose();
   if (src) for (const t of Object.values(src)) t.dispose();
+  moonSrc?.dispose();
 
   const [moonColor, moonNormal] = moonRT.textures;
   return { earthColor, earthAux, earthNormal, moonColor, moonNormal, waterMask, waterW: readW, waterH: readH, realEarth: !!src };

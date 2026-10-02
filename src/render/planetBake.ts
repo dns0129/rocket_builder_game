@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { NOISE_GLSL, NOISE_OFFSET } from '../physics/noise';
 import { CRATER_CELL_K, MOON_TERRAIN_GLSL, ROCKY_COMMON_GLSL, TERRAIN, rockyTerrainGLSL } from '../physics/terrain';
-import { EARTH, LAUNCH_SITE, MOON, type BodyId, dirFromLatLon } from '../physics/bodies';
+import { EARTH, LAUNCH_SITE, MARS, MERCURY, MOON, VENUS, type BodyId, dirFromLatLon } from '../physics/bodies';
 
 /**
  * 在 GPU 上一次性烘焙程序化星球贴图（等距柱状投影）。
@@ -249,6 +249,36 @@ export const EARTH_TEXTURE_FILES = {
 /** 水体遮罩中水面为白色。 */
 const WATER_IS_WHITE = true;
 
+/**
+ * 其他天体的真实贴图（4096×2048 等距柱状投影，北在上、经度 0 在图中央，与地球贴图相同）：
+ * Solar System Scope 的星球贴图（CC BY 4.0），基于 NASA 的 LRO、MESSENGER、麦哲伦号、海盗号、卡西尼号等影像。
+ * 某张贴图缺失或加载失败时，该天体退回程序化生成。
+ */
+export const PLANET_TEXTURE_FILES = {
+  moon: 'textures/planets/moon.jpg',
+  mercury: 'textures/planets/mercury.jpg',
+  venus: 'textures/planets/venus_surface.jpg',
+  venusClouds: 'textures/planets/venus_clouds.jpg',
+  mars: 'textures/planets/mars.jpg',
+  jupiter: 'textures/planets/jupiter.jpg',
+  saturn: 'textures/planets/saturn.jpg',
+  sun: 'textures/planets/sun.jpg',
+};
+type PlanetTexKey = keyof typeof PLANET_TEXTURE_FILES;
+type PlanetSources = Partial<Record<PlanetTexKey, THREE.Texture>>;
+
+/**
+ * 真实贴图的微调：sat = 饱和度倍数，gain = 亮度倍数（线性空间），
+ * relief = 程序化法线起伏的强度（贴图本身已带地形明暗，起伏减弱一些，免得两套撞击坑叠在一起显得杂乱）。
+ */
+const REAL_LOOK: Partial<Record<PlanetTexKey, { sat?: number; gain?: number; relief?: number }>> = {
+  // 月球贴图偏亮，压暗一点让月海与高地的反差更清楚
+  moon: { gain: 0.8, relief: 0.45 },
+  mercury: { relief: 0.45 },
+  venus: { relief: 0.7 },
+  mars: { relief: 0.8 },
+};
+
 function loadTexture(url: string): Promise<THREE.Texture | null> {
   return new Promise((resolve) => {
     new THREE.TextureLoader().load(
@@ -289,6 +319,39 @@ async function loadEarthSources(onProgress: (f: number) => void): Promise<EarthS
   }
   return out as EarthSources;
 }
+
+async function loadPlanetSources(onProgress: (f: number) => void): Promise<PlanetSources> {
+  let done = 0;
+  const entries = Object.entries(PLANET_TEXTURE_FILES) as [PlanetTexKey, string][];
+  const out: PlanetSources = {};
+  await Promise.all(
+    entries.map(async ([k, url]) => {
+      const t = await loadTexture(url);
+      onProgress(++done / entries.length);
+      if (t) out[k] = t;
+      else console.warn(`星球贴图 ${url} 加载失败，改用程序化生成。`);
+    }),
+  );
+  return out;
+}
+
+/**
+ * 真实星球贴图：按画质缩放到目标分辨率（mipmap 负责降采样），可选地调整饱和度与亮度（线性空间）。
+ */
+const REAL_COPY_FRAG = /* glsl */ `
+${COMMON}
+uniform sampler2D uSrc;
+uniform float uSat;
+uniform float uGain;
+layout(location = 0) out vec4 oColor;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 lin = pow(texture(uSrc, uv).rgb, vec3(2.2));
+  float l = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+  lin = max(vec3(l) + (lin - vec3(l)) * uSat, 0.0) * uGain;
+  oColor = vec4(srgb(lin), 1.0);
+}
+`;
 
 /** 发射场坐标系旋转矩阵：把发射场方向转到 (1,0,0)，北向转到 (0,1,0)。 */
 function siteRotation(): THREE.Matrix3 {
@@ -382,17 +445,23 @@ void main() {
 
 // ---------------------------------------------------------------- 其他行星
 
-/** 岩质行星（水星、金星表面、火星）：与物理地形相同的撞击坑、低地与火山，再按行星上色。 */
-function rockyFrag(id: BodyId, colorGLSL: string, extraGLSL = ''): string {
+/**
+ * 岩质天体（月球、水星、金星表面、火星）：与物理地形相同的撞击坑、低地与火山，再按行星上色。
+ * colorGLSL 为 null 时只输出法线（颜色来自真实贴图）；uRelief 缩放法线的起伏——
+ * 真实贴图本身已经带有地形明暗，程序化起伏减弱一些，免得两套撞击坑叠在一起显得杂乱。
+ */
+function rockyFrag(id: BodyId, colorGLSL: string | null, extraGLSL = ''): string {
+  const outputs =
+    colorGLSL === null ? 'layout(location = 0) out vec4 oNormal;' : 'layout(location = 0) out vec4 oColor;\nlayout(location = 1) out vec4 oNormal;';
   return /* glsl */ `
 ${COMMON}
 ${ROCKY_COMMON_GLSL}
 ${rockyTerrainGLSL(id, 'terr')}
 ${extraGLSL}
-layout(location = 0) out vec4 oColor;
-layout(location = 1) out vec4 oNormal;
+${outputs}
 uniform int uMaxLevel;
 uniform float uRadius;
+uniform float uRelief;
 void main() {
   vec2 uv = gl_FragCoord.xy / uRes;
   float lon = (uv.x - 0.5) * 2.0 * PI;
@@ -403,11 +472,15 @@ void main() {
   float hE = terr(dirFromLatLon(lat, lon + eps), uMaxLevel).x;
   float hN = terr(dirFromLatLon(lat + eps, lon), uMaxLevel).x;
   float dist = eps * uRadius;
-  vec3 n = normalize(vec3(-(hE - t.x) / (dist * max(cos(lat), 0.05)), -(hN - t.x) / dist, 1.0));
+  vec3 n = normalize(vec3(-(hE - t.x) * uRelief / (dist * max(cos(lat), 0.05)), -(hN - t.x) * uRelief / dist, 1.0));
   oNormal = vec4(n * 0.5 + 0.5, 1.0);
-  vec3 col;
+  ${
+    colorGLSL === null
+      ? ''
+      : `vec3 col;
   ${colorGLSL}
-  oColor = vec4(srgb(col), clamp(t.x / 8000.0 * 0.5 + 0.5, 0.0, 1.0));
+  oColor = vec4(srgb(col), clamp(t.x / 8000.0 * 0.5 + 0.5, 0.0, 1.0));`
+  }
 }
 `;
 }
@@ -734,8 +807,10 @@ export interface PlanetMaps {
   earthNormal: THREE.Texture;
   moonColor: THREE.Texture;
   moonNormal: THREE.Texture;
-  /** 其他行星的贴图（程序化烘焙） */
+  /** 其他天体的贴图（真实贴图或程序化烘焙；太阳只在有真实贴图时才有） */
   bodies: Partial<Record<BodyId, BodyMaps>>;
+  /** 使用了真实贴图的天体 */
+  realBodies: BodyId[];
   /** 土星环的径向密度/颜色（一维） */
   saturnRings: THREE.Texture;
   waterMask: Uint8Array;
@@ -770,9 +845,21 @@ export async function bakePlanets(
   quality: 'low' | 'medium' | 'high',
   onProgress: (f: number) => void,
 ): Promise<PlanetMaps & { realEarth: boolean }> {
-  // 进度：前 35% 下载真实地球贴图，其余为 GPU 烘焙
-  const src = await loadEarthSources((f) => onProgress(f * 0.35));
-  const bakeProgress = (f: number) => onProgress(0.35 + f * 0.65);
+  // 进度：前 45% 下载真实贴图（地球 4 张、其他天体 8 张，同时下载），其余为 GPU 烘焙
+  let earthF = 0;
+  let planetF = 0;
+  const dlProgress = () => onProgress(((earthF * 4 + planetF * 8) / 12) * 0.45);
+  const [src, real] = await Promise.all([
+    loadEarthSources((f) => {
+      earthF = f;
+      dlProgress();
+    }),
+    loadPlanetSources((f) => {
+      planetF = f;
+      dlProgress();
+    }),
+  ]);
+  const bakeProgress = (f: number) => onProgress(0.45 + f * 0.55);
   const maxTex = renderer.capabilities.maxTextureSize;
   const mw = Math.min(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096, maxTex);
   const scene = new THREE.Scene();
@@ -782,7 +869,8 @@ export async function bakePlanets(
   scene.add(quad);
   const siteRot = { value: siteRotation() };
 
-  const jobs: { rt: THREE.WebGLRenderTarget; mat: THREE.RawShaderMaterial; w: number; h: number }[] = [];
+  // strips：分几条带渲染（只是复制贴图的任务很轻，少分几条）
+  const jobs: { rt: THREE.WebGLRenderTarget; mat: THREE.RawShaderMaterial; w: number; h: number; strips?: number }[] = [];
   let earthColor: THREE.Texture;
   let earthAux: THREE.Texture;
   let earthNormal: THREE.Texture;
@@ -850,15 +938,18 @@ export async function bakePlanets(
     [earthColor, earthAux, earthNormal] = earthRT.textures;
     readSource = earthColor;
   }
-  // ---- 其他行星
-  // 分辨率：低画质 1024，中 2048，高画质的火星、月球与气态巨行星 4096（4096 受显卡上限约束）
+  // ---- 其他天体：颜色优先取自真实贴图；岩质天体的法线仍由程序化地形烘焙（与碰撞用的地形一致）
+  // 分辨率：低画质 1024，中 2048，高画质 4096（受显卡上限约束）；没有真实贴图时水星、金星的程序化贴图最高 2048
   const cap = (w: number) => Math.min(w, maxTex);
   const pw = cap(quality === 'low' ? 1024 : 2048);
   const marsW = cap(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096);
   const gasW = cap(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096);
+  const realW = cap(quality === 'low' ? 1024 : quality === 'medium' ? 2048 : 4096);
   const bodies: Partial<Record<BodyId, BodyMaps>> = {};
-  const rockyJob = (id: BodyId, w: number, color: string, radius: number, extra = '') => {
-    const rt = makeTarget(w, w / 2, 2);
+  const realBodies: BodyId[] = [];
+  /** color 为 null 时只烘焙法线 */
+  const rockyJob = (id: BodyId, w: number, color: string | null, radius: number, extra = '', relief = 1): THREE.Texture[] => {
+    const rt = makeTarget(w, w / 2, color === null ? 1 : 2);
     jobs.push({
       rt,
       w,
@@ -867,10 +958,15 @@ export async function bakePlanets(
         glslVersion: THREE.GLSL3,
         vertexShader: VERT,
         fragmentShader: rockyFrag(id, color, extra),
-        uniforms: { uRes: { value: new THREE.Vector2(w, w / 2) }, uMaxLevel: { value: BAKE_CRATER_LEVEL }, uRadius: { value: radius } },
+        uniforms: {
+          uRes: { value: new THREE.Vector2(w, w / 2) },
+          uMaxLevel: { value: BAKE_CRATER_LEVEL },
+          uRadius: { value: radius },
+          uRelief: { value: relief },
+        },
       }),
     });
-    bodies[id] = { color: rt.textures[0], normal: rt.textures[1] };
+    return rt.textures;
   };
   const colorJob = (w: number, frag: string): THREE.Texture => {
     const rt = makeTarget(w, w / 2, 1);
@@ -882,76 +978,113 @@ export async function bakePlanets(
     });
     return rt.textures[0];
   };
-  rockyJob('mercury', pw, MERCURY_COLOR, 243_970, RAYS_GLSL);
-  rockyJob('venus', pw, VENUS_SURFACE_COLOR, 605_180);
-  bodies.venus!.clouds = colorJob(pw, VENUS_CLOUD_FRAG);
-  rockyJob('mars', marsW, MARS_COLOR, 338_950);
-  bodies.jupiter = {
-    color: colorJob(
-      gasW,
-      gasFrag({
-        seed: 701,
-        zone: 'vec3(0.96, 0.92, 0.84)',
-        belt: 'vec3(0.64, 0.43, 0.28)',
-        beltDark: 'vec3(0.44, 0.26, 0.16)',
-        accent: 'vec3(0.5, 0.52, 0.6)',
-        polar: 'vec3(0.62, 0.61, 0.6)',
-        bandFreq: 15,
-        turb: 0.06,
-        redSpot: true,
-        hexagon: false,
-        ovals: [
-          [-0.58, 9, 0.022, 0.8],
-          [0.36, 7, 0.016, 0.5],
-          [-0.75, 6, 0.02, 0.5],
-          [0.62, 8, 0.015, 0.45],
-        ],
+  const copyJob = (key: PlanetTexKey, source: THREE.Texture): THREE.Texture => {
+    const look = REAL_LOOK[key] ?? {};
+    const rt = makeTarget(realW, realW / 2, 1);
+    jobs.push({
+      rt,
+      w: realW,
+      h: realW / 2,
+      strips: 2,
+      mat: new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: VERT,
+        fragmentShader: REAL_COPY_FRAG,
+        uniforms: {
+          uRes: { value: new THREE.Vector2(realW, realW / 2) },
+          uSrc: { value: source },
+          uSat: { value: look.sat ?? 1 },
+          uGain: { value: look.gain ?? 1 },
+        },
       }),
-    ),
+    });
+    return rt.textures[0];
   };
-  bodies.saturn = {
-    color: colorJob(
-      gasW,
-      gasFrag({
-        seed: 733,
-        zone: 'vec3(0.93, 0.86, 0.66)',
-        belt: 'vec3(0.82, 0.71, 0.5)',
-        beltDark: 'vec3(0.72, 0.6, 0.41)',
-        accent: 'vec3(0.86, 0.8, 0.62)',
-        polar: 'vec3(0.66, 0.68, 0.66)',
-        bandFreq: 19,
-        turb: 0.025,
-        redSpot: false,
-        hexagon: true,
-        ovals: [[0.7, 5, 0.014, 0.35]],
+  /** 岩质天体：有真实贴图时颜色取自贴图、法线单独烘焙；否则颜色与法线都程序化烘焙 */
+  const rocky = (id: 'moon' | 'mercury' | 'venus' | 'mars', w: number, radius: number, procedural: () => THREE.Texture[]) => {
+    const source = real[id];
+    if (source) {
+      const [normal] = rockyJob(id, w, null, radius, '', REAL_LOOK[id]?.relief ?? 1);
+      bodies[id] = { color: copyJob(id, source), normal };
+      realBodies.push(id);
+    } else {
+      const [color, normal] = procedural();
+      bodies[id] = { color, normal };
+    }
+  };
+  const gas = (id: 'jupiter' | 'saturn', look: GasLook) => {
+    const source = real[id];
+    bodies[id] = { color: source ? copyJob(id, source) : colorJob(gasW, gasFrag(look)) };
+    if (source) realBodies.push(id);
+  };
+  rocky('mercury', pw, MERCURY.radius, () => rockyJob('mercury', pw, MERCURY_COLOR, MERCURY.radius, RAYS_GLSL));
+  rocky('venus', pw, VENUS.radius, () => rockyJob('venus', pw, VENUS_SURFACE_COLOR, VENUS.radius));
+  bodies.venus!.clouds = real.venusClouds ? copyJob('venusClouds', real.venusClouds) : colorJob(pw, VENUS_CLOUD_FRAG);
+  rocky('mars', marsW, MARS.radius, () => rockyJob('mars', marsW, MARS_COLOR, MARS.radius));
+  gas('jupiter', {
+    seed: 701,
+    zone: 'vec3(0.96, 0.92, 0.84)',
+    belt: 'vec3(0.64, 0.43, 0.28)',
+    beltDark: 'vec3(0.44, 0.26, 0.16)',
+    accent: 'vec3(0.5, 0.52, 0.6)',
+    polar: 'vec3(0.62, 0.61, 0.6)',
+    bandFreq: 15,
+    turb: 0.06,
+    redSpot: true,
+    hexagon: false,
+    ovals: [
+      [-0.58, 9, 0.022, 0.8],
+      [0.36, 7, 0.016, 0.5],
+      [-0.75, 6, 0.02, 0.5],
+      [0.62, 8, 0.015, 0.45],
+    ],
+  });
+  gas('saturn', {
+    seed: 733,
+    zone: 'vec3(0.93, 0.86, 0.66)',
+    belt: 'vec3(0.82, 0.71, 0.5)',
+    beltDark: 'vec3(0.72, 0.6, 0.41)',
+    accent: 'vec3(0.86, 0.8, 0.62)',
+    polar: 'vec3(0.66, 0.68, 0.66)',
+    bandFreq: 19,
+    turb: 0.025,
+    redSpot: false,
+    hexagon: true,
+    ovals: [[0.7, 5, 0.014, 0.35]],
+  });
+  // 太阳只在有真实贴图时才有贴图（否则米粒组织完全由着色器计算）
+  if (real.sun) {
+    bodies.sun = { color: copyJob('sun', real.sun) };
+    realBodies.push('sun');
+  }
+  rocky('moon', mw, MOON.radius, () => {
+    const moonRT = makeTarget(mw, mw / 2, 2);
+    jobs.push({
+      rt: moonRT,
+      w: mw,
+      h: mw / 2,
+      mat: new THREE.RawShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: VERT,
+        fragmentShader: MOON_FRAG,
+        uniforms: { uRes: { value: new THREE.Vector2(mw, mw / 2) }, uMaxLevel: { value: BAKE_CRATER_LEVEL } },
       }),
-    ),
-  };
-
-  const moonRT = makeTarget(mw, mw / 2, 2);
-  jobs.push({
-    rt: moonRT,
-    w: mw,
-    h: mw / 2,
-    mat: new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      vertexShader: VERT,
-      fragmentShader: MOON_FRAG,
-      uniforms: { uRes: { value: new THREE.Vector2(mw, mw / 2) }, uMaxLevel: { value: BAKE_CRATER_LEVEL } },
-    }),
+    });
+    return moonRT.textures;
   });
 
   const prevTarget = renderer.getRenderTarget();
   const prevAuto = renderer.autoClear;
   renderer.autoClear = false;
   const strips = quality === 'low' ? 4 : 16;
-  const total = jobs.length * strips;
+  const total = jobs.reduce((n, j) => n + (j.strips ?? strips), 0);
   let done = 0;
   for (const job of jobs) {
     quad.material = job.mat;
-    for (let s = 0; s < strips; s++) {
-      const y0 = Math.floor((job.h * s) / strips);
-      const y1 = Math.floor((job.h * (s + 1)) / strips);
+    const n = job.strips ?? strips;
+    for (let s = 0; s < n; s++) {
+      const y0 = Math.floor((job.h * s) / n);
+      const y1 = Math.floor((job.h * (s + 1)) / n);
       renderer.setRenderTarget(job.rt);
       job.rt.scissor.set(0, y0, job.w, y1 - y0);
       job.rt.scissorTest = true;
@@ -987,10 +1120,24 @@ export async function bakePlanets(
   for (const j of jobs) j.mat.dispose();
   quad.geometry.dispose();
   if (src) for (const t of Object.values(src)) t.dispose();
+  for (const t of Object.values(real)) t?.dispose();
 
-  const [moonColor, moonNormal] = moonRT.textures;
-  bodies.moon = { color: moonColor, normal: moonNormal };
-  return { earthColor, earthAux, earthNormal, moonColor, moonNormal, bodies, saturnRings: saturnRingTexture(), waterMask, waterW: readW, waterH: readH, realEarth: !!src };
+  const moonColor = bodies.moon!.color;
+  const moonNormal = bodies.moon!.normal!;
+  return {
+    earthColor,
+    earthAux,
+    earthNormal,
+    moonColor,
+    moonNormal,
+    bodies,
+    realBodies,
+    saturnRings: saturnRingTexture(),
+    waterMask,
+    waterW: readW,
+    waterH: readH,
+    realEarth: !!src,
+  };
 }
 
 export function sampleWater(maps: PlanetMaps, dir: THREE.Vector3): boolean {

@@ -78,6 +78,16 @@ export class ComputerPilot {
     this.sim.addNode(res.node, replan?.at != null && replan.target ? { at: replan.at, target: replan.target.id } : null);
   }
 
+  /** 中途修正：轨道已经足够准确时规划器不给节点，直接跳过。 */
+  correct(res: SolveResult, what: string, lead = 20): void {
+    if (!res.node) {
+      this.say(`${what}：${res.msg}`);
+      return;
+    }
+    this.plan(res, what);
+    this.execNode(what, lead);
+  }
+
   /** 加速到节点前，然后“执行机动”（飞行辅助自动对准、点火、关机）。 */
   execNode(what: string, lead = 60): void {
     const sim = this.sim;
@@ -151,8 +161,7 @@ function flyMoon(p: ComputerPilot): void {
   p.say(`奔月途中：预计近月点 ${fmtDist((sim.prediction?.moonMinDist ?? 0) - MOON.radius)}`);
   const tc = sim.t + 20_000;
   p.coast(8, () => sim.t > tc);
-  p.plan(solveCorrection(p.state(), 'moon', 40_000, 60), '修正近月点');
-  p.execNode('中途修正', 20);
+  p.correct(solveCorrection(p.state(), 'moon', 40_000, 60), '修正近月点');
   p.say('滑行进入月球引力影响球');
   p.coast(9, () => sim.telemetry.body.id === 'moon');
   p.capture(MOON);
@@ -171,8 +180,7 @@ function flyMoon(p: ComputerPilot): void {
   p.execNode('月地转移入射');
   p.say('飞出月球影响球，返回地球');
   p.coast(8, () => sim.telemetry.body.id === 'earth', 200);
-  p.plan(solveCorrection(p.state(), 'earth', 35_000, 90), '修正再入角');
-  p.execNode('再入走廊修正', 30);
+  p.correct(solveCorrection(p.state(), 'earth', 35_000, 90), '修正再入角', 30);
   p.say('滑行返回地球，准备再入');
   p.coast(9, () => sim.telemetry.body.id === 'earth' && sim.telemetry.alt < 200_000);
   p.say('分离着陆级，只留指令舱；SAS 逆行：隔热罩朝前再入大气层');
@@ -208,11 +216,7 @@ function interplanetary(p: ComputerPilot, target: Body): void {
   p.say('巡航中：飞出地球影响球');
   const t1 = sim.t + 5 * 86_400;
   p.coast(10, () => sim.t > t1);
-  const c1 = solvePlanetCorrection(p.state(), target);
-  if (c1.node) {
-    p.plan(c1, '中途修正');
-    p.execNode('第一次中途修正', 20);
-  } else p.say(c1.msg);
+  p.correct(solvePlanetCorrection(p.state(), target), '第一次中途修正');
   // 抵达前几天再修正一次
   sim.refreshPrediction();
   const arrive = sim.prediction?.minDist[target.id]?.t ?? sim.t;
@@ -220,16 +224,15 @@ function interplanetary(p: ComputerPilot, target: Body): void {
   if (arrive - lead > sim.t) {
     p.say(`日心巡航：约 ${fmtTime(arrive - sim.t)} 后抵达${target.name}`);
     p.coast(10, () => sim.t > arrive - lead);
-    const c2 = solvePlanetCorrection(p.state(), target);
-    if (c2.node) {
-      p.plan(c2, '中途修正');
-      p.execNode('第二次中途修正', 20);
-    } else p.say(c2.msg);
+    p.correct(solvePlanetCorrection(p.state(), target), '第二次中途修正');
   }
   p.say(`滑行进入${target.name}引力影响球`);
   p.coast(10, () => sim.telemetry.body === target, 30_000);
-  const o = sim.telemetry.orbit;
-  p.say(`进入${target.name}影响球：近${target.apsisChar}点 ${fmtDist(o.peAlt)}`);
+  // 影响球很大时（木星）太阳摄动明显，用完整预测的最近距离而不是瞬时二体轨道
+  sim.refreshPrediction();
+  const close = sim.prediction?.minDist[target.id];
+  const pe = close ? close.dist - target.radius : sim.telemetry.orbit.peAlt;
+  p.say(`进入${target.name}影响球：预计近${target.apsisChar}点 ${fmtDist(pe)}`);
 }
 
 function flyMars(p: ComputerPilot, windowT: number): void {

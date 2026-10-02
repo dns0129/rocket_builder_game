@@ -1,10 +1,10 @@
 /*
  * 离线缓存（Service Worker）：添加到主屏幕后可以在没有网络时游玩。
  * - 页面导航：网络优先（有新版本时立即生效），离线时用缓存；
- * - 带哈希的脚本 / 样式、地球贴图、图标：缓存优先。
+ * - 带哈希的脚本 / 样式、地球与月球贴图、图标：缓存优先。
  * 更换贴图等非哈希资源时请修改 CACHE 的版本号。
  */
-const CACHE = 'rocket-mobile-v1';
+const CACHE = 'rocket-mobile-v2';
 const CORE = [
   './',
   './manifest.webmanifest',
@@ -16,6 +16,7 @@ const CORE = [
   './textures/earth/night.jpg',
   './textures/earth/water.png',
   './textures/earth/topo.png',
+  './textures/planets/moon.jpg',
 ];
 
 self.addEventListener('install', (event) => {

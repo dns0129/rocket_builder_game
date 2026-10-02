@@ -2,7 +2,7 @@ import { Vector3 } from 'three';
 import { EARTH, MOON, MOON_ORBIT, type Body, bodyPosition, bodyVelocity, dominantBody, moonPosition, moonVelocity } from '../physics/bodies';
 import { adaptiveStep, rk4Step } from '../physics/integrate';
 import { computeOrbit, visViva } from '../physics/orbit';
-import { predict, type NodeSpec } from './predictor';
+import { predict, virtualPeAlt, type NodeSpec, type PredEvent } from './predictor';
 
 export interface StateVec {
   r: Vector3;
@@ -309,86 +309,113 @@ export function solveReturn(s: StateVec, targetAlt = 35_000): SolveResult {
     }
   }
 
-  // ---- 3. 三体精修：点火时刻、顺行 Δv、法向 Δv
-  const cost = (dtb: number, dv: number, dn: number) => {
-    const p = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(dv, dn, 0) }], { maxSteps: 2000, eta: 0.03, maxTime: lead + dtb + (5 * 86400) / 3.16 });
-    if (p.impact && p.impact.body.id === 'moon') return 5e7;
-    let c: number;
-    if (p.earthPeAfterMoon) {
-      c = Math.abs(p.earthPeAfterMoon.alt - targetAlt);
-    } else {
-      // 尚未到达近地点（或直接撞地）：用飞出月球影响球时的二体近地点作为连续代价
-      const ex = p.events.find((e) => e.type === 'soiExit' && e.afterNode && e.vel);
-      if (!ex || !ex.vel) return 4e7 + Math.abs(dv - dvEst) * 1e4;
-      c = Math.abs(computeOrbit(ex.pos, ex.vel, EARTH).pe - rpE);
-    }
-    return c + Math.abs(dn) * 30;
+  // ---- 3. 三体精修
+  // 能命中再入走廊的（点火时刻, Δv）有一整族：点火早一点或晚一点，多烧一点也能把近地点压到目标高度。
+  // 对每个点火时刻，用割线法求出使近地点正好在目标高度的顺行 Δv；再在点火时刻上找 Δv 最小的那个。
+  // （直接在二维里做模式搜索容易卡在一条斜着的窄谷里，多花几十 m/s。）
+  // 返回地球约需 1.6 天：预测到第一个地球近地点为止，最长约 4.6 天（太短的话有些几何下还没到近地点就截止了）
+  const untilEarthPe = (e: PredEvent) => e.type === 'pe' && e.afterNode && e.body.id === 'earth';
+  const horizon = 4e5;
+  /** 近地点高度与目标之差（m）；撞月等无效方案返回 null */
+  const peErr = (dtb: number, dv: number, dn: number): number | null => {
+    const p = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(dv, dn, 0) }], { maxSteps: 3000, eta: 0.03, maxTime: lead + dtb + horizon, until: untilEarthPe });
+    if (p.impact && p.impact.body.id === 'moon') return null;
+    if (p.earthPeAfterMoon) return p.earthPeAfterMoon.alt - targetAlt;
+    // 还没到近地点就撞上了：用撞击时刻的二体近地点（已包含途中所有摄动）衡量差多少
+    if (p.impact && p.impact.body.id === 'earth' && p.impact.afterNode) return virtualPeAlt(p.impact) - targetAlt;
+    // 预测截止前还没到近地点：用飞出月球影响球时的二体近地点近似
+    const ex = p.events.find((e) => e.type === 'soiExit' && e.afterNode && e.vel);
+    return ex && ex.vel ? computeOrbit(ex.pos, ex.vel, EARTH).pe - rpE : null;
   };
+  /** 给定点火时刻（与法向分量），求命中目标近地点的顺行 Δv */
+  const solveDv = (dtb: number, dn: number, dv0: number): { dv: number; err: number } | null => {
+    let a = dv0;
+    let fa = peErr(dtb, a, dn);
+    if (fa === null) return null;
+    // 顺行 Δv 越大，相对地球越“停得住”，近地点越低
+    let b = dv0 + (fa > 0 ? 6 : -6);
+    let fb = peErr(dtb, b, dn);
+    if (fb === null) return null;
+    for (let i = 0; i < 14 && Math.abs(fb) > 30; i++) {
+      const slope = (fb - fa) / (b - a);
+      if (!isFinite(slope) || slope === 0) break;
+      const c = Math.max(b - 60, Math.min(b + 60, b - fb / slope));
+      a = b;
+      fa = fb;
+      b = c;
+      const fc = peErr(dtb, b, dn);
+      if (fc === null) return null;
+      fb = fc;
+    }
+    return { dv: b, err: Math.abs(fb) };
+  };
+  // 窗口就在眼前时没有向前调整的余地：改用下一圈的同一位置
+  if (lead < T / 4 + 30) lead += T;
   let bT = 0;
   let bDv = dvEst;
   let bN = 0;
-  let best = Infinity;
-  for (const dT of [-T / 8, -T / 16, 0, T / 16, T / 8]) {
-    if (lead + dT < 20) continue;
-    for (const dD of [-30, 0, 30, 80]) {
-      for (const dN of [-60, 0, 60]) {
-        const c = cost(dT, dvEst + dD, dN);
-        if (c < best) {
-          best = c;
-          bT = dT;
-          bDv = dvEst + dD;
-          bN = dN;
-        }
-      }
+  let bErr = Infinity;
+  const consider = (dtb: number, r: { dv: number; err: number } | null) => {
+    if (!r) return Infinity;
+    // 先保证命中，再比 Δv
+    const score = Math.abs(r.dv) + Math.max(0, r.err - 2_000) * 0.05;
+    const bScore = Math.abs(bDv) + Math.max(0, bErr - 2_000) * 0.05;
+    if (score < bScore || !isFinite(bErr)) {
+      bT = dtb;
+      bDv = r.dv;
+      bErr = r.err;
+    }
+    return score;
+  };
+  const span = T / 24;
+  for (let k = -6; k <= 6; k++) consider(k * span, solveDv(k * span, 0, dvEst));
+  // 黄金分割细化点火时刻
+  let lo = bT - span;
+  let hi = bT + span;
+  const gr = (Math.sqrt(5) - 1) / 2;
+  const evalAt = (x: number) => {
+    const r = solveDv(x, 0, bDv);
+    const sc = consider(x, r);
+    return sc;
+  };
+  let x1 = hi - gr * (hi - lo);
+  let x2 = lo + gr * (hi - lo);
+  let f1 = evalAt(x1);
+  let f2 = evalAt(x2);
+  for (let i = 0; i < 9; i++) {
+    if (f1 < f2) {
+      hi = x2;
+      x2 = x1;
+      f2 = f1;
+      x1 = hi - gr * (hi - lo);
+      f1 = evalAt(x1);
+    } else {
+      lo = x1;
+      x1 = x2;
+      f1 = f2;
+      x2 = lo + gr * (hi - lo);
+      f2 = evalAt(x2);
     }
   }
-  let sT = T / 32;
-  let sDv = 16;
-  let sN = 24;
-  for (let iter = 0; iter < 9; iter++) {
-    let improved = true;
-    let guard = 0;
-    while (improved && guard++ < 30) {
-      improved = false;
-      for (const [dT, dD, dN] of [
-        [sT, 0, 0],
-        [-sT, 0, 0],
-        [0, sDv, 0],
-        [0, -sDv, 0],
-        [sT, sDv, 0],
-        [-sT, -sDv, 0],
-        [sT, -sDv, 0],
-        [-sT, sDv, 0],
-        [0, 0, sN],
-        [0, 0, -sN],
-      ]) {
-        const nt = bT + dT;
-        if (lead + nt < 20) continue;
-        const c = cost(nt, bDv + dD, bN + dN);
-        if (c < best) {
-          best = c;
-          bT = nt;
-          bDv += dD;
-          bN += dN;
-          improved = true;
-        }
-      }
-    }
-    sT /= 2.5;
-    sDv /= 2.5;
-    sN /= 2.5;
+  // 收尾：在最终点火时刻把近地点再对准一些
+  const fin = solveDv(bT, bN, bDv);
+  if (fin && fin.err < bErr) {
+    bDv = fin.dv;
+    bErr = fin.err;
   }
   const nodeT = t + lead + bT;
-  const miss = best - Math.abs(bN) * 30;
   const dvTot = Math.hypot(bDv, bN);
-  const ok = miss < 30_000 && dvTot < dvEst + 300;
   const wait = nodeT - s.t;
   const waitTxt = wait > 1.5 * T ? `，返回窗口在 ${fmtWait(wait)} 后（可用时间加速）` : '';
+  // 用更精细的积分核对结果，报告实际预计的再入近地点（而不是目标值）
+  const check = predict(r1, v1, t, [{ t: nodeT, dv: new Vector3(bDv, bN, 0) }], { maxSteps: 12000, eta: 0.01, maxTime: lead + bT + horizon, until: untilEarthPe });
+  const peEv = check.earthPeAfterMoon ? check.earthPeAfterMoon.alt : check.impact && check.impact.body.id === 'earth' ? virtualPeAlt(check.impact) : null;
+  const ok = peEv !== null && Math.abs(peEv - targetAlt) < 15_000 && dvTot < dvEst + 300;
   return {
     node: { t: nodeT, dv: new Vector3(bDv, bN, 0) },
     msg: ok
-      ? `返回地球：Δv ${dvTot.toFixed(0)} m/s，再入近地点约 ${(targetAlt / 1000).toFixed(0)} km${waitTxt}`
-      : `未找到理想返回轨道，已给出近似方案，请手动微调${waitTxt}。`,
+      ? `返回地球：Δv ${dvTot.toFixed(0)} m/s，预计再入近地点 ${(peEv! / 1000).toFixed(0)} km${waitTxt}`
+      : `未找到理想返回轨道，已给出近似方案（预计近地点 ${peEv === null ? '—' : `${(peEv / 1000).toFixed(0)} km`}），途中请用“修正再入角”${waitTxt}。`,
   };
 }
 
@@ -398,8 +425,9 @@ export function solveReturn(s: StateVec, targetAlt = 35_000): SolveResult {
  */
 export function solveCorrection(s: StateVec, target: 'moon' | 'earth', targetAlt: number, delay = 120): SolveResult {
   const tb = s.t + delay;
+  const until = target === 'earth' ? (e: PredEvent) => e.type === 'pe' && e.afterNode && e.body.id === 'earth' : undefined;
   const cost = (dv: Vector3) => {
-    const p = predict(s.r, s.v, s.t, [{ t: tb, dv }], { maxSteps: 1800, eta: 0.03, maxTime: delay + 6 * 86400 / 3.16 });
+    const p = predict(s.r, s.v, s.t, [{ t: tb, dv }], { maxSteps: 2500, eta: 0.03, maxTime: delay + 4e5, until });
     let c: number;
     if (target === 'moon') {
       c = Math.abs(p.moonMinDist - (MOON.radius + targetAlt));
@@ -408,7 +436,7 @@ export function solveCorrection(s: StateVec, target: 'moon' | 'earth', targetAlt
       const pe = p.events.find((e) => e.afterNode && e.type === 'pe' && e.body.id === 'earth');
       const imp = p.impact && p.impact.body.id === 'earth' ? p.impact : null;
       if (pe) c = Math.abs(pe.alt - targetAlt);
-      else if (imp) c = targetAlt + 50_000; // 直接撞击：说明近地点过低
+      else if (imp) c = Math.abs(virtualPeAlt(imp) - targetAlt); // 直接撞击：近地点在地下多深
       else c = 5e7;
       if (p.impact && p.impact.body.id === 'moon') c += 5e7;
     }
@@ -452,4 +480,92 @@ export function burnTime(dv: number, mass: number, thrust: number, mdot: number)
   if (thrust <= 0 || mdot <= 0) return Infinity;
   const ve = thrust / mdot;
   return ((mass * ve) / thrust) * (1 - Math.exp(-Math.abs(dv) / ve));
+}
+
+/**
+ * 从点火到“Δv 加权中心”的时间：在这个时刻之前点火，有限推力烧完后的位置与瞬时机动完全一致。
+ * 质量越烧越轻、加速度越来越大，所以它比燃烧时间的一半略长（奔月时约晚 0.7 s，对应近千米的位置偏差）。
+ */
+export function burnLead(dv: number, mass: number, thrust: number, mdot: number): number {
+  if (thrust <= 0 || mdot <= 0) return Infinity;
+  const ve = thrust / mdot;
+  const L = Math.abs(dv) / ve;
+  if (L <= 0) return 0;
+  const U = -Math.expm1(-L);
+  return ((mass * ve) / thrust) * (1 - U / L);
+}
+
+// ================================================================ 兰伯特问题（闭环制导用）
+
+/** Stumpff 函数 C(z)、S(z)。 */
+function stumpffC(z: number): number {
+  if (z > 1e-6) return (1 - Math.cos(Math.sqrt(z))) / z;
+  if (z < -1e-6) return (Math.cosh(Math.sqrt(-z)) - 1) / -z;
+  return 1 / 2 - z / 24 + (z * z) / 720;
+}
+
+function stumpffS(z: number): number {
+  if (z > 1e-6) {
+    const s = Math.sqrt(z);
+    return (s - Math.sin(s)) / (s * s * s);
+  }
+  if (z < -1e-6) {
+    const s = Math.sqrt(-z);
+    return (Math.sinh(s) - s) / (s * s * s);
+  }
+  return 1 / 6 - z / 120 + (z * z) / 5040;
+}
+
+const Y_AXIS = new Vector3(0, 1, 0);
+
+/**
+ * 兰伯特问题（普适变量法，单圈、顺行）：已知两点位置与飞行时间，求两端速度。
+ * 顺行指角动量与 hRef 同向（默认 +Y，即与行星公转方向一致）。
+ */
+export function lambert(r1: Vector3, r2: Vector3, tof: number, mu: number, hRef: Vector3 = Y_AXIS): { v1: Vector3; v2: Vector3 } | null {
+  if (!(tof > 0)) return null;
+  const r1n = r1.length();
+  const r2n = r2.length();
+  const cosD = Math.max(-1, Math.min(1, r1.dot(r2) / (r1n * r2n)));
+  let dth = Math.acos(cosD);
+  if (new Vector3().crossVectors(r1, r2).dot(hRef) < 0) dth = 2 * Math.PI - dth;
+  const A = Math.sin(dth) * Math.sqrt((r1n * r2n) / (1 - cosD));
+  if (!isFinite(A) || Math.abs(A) < 1e-9) return null;
+  const y = (z: number) => r1n + r2n + (A * (z * stumpffS(z) - 1)) / Math.sqrt(stumpffC(z));
+  const F = (z: number) => {
+    const yz = y(z);
+    if (yz < 0) return -Infinity;
+    return Math.pow(yz / stumpffC(z), 1.5) * stumpffS(z) + A * Math.sqrt(yz) - Math.sqrt(mu) * tof;
+  };
+  // F(z) 随 z 单调递增：先找到 y>0 的下界，再二分
+  let lo = -4 * Math.PI * Math.PI;
+  // 飞行时间很短的双曲线弧（例如逃逸点火）需要更小的 z
+  for (let k = 0; k < 40 && y(lo) >= 0 && F(lo) > 0 && lo > -1e5; k++) lo *= 2;
+  if (y(lo) < 0) {
+    // y(0) ≥ 0（转移角小于 180°），在 [lo, 0] 内二分出 y = 0 的边界
+    let a = lo;
+    let b = 0;
+    if (y(b) < 0) return null;
+    for (let i = 0; i < 60; i++) {
+      const m = (a + b) / 2;
+      if (y(m) < 0) a = m;
+      else b = m;
+    }
+    lo = b;
+  }
+  let hi = 4 * Math.PI * Math.PI - 1e-6;
+  if (!(F(lo) < 0) || !(F(hi) > 0)) return null;
+  for (let i = 0; i < 90; i++) {
+    const mid = (lo + hi) / 2;
+    if (F(mid) > 0) hi = mid;
+    else lo = mid;
+  }
+  const z = (lo + hi) / 2;
+  const yz = y(z);
+  const f = 1 - yz / r1n;
+  const g = A * Math.sqrt(yz / mu);
+  const gd = 1 - yz / r2n;
+  const v1 = r2.clone().addScaledVector(r1, -f).divideScalar(g);
+  const v2 = r2.clone().multiplyScalar(gd).sub(r1).divideScalar(g);
+  return { v1, v2 };
 }

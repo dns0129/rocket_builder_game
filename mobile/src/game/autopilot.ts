@@ -7,6 +7,13 @@ export type APMode = 'off' | 'ascent' | 'node' | 'land';
 
 const UP = new Vector3(0, 1, 0);
 
+function fmtWait(s: number): string {
+  s = Math.max(0, s);
+  if (s < 120) return `${s.toFixed(0)} s`;
+  if (s < 7200) return `${(s / 60).toFixed(0)} 分钟`;
+  return s < 172_800 ? `${(s / 3600).toFixed(1)} 小时` : `${(s / 86_400).toFixed(1)} 天`;
+}
+
 /** 飞行辅助：自动入轨、自动执行机动节点、自动着陆（无大气天体）。 */
 export class Autopilot {
   mode: APMode = 'off';
@@ -22,6 +29,19 @@ export class Autopilot {
     this.sim = sim;
   }
 
+  /** 飞行辅助正在负责执行第一个机动节点（“执行机动”或自动入轨的圆化阶段）。 */
+  get executingNode(): boolean {
+    return this.mode === 'node' || (this.mode === 'ascent' && this.phase === 'circ');
+  }
+
+  /** 负责的机动还没执行完时返回点火时刻：时间加速不得越过它；不需要限制时返回 null。 */
+  burnWarpHold(): number | null {
+    if (!this.executingNode) return null;
+    const n = this.sim.nodes[0];
+    if (!n || n.done) return null;
+    return n.t - this.sim.nodeBurnLead();
+  }
+
   engage(mode: APMode): void {
     const sim = this.sim;
     if (mode === 'land' && sim.telemetry.body.atmosphere) {
@@ -32,11 +52,31 @@ export class Autopilot {
       sim.emit({ type: 'msg', msg: '没有机动节点', level: 'warn' });
       return;
     }
+    if (mode === 'node') {
+      const n = sim.nodes[0];
+      const bt = sim.nodeBurnTime();
+      if (!isFinite(bt)) {
+        sim.emit({ type: 'msg', msg: '没有可用的发动机/燃料，无法执行机动', level: 'bad' });
+        return;
+      }
+      if (sim.t > n.t + Math.max(120, bt)) {
+        sim.emit({ type: 'msg', msg: '机动节点已经过去太久，请删除后重新规划', level: 'warn' });
+        return;
+      }
+    }
     this.mode = mode;
     this.phase = mode === 'ascent' ? 'start' : '';
     this.nodeStarted = false;
     this.targetDir = null;
     sim.emit({ type: 'msg', msg: `飞行辅助：${mode === 'ascent' ? '自动入轨' : mode === 'node' ? '执行机动' : '自动着陆'}`, level: 'info' });
+    if (mode === 'node') {
+      // 节点还远：自动时间加速到点火前（随时可以按 / 恢复实时）
+      const tStart = sim.nodes[0].t - sim.nodeBurnLead();
+      if (tStart - sim.t > 90 && sim.autoWarpTo === null) {
+        sim.warpToTime(tStart - 45);
+        sim.emit({ type: 'msg', msg: '自动时间加速到点火前', level: 'info' });
+      }
+    }
   }
 
   disengage(msg?: string, keepThrottle = false): void {
@@ -156,21 +196,30 @@ export class Autopilot {
     if (done) this.disengage('机动执行完毕');
   }
 
-  /** 执行第一个机动节点；返回是否完成。 */
+  /**
+   * 执行第一个机动节点；返回是否完成。
+   * 点火时刻以节点为中心；点火方向与剩余 Δv 由闭环制导（guidance.ts）每帧更新，
+   * 关机由物理子步精确完成（node.done），这里只负责对准、油门和分级。
+   */
   private execNode(dt: number): boolean {
     const sim = this.sim;
     const V = sim.vessel;
     const node = sim.nodes[0];
     if (!node) return true;
+    if (node.done) {
+      V.throttle = 0;
+      sim.removeNode(false);
+      return true;
+    }
     const vec = sim.nodeBurnVector();
     if (!vec) return true;
-    const bt = sim.nodeBurnTime();
-    const tStart = node.t - bt / 2;
+    const tStart = node.t - sim.nodeBurnLead();
     const remain = vec.length();
-    this.targetDir = remain > 1e-3 ? vec.clone().normalize() : this.targetDir;
+    if (remain > 1e-6) this.targetDir = vec.clone().normalize();
+    else if (!this.targetDir) this.targetDir = node.burnDir?.clone() ?? null;
     if (sim.t < tStart && !this.nodeStarted) {
       V.throttle = 0;
-      this.status = `等待点火：${Math.max(0, tStart - sim.t).toFixed(0)} s，Δv ${remain.toFixed(1)} m/s`;
+      this.status = `等待点火：${fmtWait(tStart - sim.t)}，Δv ${remain.toFixed(1)} m/s`;
       return false;
     }
     this.nodeStarted = true;
@@ -186,13 +235,17 @@ export class Autopilot {
     const align = this.targetDir ? fwd.angleTo(this.targetDir) : Math.PI;
     const { thrust } = V.maxThrustVac();
     const aMax = thrust / V.mass;
+    // 对准后才点火；已经在烧时允许稍大的偏差（滞回），免得姿态一抖油门就反复开关
+    const lim = ((V.throttle > 0 ? 9 : 4) * Math.PI) / 180;
     let thr = 0;
-    if (align < (6 * Math.PI) / 180 && aMax > 0) thr = Math.min(1, remain / (aMax * 1.2) + 0.02);
-    V.setEffectiveThrottle(thr, remain > 0.15);
-    this.status = `执行机动：剩余 Δv ${remain.toFixed(1)} m/s`;
-    if (node.remaining && node.fixedDv && (node.remaining.dot(node.fixedDv) <= 0 || remain < 0.15)) {
+    // 最后约 0.25 s 逐渐收油门，配合子步关机得到精确的 Δv
+    if (align < lim && aMax > 0) thr = Math.min(1, remain / (aMax * 0.25) + 0.01);
+    V.setEffectiveThrottle(thr, true);
+    this.status = align < lim || V.throttle > 0 ? `执行机动：剩余 Δv ${remain.toFixed(1)} m/s` : `对准点火方向：偏差 ${((align * 180) / Math.PI).toFixed(0)}°`;
+    // 保护：已经“烧过头”（例如不能关机的固体发动机）或剩余量可以忽略
+    if (node.remaining && node.burnDir && (node.remaining.dot(node.burnDir) <= 0 || remain < 0.01)) {
       V.throttle = 0;
-      sim.removeNode();
+      sim.removeNode(false);
       return true;
     }
     return false;

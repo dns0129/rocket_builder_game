@@ -455,7 +455,7 @@ export class ReplayPlayer {
     sim.trail = new FlightTrail();
     sim.nodes = [];
     sim.prediction = null;
-    sim.predictionAge = 999;
+    sim.invalidatePrediction();
     sim.destroyed = false;
     sim.destroyReason = '';
     sim.launched = this.data.meta.scenario !== 'pad';
@@ -534,8 +534,14 @@ export class ReplayPlayer {
     sim.updateTelemetry();
     sim.body = sim.telemetry.body;
     sim.predictionAge += dtReal;
-    const interval = this.st.thrust ? 0.25 : sim.warpIndex > PHYS_WARP_MAX ? 0.1 : 0.5;
-    if (silent || sim.predictionAge > interval) sim.refreshPrediction();
+    if (silent) {
+      sim.invalidatePrediction();
+      sim.refreshPrediction();
+    } else if (!sim.livePrediction) {
+      // 没有主循环逐帧推进预测时（测试），按固定间隔整段计算
+      const interval = this.st.thrust ? 0.25 : sim.warpIndex > PHYS_WARP_MAX ? 0.1 : 0.5;
+      if (sim.predictionAge > interval) sim.refreshPrediction();
+    }
   }
 
   /** 把 t 时刻的插值状态写进 sim。 */
@@ -665,13 +671,16 @@ export class ReplayPlayer {
       case 'node': {
         const dv = e.dv as number[] | undefined;
         sim.nodes = e.nt != null && dv ? [{ t: e.nt as number, dv: new Vector3(dv[0], dv[1], dv[2]), fixedDv: null, remaining: null }] : [];
-        sim.predictionAge = 999;
+        sim.invalidatePrediction();
         break;
       }
       case 'burn':
         // 开始点火后节点交给实际轨迹显示（避免预测重复计入已完成的 Δv）
         sim.nodes = [];
-        sim.predictionAge = 999;
+        sim.invalidatePrediction();
+        break;
+      case 'inf':
+        V.infiniteFuel = !!e.on;
         break;
       case 'target':
         sim.targetBody = (e.b as BodyId | null) ?? null;

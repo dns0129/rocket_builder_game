@@ -42,7 +42,22 @@ export interface PredictOptions {
   maxSteps?: number;
   eta?: number;
   maxTime?: number;
+  /**
+   * 远期节点的“跳跃”缓存：节点在很多圈之后时，只画一圈当前轨道，然后直接跳到节点前半圈。
+   * 提供缓存时用数值积分（含月球摄动）跳过去，结果存进缓存，只要飞船一直在滑行、
+   * 节点不变，下次预测就能直接复用；不提供时退回二体开普勒外推（快，但几天后会差出几十公里）。
+   */
+  jump?: JumpCache;
+  /** 产生某个事件后提前结束（规划器只关心第一个近地点之类的结果时，省掉后面的积分） */
+  until?: (e: PredEvent) => boolean;
 }
+
+export interface JumpCache {
+  state: { t: number; r: Vector3; v: Vector3 } | null;
+}
+
+/** 数值跳跃最多积分这么多圈，更远的部分先用开普勒外推（到时会自然越来越准） */
+const JUMP_MAX_ORBITS = 40;
 
 const _rel = new Vector3();
 const _vrel = new Vector3();
@@ -57,6 +72,11 @@ export function nodeFrame(r: Vector3, v: Vector3, t: number, body: Body) {
   const nor = new Vector3().crossVectors(rel, vrel).normalize();
   const rad = new Vector3().crossVectors(nor, pro).normalize();
   return { pro, nor, rad };
+}
+
+/** 撞击事件的“虚拟近拱点”高度（撞击时刻的二体轨道近拱点，负值表示在地下多深）；其他事件返回其高度。 */
+export function virtualPeAlt(e: PredEvent): number {
+  return e.type === 'impact' && e.vel ? computeOrbit(e.pos, e.vel, e.body).peAlt : e.alt;
 }
 
 export function nodeDvWorld(r: Vector3, v: Vector3, t: number, dv: Vector3, body: Body): Vector3 {
@@ -75,7 +95,23 @@ function horizonFor(r: Vector3, v: Vector3, t: number, body: Body, maxTime: numb
   return maxTime;
 }
 
+/** 一次算完整条预测轨迹。 */
 export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[], opts: PredictOptions = {}): Prediction {
+  const it = predictSteps(r0, v0, t0, nodes, opts);
+  for (;;) {
+    const s = it.next();
+    if (s.done) return s.value;
+  }
+}
+
+/** 分片计算时每积分这么多步让出一次 */
+const YIELD_EVERY = 48;
+
+/**
+ * 可分片执行的轨迹预测：每积分 YIELD_EVERY 步让出一次，主循环可以在每帧的时间预算内推进它，
+ * 不必让某一帧停下来等整条轨迹算完。注意：输入在第一次 next() 时才被读取，调用方应传入快照。
+ */
+export function* predictSteps(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[], opts: PredictOptions = {}): Generator<void, Prediction, void> {
   const maxSteps = opts.maxSteps ?? 3000;
   const eta = opts.eta ?? 0.02;
   const maxTime = opts.maxTime ?? 14 * 86400 / 3.16;
@@ -122,19 +158,46 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
   let jumped = false;
 
   for (let step = 0; step < maxSteps; step++) {
+    if (step % YIELD_EVERY === YIELD_EVERY - 1) yield;
     if (!jumped && pending.length && isFinite(closedPeriod) && t - tStart >= closedPeriod && pending[0].t - t > 0.6 * closedPeriod) {
       jumped = true;
       const target = pending[0].t - 0.5 * closedPeriod;
-      bodyPosition(body, t, _bp);
-      bodyVelocity(body, t, _bv);
-      const rr = r.clone().sub(_bp);
-      const vv = v.clone().sub(_bv);
-      if (keplerPropagate(rr, vv, body.mu, target - t)) {
-        t = target;
-        bodyPosition(body, t, _bp);
-        bodyVelocity(body, t, _bv);
-        r.copy(rr).add(_bp);
-        v.copy(vv).add(_bv);
+      const cached = opts.jump?.state;
+      let ok = false;
+      if (cached && cached.t > t && cached.t < pending[0].t) {
+        r.copy(cached.r);
+        v.copy(cached.v);
+        t = cached.t;
+        ok = true;
+      } else {
+        // 太远的部分先用开普勒外推，最后 JUMP_MAX_ORBITS 圈（或全部）数值积分
+        const tNum = opts.jump ? Math.max(t, target - JUMP_MAX_ORBITS * closedPeriod) : target;
+        ok = true;
+        if (tNum > t) {
+          bodyPosition(body, t, _bp);
+          bodyVelocity(body, t, _bv);
+          const rr = r.clone().sub(_bp);
+          const vv = v.clone().sub(_bv);
+          ok = keplerPropagate(rr, vv, body.mu, tNum - t);
+          if (ok) {
+            t = tNum;
+            bodyPosition(body, t, _bp);
+            bodyVelocity(body, t, _bv);
+            r.copy(rr).add(_bp);
+            v.copy(vv).add(_bv);
+          }
+        }
+        if (ok && opts.jump) {
+          for (let k = 1; t < target - 1e-9; k++) {
+            const hj = Math.min(target - t, adaptiveStep(r, t, 0.02));
+            rk4Step(r, v, t, hj);
+            t += hj;
+            if (k % (YIELD_EVERY * 4) === 0) yield;
+          }
+          opts.jump.state = { t, r: r.clone(), v: v.clone() };
+        }
+      }
+      if (ok) {
         seg = { body, pts: [], times: [], afterNode };
         segments.push(seg);
         pushPoint();
@@ -187,8 +250,14 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
 
     if (dist < body.radius) {
       pushPoint();
-      impact = { type: 'impact', t, body, pos: _rel.clone(), alt: 0, afterNode };
+      impact = { type: 'impact', t, body, pos: _rel.clone(), vel: _vrel.clone(), alt: 0, afterNode };
       events.push(impact);
+      // 撞击时刻的二体近拱点（在地下）：规划器把它当作“最近距离”，代价因此是连续的，
+      // 知道还差多少才能擦过去，而不是一撞上就失去方向
+      if (body.id === 'moon' && (!needAfterNode || afterNode)) {
+        const vpe = computeOrbit(_rel, _vrel, body).pe;
+        if (vpe < moonMinDist) moonMinDist = vpe;
+      }
       break;
     }
 
@@ -199,6 +268,10 @@ export function predict(r0: Vector3, v0: Vector3, t0: number, nodes: NodeSpec[],
         events.push({ type: 'pe', t, body, pos: _rel.clone(), vel: _vrel.clone(), alt: dist - body.radius, afterNode });
         apsisCount++;
         if (body.id === 'earth' && visitedMoon && !earthPeAfterMoon) earthPeAfterMoon = { t, alt: dist - body.radius };
+        if (opts.until?.(events[events.length - 1])) {
+          pushPoint();
+          break;
+        }
       } else if (prevRdot > 0 && rdot <= 0) {
         events.push({ type: 'ap', t, body, pos: _rel.clone(), alt: dist - body.radius, afterNode });
         apsisCount++;

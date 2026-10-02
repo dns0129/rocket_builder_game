@@ -170,6 +170,8 @@ describe('full lunar mission', () => {
     log('TLI exec:', sim.destroyed, sim.destroyReason, sim.landed, sim.telemetry.alt, sim.autopilot.mode, sim.t);
     sim.refreshPrediction();
     log('after TLI: moonMin', ((sim.prediction!.moonMinDist - MOON.radius) / 1000).toFixed(0), 'km', 'stage', sim.vessel.stageIndex);
+    // 闭环制导：执行后的近月点应接近计划的 60 km（以前偏到 600 km 以上）
+    expect(Math.abs(sim.prediction!.moonMinDist - MOON.radius - 60_000)).toBeLessThan(25_000);
     // 中途修正
     // 滑行一段时间（按游戏时间计）再做中途修正
     const tCoast = sim.t + 20_000;
@@ -229,6 +231,9 @@ describe('full lunar mission', () => {
     run(sim, 600, 1 / 30, () => sim.autopilot.mode === 'off');
     sim.refreshPrediction();
     log('return: earth pe', sim.prediction?.earthPeAfterMoon, 'dv left', sim.telemetry.stageDv.toFixed(0));
+    // 返回轨道应直接落在再入走廊里（以前规划出的轨迹会直接撞上地球，要靠中途修正补救）
+    expect(sim.prediction?.earthPeAfterMoon).toBeTruthy();
+    expect(Math.abs(sim.prediction!.earthPeAfterMoon!.alt - 35_000)).toBeLessThan(10_000);
     sim.setWarp(8);
     run(sim, 100, 1 / 30, () => sim.telemetry.body.id === 'earth');
     sim.warpIndex = 0;

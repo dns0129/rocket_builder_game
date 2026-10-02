@@ -66,7 +66,7 @@ export interface DemoFrames {
  * 离散事件。k：
  * - ev：当时弹出的提示 / 音效事件（type, msg, level, size, pos, id）
  * - stage：分级（i = 分级后的级序号）
- * - legs / chute / sas / ap / node / burn / target / met / flame / dead / spd：状态变化
+ * - legs / chute / sas / ap / node / burn / target / met / flame / dead / spd / inf：状态变化
  * - cap：电脑演示的解说字幕
  */
 export interface DemoEvent {
