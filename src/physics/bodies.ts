@@ -14,6 +14,13 @@ export const G0 = 9.80665; // 标准重力加速度，用于比冲换算
 export const SIM_SCALE = 10;
 export const TIME_SCALE = Math.sqrt(SIM_SCALE);
 
+/**
+ * 天体自转开关（暂时关闭）。关闭时所有天体（含月球的潮汐锁定）都不转：rotationRate 为 0，
+ * 自转角固定为 t=0 时的取值，因此发射场、着陆点、地图贴图的朝向与开局时一致。
+ * 改回 true 即恢复自转。
+ */
+export const BODY_ROTATION = false;
+
 export interface AtmosphereDef {
   height: number; // 大气顶端高度 m
   scaleHeight: number; // 标高 m
@@ -64,7 +71,7 @@ function rocky(id: BodyId, name: string, radiusKm: number, gmReal: number, rotDa
     radius,
     mu,
     surfaceGravity: mu / (radius * radius),
-    rotationRate: rotDaysSidereal === 0 ? 0 : (2 * Math.PI) / ((rotDaysSidereal * 86_400) / TIME_SCALE),
+    rotationRate: !BODY_ROTATION || rotDaysSidereal === 0 ? 0 : (2 * Math.PI) / ((rotDaysSidereal * 86_400) / TIME_SCALE),
     atmosphere: null,
     soi: Infinity,
     hasOcean: false,
@@ -89,7 +96,7 @@ export const EARTH: Body = {
   radius: EARTH_R,
   mu: EARTH_G * EARTH_R * EARTH_R,
   surfaceGravity: EARTH_G,
-  rotationRate: (2 * Math.PI) / (86_164.1 / TIME_SCALE),
+  rotationRate: BODY_ROTATION ? (2 * Math.PI) / (86_164.1 / TIME_SCALE) : 0,
   atmosphere: { height: 70_000, scaleHeight: 7_000, rho0: 1.225, p0: 101_325 },
   soi: Infinity,
   hasOcean: true,
@@ -110,7 +117,7 @@ export const MOON: Body = {
   radius: MOON_R,
   mu: MOON_MU,
   surfaceGravity: MOON_G,
-  rotationRate: MOON_N, // 潮汐锁定
+  rotationRate: BODY_ROTATION ? MOON_N : 0, // 潮汐锁定
   atmosphere: null,
   soi: MOON_A * Math.pow(MOON_MU / EARTH.mu, 0.4),
   hasOcean: false,
@@ -199,8 +206,12 @@ export function dirFromLatLon(lat: number, lon: number, out = new Vector3()): Ve
   return out.set(Math.cos(lat) * Math.cos(lon), Math.sin(lat), -Math.cos(lat) * Math.sin(lon));
 }
 
-/** t=0 时地球的自转角：让发射场位于惯性系方位角 0 处。 */
-const EARTH_ROT0 = -LAUNCH_SITE.lon;
+/**
+ * t=0 时地球的自转角：自转时让发射场位于惯性系方位角 0 处（当地上午）。
+ * 不自转时向正东发射得到的停泊轨道交线永远不变，把发射场转到方位角 70° 处，
+ * 让这条交线对准开局两周左右各行星的转移窗口，出发不必额外改变轨道面（开局时当地为午后）。
+ */
+const EARTH_ROT0 = -LAUNCH_SITE.lon + (BODY_ROTATION ? 0 : 70 * DEG);
 
 export function moonAngle(t: number): number {
   return MOON_ORBIT.phase0 + MOON_ORBIT.n * t;
@@ -280,6 +291,7 @@ export function sunDirection(from: Vector3, t: number, out = new Vector3()): Vec
 
 /** 天体自转角：天体固连系 -> 惯性系 为绕 Y 轴旋转该角度。 */
 export function bodyRotation(body: Body, t: number): number {
+  if (!BODY_ROTATION) t = 0;
   if (body.id === 'earth') return body.rotationRate * t + EARTH_ROT0;
   // 月球 +X 轴始终指向地球
   if (body.id === 'moon') return moonAngle(t) + Math.PI;

@@ -173,7 +173,7 @@ const _c = new THREE.Color();
  * - 从火箭出发的预测弹道（蓝色，将要撞地的一段变红），
  * - 1 秒多以前的“幽灵”弹道（白色），操纵时两条线分开，
  * - 远地点 / 落点标签及其变化量。
- * 都换算到随天体自转的坐标系，因此与地面、发射台对得上。
+ * 都换算到随天体自转的坐标系，因此与地面、发射台对得上（BODY_ROTATION 关闭时即惯性系）。
  */
 export class FlightTrajectory {
   group = new THREE.Group();
