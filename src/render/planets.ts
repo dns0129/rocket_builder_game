@@ -413,6 +413,8 @@ ${LIGHT_GLSL}
 ${NOISE_GLSL}
 uniform vec3 uCenter;
 uniform float uSunGain;
+uniform sampler2D uColor;
+uniform float uHasMap;
 varying vec3 vWorldPos;
 varying vec3 vLocal;
 varying vec2 vUv;
@@ -444,6 +446,12 @@ void main() {
   vec3 col = tint * (0.9 + mix(0.12, 0.4, near) * g) * mix(limb, limb * limb, near) * 34.0 * uSunGain;
   col *= (1.0 - 0.45 * pen) * (1.0 - 0.6 * umb) * (1.0 + 0.35 * fac);
   col = mix(col, col * vec3(1.0, 0.75, 0.55), pen * 0.5);
+  // 真实贴图（Solar System Scope）：明亮的活动区与较暗的斑驳区域，近看时更明显
+  if (uHasMap > 0.5) {
+    vec3 sm = pow(texture2D(uColor, vUv).rgb, vec3(2.2));
+    float act2 = clamp(dot(sm, vec3(0.2126, 0.7152, 0.0722)) / 0.4, 0.5, 1.6);
+    col *= mix(1.0, act2, mix(0.15, 0.5, near));
+  }
   col = applyAtmo(col, vWorldPos);
   gl_FragColor = vec4(col, 1.0);
 }
@@ -789,7 +797,13 @@ export class Planets {
     const sunMat = new THREE.ShaderMaterial({
       vertexShader: PLANET_VERT,
       fragmentShader: SUN_FRAG,
-      uniforms: { ...sharedUniforms, uCenter: { value: new THREE.Vector3() }, uSunGain: { value: 1 } },
+      uniforms: {
+        ...sharedUniforms,
+        uCenter: { value: new THREE.Vector3() },
+        uSunGain: { value: 1 },
+        uColor: { value: maps.bodies.sun?.color ?? maps.moonColor },
+        uHasMap: { value: maps.bodies.sun ? 1 : 0 },
+      },
     });
     addVisual(SUN, sunMat, 96, sunDummy);
     this.sunGlow = new THREE.Sprite(

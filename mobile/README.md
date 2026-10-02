@@ -54,6 +54,7 @@ npm test           # 物理与平衡测试（与电脑版相同）
 - **界面**：全部重写为触屏界面（`src/ui/builderUI.ts`、`src/ui/hud.ts`、`src/ui/touch.ts`、`src/ui/styles.css`），按钮触控尺寸 ≥ 40 px，适配刘海 / 圆角屏的安全区域，横竖屏两套布局；面板不用 `backdrop-filter`（在 WebGL 画面上实时模糊对手机 GPU 开销很大）。
 - **动态分辨率**（`src/render/engine.ts`）：每秒统计帧率，低于约 38 FPS 自动降低渲染分辨率，持续流畅再慢慢提高。设置里三档画质（流畅 / 均衡 / 精细）决定分辨率上下限、阴影和抗锯齿；默认按设备内存与 CPU 核数选择。
 - **更小的资源**：地球日间 / 夜间贴图降到 2048×1024（约 0.6 MB，电脑版约 2.1 MB）；阴影贴图比电脑版小一档。
+- **真实月球贴图**：`public/textures/planets/moon.jpg`（2048×1024，约 0.7 MB），作者 [Solar System Scope](https://www.solarsystemscope.com/textures/)，基于 NASA LRO 影像，按 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 使用；法线仍由程序化月面地形烘焙（与碰撞一致），加载失败时退回程序化月面。
 - **总装车间取景**（`src/render/builderScene.ts`）：用相机视口偏移把火箭放在面板之外的可见区域中央，面板展开 / 收起、旋转屏幕时自动重新取景；点选的抖动阈值放宽到 12 px。
 - **系统集成**（`src/main.ts`）：
   - 飞行中申请**屏幕常亮**（Wake Lock）；
