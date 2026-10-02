@@ -1318,39 +1318,39 @@ table.stages th:first-child {
 
 .rudder-dial {
   display: block;
-  width: 100%;
+  width: min(100%, var(--nb));
   height: auto;
-  aspect-ratio: 2 / 1;
+  aspect-ratio: 1 / 1;
+  margin: 0 auto;
   touch-action: none;
 }
 
 .rud-track {
   fill: none;
   stroke: rgba(255, 255, 255, 0.1);
-  stroke-width: 14;
-  stroke-linecap: round;
+  stroke-width: 16;
 }
 
 .rud-tick {
-  stroke: rgba(255, 255, 255, 0.28);
-  stroke-width: 1;
+  stroke: rgba(255, 255, 255, 0.3);
+  stroke-width: 1.8;
 }
 
 .rud-tick.major {
-  stroke: rgba(255, 255, 255, 0.55);
-  stroke-width: 1.5;
+  stroke: rgba(255, 255, 255, 0.6);
+  stroke-width: 2.6;
 }
 
 .rud-num {
   fill: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 17px;
   text-anchor: middle;
 }
 
 .rud-dir {
   fill: var(--text);
-  font-size: 12px;
+  font-size: 20px;
   font-weight: 700;
   text-anchor: middle;
 }
@@ -1358,15 +1358,15 @@ table.stages th:first-child {
 .rud-fill {
   fill: none;
   stroke: var(--accent2);
-  stroke-width: 14;
+  stroke-width: 16;
   stroke-linecap: round;
   opacity: 0.55;
 }
 
 .rud-link {
   stroke: var(--accent2);
-  stroke-width: 1.2;
-  stroke-dasharray: 3 3;
+  stroke-width: 2;
+  stroke-dasharray: 5 5;
   opacity: 0;
 }
 
@@ -1377,7 +1377,7 @@ table.stages th:first-child {
 .rud-rocket path {
   fill: #e8edf4;
   stroke: #0b0f15;
-  stroke-width: 1;
+  stroke-width: 1.6;
 }
 
 .rud-knob {
@@ -1409,7 +1409,8 @@ table.stages th:first-child {
 .rudder-row button {
   min-height: 32px;
   padding: 0 6px;
-  font-size: 11px;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .rudder-lbl {

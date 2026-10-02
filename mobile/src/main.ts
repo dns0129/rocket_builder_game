@@ -117,6 +117,8 @@ class App {
     this.builderUI.show(false);
     this.builderScene.controls.enabled = false;
     const sim = new FlightSim(design, scenario);
+    // 轨迹预测由主循环逐帧推进（见 FlightSim.pumpPrediction）
+    sim.livePrediction = true;
     sim.isWater = (_b, dir) => sampleWater(this.maps, dir);
     const scene = new FlightScene(this.engine, this.maps, sim, this.mapOverlay);
     const hud = new FlightHUD(this.ui, sim, scene, {
@@ -340,6 +342,8 @@ class App {
     this.applyControls(dt);
     sim.paused = !!this.modal;
     sim.update(dt);
+    // 实时轨迹预测：每帧最多花几毫秒，算完立即开始下一次；帧率偏低（低于约 45 帧）时少花一些
+    sim.pumpPrediction(rawDt > 1 / 45 ? 1.2 : 2.5);
     const events = sim.drainEvents();
     for (const e of events) this.onEvent(e.type, e.msg, e.level, e.size);
     // 分离、爆炸等事件也要交给三维场景（生成残骸模型与特效）
@@ -508,7 +512,7 @@ class App {
           { class: 'keys' },
           ...k('分级', '左下角橙色按钮：点火 / 分离下面级 / 抛离助推器 / 启用降落伞（上方卡片显示下一级的动作，点卡片查看全部分级）'),
           ...k('油门', '左侧滑杆上下拖动；“满”“关”一键全开 / 关闭'),
-          ...k('方向舵', '拖动导航球旁半圆刻度盘上的旋钮，直接设定火箭倾角（0° 竖直，右边向东）；火箭自动转过去并保持'),
+          ...k('方向舵', '拖动导航球旁圆形刻度盘上的旋钮，直接设定火箭倾角（0° 竖直，右边向东，180° 竖直向下，可以转满一圈）；火箭自动转过去并保持'),
           ...k('摇杆', '右下角：上下 = 俯仰（上推低头），左右 = 偏航；⟲ ⟳ 按住滚转'),
           ...k('SAS', '姿态稳定：保持 / 顺行 / 逆行 / 法向 / 径向 / 机动方向'),
           ...k('辅助', '飞行辅助：自动入轨 / 执行机动 / 自动着陆'),
