@@ -98,6 +98,8 @@ class App {
     this.builderUI.show(false);
     this.builderScene.controls.enabled = false;
     const sim = new FlightSim(design, scenario);
+    // 轨迹预测由主循环逐帧推进（见 FlightSim.pumpPrediction）
+    sim.livePrediction = true;
     sim.isWater = (_b, dir) => sampleWater(this.maps, dir);
     const scene = new FlightScene(this.engine, this.maps, sim, this.mapOverlay);
     const hud = new FlightHUD(this.ui, sim, scene, {
@@ -299,6 +301,8 @@ class App {
     this.applyKeys(dt);
     sim.paused = !!this.modal;
     sim.update(dt);
+    // 实时轨迹预测：每帧最多花几毫秒，算完立即开始下一次；帧率偏低时少花一些
+    sim.pumpPrediction(this.engine.fps < 45 ? 1.5 : 3);
     const events = sim.drainEvents();
     for (const e of events) this.onEvent(e.type, e.msg, e.level, e.size);
     // 分离、爆炸等事件也要交给三维场景（生成残骸模型与特效）
@@ -487,7 +491,7 @@ class App {
           ...k('Shift ↑', '增加油门'),
           ...k('↓ Ctrl', '减小油门'),
           ...k('Z X', '油门全开 / 关闭'),
-          ...k('← →', '方向舵：向西 / 向东倾斜，火箭自动转到设定角度并保持（也可拖动导航球右侧的刻度盘）'),
+          ...k('← →', '方向舵：逆时针（向西）/ 顺时针（向东）转动，可以转满一圈；火箭自动转到设定角度并保持（也可拖动导航球右侧的圆形刻度盘）'),
           ...k('W S', '俯仰（W 低头，S 抬头）'),
           ...k('A D', '偏航'),
           ...k('Q E', '滚转'),

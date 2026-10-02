@@ -759,8 +759,9 @@ input[type='text'] {
 
 .rudder-dial {
   display: block;
-  width: 150px;
-  height: 75px;
+  width: 112px;
+  height: 112px;
+  margin: 0 auto;
   cursor: grab;
   touch-action: none;
 }
@@ -772,30 +773,29 @@ input[type='text'] {
 .rud-track {
   fill: none;
   stroke: rgba(255, 255, 255, 0.1);
-  stroke-width: 12;
-  stroke-linecap: round;
+  stroke-width: 14;
 }
 
 .rud-tick {
-  stroke: rgba(255, 255, 255, 0.28);
-  stroke-width: 1;
+  stroke: rgba(255, 255, 255, 0.3);
+  stroke-width: 1.8;
 }
 
 .rud-tick.major {
-  stroke: rgba(255, 255, 255, 0.55);
-  stroke-width: 1.5;
+  stroke: rgba(255, 255, 255, 0.6);
+  stroke-width: 2.6;
 }
 
 .rud-num {
   fill: var(--muted);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 16px;
   text-anchor: middle;
 }
 
 .rud-dir {
   fill: var(--text);
-  font-size: 14px;
+  font-size: 19px;
   font-weight: 700;
   text-anchor: middle;
 }
@@ -803,15 +803,15 @@ input[type='text'] {
 .rud-fill {
   fill: none;
   stroke: var(--accent2);
-  stroke-width: 12;
+  stroke-width: 14;
   stroke-linecap: round;
   opacity: 0.55;
 }
 
 .rud-link {
   stroke: var(--accent2);
-  stroke-width: 1.2;
-  stroke-dasharray: 3 3;
+  stroke-width: 2;
+  stroke-dasharray: 5 5;
   opacity: 0;
 }
 
@@ -822,13 +822,13 @@ input[type='text'] {
 .rud-rocket path {
   fill: #e8edf4;
   stroke: #0b0f15;
-  stroke-width: 1;
+  stroke-width: 1.6;
 }
 
 .rud-knob {
   fill: rgba(255, 174, 59, 0.25);
   stroke: rgba(255, 174, 59, 0.7);
-  stroke-width: 2;
+  stroke-width: 3;
 }
 
 .rudder-dial.on .rud-knob {
@@ -853,8 +853,8 @@ input[type='text'] {
 
 .rudder-row button {
   width: 26px;
-  padding: 2px 0;
-  font-size: 10px;
+  padding: 1px 0;
+  font-size: 12px;
 }
 
 .rudder-lbl {

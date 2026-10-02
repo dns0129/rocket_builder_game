@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { FlightSim, SasMode } from '../game/flight';
-import { WARP_LEVELS, PHYS_WARP_MAX, RUDDER_MAX } from '../game/flight';
+import { WARP_LEVELS, PHYS_WARP_MAX } from '../game/flight';
 import { MISSIONS, PLANET_MISSIONS, loadAchievements } from '../game/missions';
 import { solveCapture, solveCaptureAt, solveChangeApsis, solveCircularize, solveCorrection, solvePlanetCorrection, solveReturn, solveTLI, solveTransfer, type SolveResult, type TransferPlan } from '../game/maneuver';
 import { BODY_BY_ID, EARTH, HELIO, type BodyId } from '../physics/bodies';
@@ -286,8 +286,8 @@ export class FlightHUD {
   }
 
   /**
-   * 方向舵：半圆刻度盘，0° 竖直向上，右侧向东、左侧向西。
-   * 拖动橙色旋钮（或按 ← / →）直接设定火箭倾角，中间的小火箭显示实际姿态。
+   * 方向舵：一整圈的圆形刻度盘，0° 竖直向上，右侧向东、左侧向西，180° 竖直向下。
+   * 拖动橙色旋钮（或按 ← / →）直接设定火箭倾角，可以转满一圈；中间的小火箭显示实际姿态。
    */
   private buildRudder(): HTMLElement {
     const NS = 'http://www.w3.org/2000/svg';
@@ -297,40 +297,38 @@ export class FlightHUD {
       parent?.appendChild(e);
       return e;
     };
-    const svg = el('svg', { viewBox: '0 0 200 100', class: 'rudder-dial' });
-    el('path', { d: arcPath(-90, 90), class: 'rud-track' }, svg);
-    for (let a = -90; a <= 90; a += 15) {
+    const svg = el('svg', { viewBox: '0 0 200 200', class: 'rudder-dial' });
+    el('circle', { cx: DIAL.cx, cy: DIAL.cy, r: DIAL.r, class: 'rud-track' }, svg);
+    for (let a = -165; a <= 180; a += 15) {
       const major = a % 45 === 0;
-      const [x1, y1] = dialPt(a, major ? 58 : 62);
-      const [x2, y2] = dialPt(a, 68);
+      const [x1, y1] = dialPt(a, DIAL.r - (major ? 13 : 9));
+      const [x2, y2] = dialPt(a, DIAL.r - 2);
       el('line', { x1, y1, x2, y2, class: major ? 'rud-tick major' : 'rud-tick' }, svg);
     }
-    for (const a of [-90, -45, 0, 45, 90]) {
-      const [x, y] = dialPt(a, 47);
-      const t = el('text', { x, y: y + 3.5, class: 'rud-num' }, svg);
+    for (const a of [0, 45, 90, 135, 180, -135, -90, -45]) {
+      const [x, y] = dialPt(a, 50);
+      const t = el('text', { x, y: y + 5.5, class: 'rud-num' }, svg);
       t.textContent = String(Math.abs(a));
     }
-    const w = el('text', { x: 12, y: 97, class: 'rud-dir' }, svg);
+    const w = el('text', { x: 9, y: 126, class: 'rud-dir' }, svg);
     w.textContent = '西';
-    const e = el('text', { x: 188, y: 97, class: 'rud-dir' }, svg);
+    const e = el('text', { x: 191, y: 126, class: 'rud-dir' }, svg);
     e.textContent = '东';
     const fill = el('path', { d: '', class: 'rud-fill' }, svg);
     const link = el('line', { x1: DIAL.cx, y1: DIAL.cy, x2: DIAL.cx, y2: DIAL.cy - DIAL.r, class: 'rud-link' }, svg);
     const rocket = el('g', { class: 'rud-rocket' }, svg);
-    el('path', { d: 'M0 -30 L5 -21 L5 -6 L9 0 L-9 0 L-5 -6 L-5 -21 Z' }, rocket);
-    const ap = el('path', { d: 'M0 0 L-5 -9 L5 -9 Z', class: 'rud-ap' }, svg);
-    const knob = el('circle', { cx: DIAL.cx, cy: DIAL.cy - DIAL.r, r: 8.5, class: 'rud-knob' }, svg);
-    el('circle', { cx: DIAL.cx, cy: DIAL.cy, r: 3, class: 'rud-hub' }, svg);
+    el('path', { d: 'M0 -32 L5.5 -22 L5.5 -6 L10 1 L-10 1 L-5.5 -6 L-5.5 -22 Z' }, rocket);
+    const ap = el('path', { d: 'M0 0 L-6 -10 L6 -10 Z', class: 'rud-ap' }, svg);
+    const knob = el('circle', { cx: DIAL.cx, cy: DIAL.cy - DIAL.r, r: 10, class: 'rud-knob' }, svg);
+    el('circle', { cx: DIAL.cx, cy: DIAL.cy, r: 3.5, class: 'rud-hub' }, svg);
 
     const setFromPointer = (ev: PointerEvent) => {
       const r = svg.getBoundingClientRect();
       const x = ((ev.clientX - r.left) / r.width) * 200;
-      const y = ((ev.clientY - r.top) / r.height) * 100;
-      let a = Math.atan2(x - DIAL.cx, DIAL.cy - y);
-      a = Math.max(-RUDDER_MAX, Math.min(RUDDER_MAX, a));
-      // 取整到 1°，竖直附近吸附
-      let deg = Math.round((a * 180) / Math.PI);
-      if (Math.abs(deg) <= 2) deg = 0;
+      const y = ((ev.clientY - r.top) / r.height) * 200;
+      // 取整到 1°，竖直、水平与倒立附近吸附
+      let deg = Math.round((Math.atan2(x - DIAL.cx, DIAL.cy - y) * 180) / Math.PI);
+      for (const snap of [0, 90, -90, 180, -180]) if (Math.abs(deg - snap) <= 2) deg = snap;
       this.sim.setRudder((deg * Math.PI) / 180);
     };
     svg.addEventListener('pointerdown', (ev) => {
@@ -357,9 +355,9 @@ export class FlightHUD {
     this.rud = { svg, fill, knob, link, rocket, ap, label };
     return h(
       'div',
-      { class: 'rudder', title: '方向舵：拖动旋钮或按 ← / → 直接设定火箭倾角' },
+      { class: 'rudder', title: '方向舵：拖动旋钮或按 ← / → 直接设定火箭倾角，可以转满一圈' },
       svg,
-      h('div', { class: 'rudder-row' }, h('button', { onclick: step(-5), title: '向西 5°' }, '◀'), label, h('button', { onclick: step(5), title: '向东 5°' }, '▶')),
+      h('div', { class: 'rudder-row' }, h('button', { onclick: step(-5), title: '逆时针 5°（向西）' }, '↺'), label, h('button', { onclick: step(5), title: '顺时针 5°（向东）' }, '↻')),
     );
   }
 
@@ -367,35 +365,29 @@ export class FlightHUD {
     const sim = this.sim;
     const R = this.rud;
     const deg = (x: number) => (x * 180) / Math.PI;
-    const actual = Math.max(-100, Math.min(100, deg(sim.tiltAngle())));
+    const actual = deg(sim.tiltAngle());
     R.rocket.setAttribute('transform', `translate(${DIAL.cx} ${DIAL.cy}) rotate(${actual.toFixed(1)})`);
     const active = sim.rudderActive;
     const cmd = deg(sim.rudderAngle);
     R.svg.classList.toggle('on', active);
-    if (active) {
-      const [kx, ky] = dialPt(cmd, DIAL.r);
-      R.knob.setAttribute('cx', kx.toFixed(1));
-      R.knob.setAttribute('cy', ky.toFixed(1));
-      R.link.setAttribute('x2', kx.toFixed(1));
-      R.link.setAttribute('y2', ky.toFixed(1));
-      R.fill.setAttribute('d', Math.abs(cmd) > 0.5 ? arcPath(0, cmd) : '');
-    } else {
-      // 未启用时旋钮停在实际姿态处，拖动即可接管
-      const [kx, ky] = dialPt(Math.max(-90, Math.min(90, actual)), DIAL.r);
-      R.knob.setAttribute('cx', kx.toFixed(1));
-      R.knob.setAttribute('cy', ky.toFixed(1));
-      R.fill.setAttribute('d', '');
-    }
+    // 未启用时旋钮停在实际姿态处，拖动即可接管
+    const knobDeg = active ? cmd : actual;
+    const [kx, ky] = dialPt(knobDeg, DIAL.r);
+    R.knob.setAttribute('cx', kx.toFixed(1));
+    R.knob.setAttribute('cy', ky.toFixed(1));
+    R.link.setAttribute('x2', kx.toFixed(1));
+    R.link.setAttribute('y2', ky.toFixed(1));
+    R.fill.setAttribute('d', active && Math.abs(cmd) > 0.5 ? arcPath(0, cmd) : '');
     // 飞行辅助的目标倾角（蓝色三角）
     const ap = sim.autopilot.mode !== 'off' ? sim.autopilot.targetDir : null;
     if (ap) {
       const tel = sim.telemetry;
-      const a = Math.max(-90, Math.min(90, deg(Math.atan2(ap.dot(tel.east), ap.dot(tel.up)))));
-      const [x, y] = dialPt(a, DIAL.r + 12);
+      const a = deg(Math.atan2(ap.dot(tel.east), ap.dot(tel.up)));
+      const [x, y] = dialPt(a, DIAL.r + 14);
       R.ap.setAttribute('transform', `translate(${x.toFixed(1)} ${y.toFixed(1)}) rotate(${a.toFixed(1)})`);
       R.ap.style.display = '';
     } else R.ap.style.display = 'none';
-    const dirTxt = (d: number) => (Math.abs(d) < 0.5 ? '竖直 0°' : `${d > 0 ? '东' : '西'} ${Math.abs(d).toFixed(0)}°`);
+    const dirTxt = (d: number) => (Math.abs(d) < 0.5 ? '竖直 0°' : Math.abs(d) > 179.5 ? '倒立 180°' : `${d > 0 ? '东' : '西'} ${Math.abs(d).toFixed(0)}°`);
     setText(R.label, active ? `方向舵 ${dirTxt(cmd)}` : `方向舵 关 · ${dirTxt(actual)}`);
     R.label.classList.toggle('on', active);
   }
@@ -706,12 +698,22 @@ export class FlightHUD {
     return out;
   }
 
+  /** 规划面板里随时间变化的数字：原地更新，不重建按钮（重建会吞掉正在进行的点击） */
+  private plannerLive: (() => void) | null = null;
+
   private updatePlanner(): void {
     const sim = this.sim;
     const n = sim.nodes[0];
-    const key = n ? `n|${n.dv.x.toFixed(2)}|${n.dv.y.toFixed(2)}|${n.dv.z.toFixed(2)}|${n.t.toFixed(0)}|${Math.floor(sim.t)}|${sim.prediction?.endT}` : `e|${this.plannerMsg}`;
-    if (key === this.plannerKey) return;
+    const tel = sim.telemetry;
+    const key = n
+      ? `n|${n.dv.x.toFixed(2)}|${n.dv.y.toFixed(2)}|${n.dv.z.toFixed(2)}|${n.t.toFixed(1)}|${sim.autopilot.mode}`
+      : `e|${this.plannerMsg}|${tel.body.id}|${sim.targetBody}|${tel.orbit.hyperbolic}|${tel.orbit.ap > tel.body.soi * 0.3}`;
+    if (key === this.plannerKey) {
+      this.plannerLive?.();
+      return;
+    }
     this.plannerKey = key;
+    this.plannerLive = null;
     const P = this.planner;
     P.innerHTML = '';
     const state = () => ({ r: sim.vessel.r, v: sim.vessel.v, t: sim.t });
@@ -755,43 +757,56 @@ export class FlightHUD {
       );
       return;
     }
-    const dvTot = n.remaining ? n.remaining.length() : n.dv.length();
-    const bt = sim.nodeBurnTime();
-    P.appendChild(
-      h(
-        'div',
-        { class: 'info' },
-        h('div', { class: 'hud-row' }, h('span', { class: 'k' }, '距离节点'), h('span', { class: 'v' }, fmtTime(n.t - sim.t))),
-        h('div', { class: 'hud-row' }, h('span', { class: 'k' }, n.remaining ? '剩余 Δv' : '总 Δv'), h('span', { class: 'v' }, fmtSpeed(dvTot))),
-        h('div', { class: 'hud-row' }, h('span', { class: 'k' }, '预计燃烧'), h('span', { class: 'v' }, isFinite(bt) ? fmtTime(bt) : '无推力')),
-        h('div', { class: 'hud-row' }, h('span', { class: 'k' }, '建议点火'), h('span', { class: 'v' }, fmtTime(n.t - bt / 2 - sim.t))),
-      ),
-    );
+    const row = (k: string) => {
+      const kEl = h('span', { class: 'k' }, k);
+      const vEl = h('span', { class: 'v' });
+      return { el: h('div', { class: 'hud-row' }, kEl, vEl), k: kEl, v: vEl };
+    };
+    const rTime = row('距离节点');
+    const rDv = row('总 Δv');
+    const rBurn = row('预计燃烧');
+    const rIgn = row('建议点火');
+    P.appendChild(h('div', { class: 'info' }, rTime.el, rDv.el, rBurn.el, rIgn.el));
     const adj = (label: string, get: () => number, set: (v: number) => void, steps: number[], fmt: (v: number) => string) => {
+      const val = h('span', { class: 'val' }, fmt(get()));
       const r = h('div', { class: 'adj-row' }, h('span', { class: 'lbl' }, label));
       for (const s of steps.filter((x) => x < 0)) r.appendChild(h('button', { onclick: () => this.editNode(() => set(get() + s)) }, String(s)));
-      r.appendChild(h('span', { class: 'val' }, fmt(get())));
+      r.appendChild(val);
       for (const s of steps.filter((x) => x > 0)) r.appendChild(h('button', { onclick: () => this.editNode(() => set(get() + s)) }, `+${s}`));
-      return r;
+      P.appendChild(r);
+      return val;
     };
     const f1 = (v: number) => v.toFixed(1);
-    P.appendChild(adj('顺行', () => n.dv.x, (v) => (n.dv.x = v), [-10, -1, -0.1, 0.1, 1, 10], f1));
-    P.appendChild(adj('法向', () => n.dv.y, (v) => (n.dv.y = v), [-10, -1, -0.1, 0.1, 1, 10], f1));
-    P.appendChild(adj('径向', () => n.dv.z, (v) => (n.dv.z = v), [-10, -1, -0.1, 0.1, 1, 10], f1));
-    P.appendChild(adj('时间', () => n.t - sim.t, (v) => (n.t = sim.t + Math.max(5, v)), [-600, -60, -10, 10, 60, 600], (v) => fmtTime(v)));
-    // 结果
-    const pred = sim.prediction;
-    const res: string[] = [];
-    if (pred) {
-      const pe = pred.events.find((e) => e.afterNode && e.type === 'pe');
-      const ap = pred.events.find((e) => e.afterNode && e.type === 'ap');
-      if (ap) res.push(`远${ap.body.apsisChar}点 ${fmtDist(ap.alt)}`);
-      if (pe) res.push(`近${pe.body.apsisChar}点 ${fmtDist(pe.alt)}`);
-      const enter = pred.events.find((e) => e.afterNode && e.type === 'soiEnter');
-      if (enter) res.push(`将进入${enter.body.name}影响球（${fmtTime(enter.t - sim.t)} 后）`);
-      if (pred.impact && pred.impact.afterNode) res.push(`⚠ 将撞击${pred.impact.body.name}`);
-    }
-    if (res.length) P.appendChild(h('div', { class: 'note' }, '机动后：' + res.join('，')));
+    adj('顺行', () => n.dv.x, (v) => (n.dv.x = v), [-10, -1, -0.1, 0.1, 1, 10], f1);
+    adj('法向', () => n.dv.y, (v) => (n.dv.y = v), [-10, -1, -0.1, 0.1, 1, 10], f1);
+    adj('径向', () => n.dv.z, (v) => (n.dv.z = v), [-10, -1, -0.1, 0.1, 1, 10], f1);
+    const tVal = adj('时间', () => n.t - sim.t, (v) => (n.t = sim.t + Math.max(5, v)), [-600, -60, -10, 10, 60, 600], (v) => fmtTime(v));
+    // 机动后的结果（随预测更新）
+    const resNote = h('div', { class: 'note' });
+    P.appendChild(resNote);
+    this.plannerLive = () => {
+      const bt = sim.nodeBurnTime();
+      setText(rTime.v, fmtTime(n.t - sim.t));
+      setText(rDv.k, n.remaining ? '剩余 Δv' : '总 Δv');
+      setText(rDv.v, fmtSpeed(n.remaining ? n.remaining.length() : n.dv.length()));
+      setText(rBurn.v, isFinite(bt) ? fmtTime(bt) : '无推力');
+      setText(rIgn.v, fmtTime(n.t - sim.nodeBurnLead() - sim.t));
+      setText(tVal, fmtTime(n.t - sim.t));
+      const pred = sim.prediction;
+      const res: string[] = [];
+      if (pred) {
+        const pe = pred.events.find((e) => e.afterNode && e.type === 'pe');
+        const ap = pred.events.find((e) => e.afterNode && e.type === 'ap');
+        if (ap) res.push(`远${ap.body.apsisChar}点 ${fmtDist(ap.alt)}`);
+        if (pe) res.push(`近${pe.body.apsisChar}点 ${fmtDist(pe.alt)}`);
+        const enter = pred.events.find((e) => e.afterNode && e.type === 'soiEnter');
+        if (enter) res.push(`将进入${enter.body.name}影响球（${fmtTime(enter.t - sim.t)} 后）`);
+        if (pred.impact && pred.impact.afterNode) res.push(`⚠ 将撞击${pred.impact.body.name}`);
+      }
+      setText(resNote, res.length ? '机动后：' + res.join('，') : '');
+      resNote.style.display = res.length ? '' : 'none';
+    };
+    this.plannerLive();
     P.appendChild(
       h(
         'div',
@@ -812,7 +827,7 @@ export class FlightHUD {
           'button',
           {
             onclick: () => {
-              sim.warpToTime(n.t - bt / 2 - 30);
+              sim.warpToTime(n.t - sim.nodeBurnLead() - 30);
               sim.setSas('maneuver');
             },
           },
@@ -837,10 +852,7 @@ export class FlightHUD {
     const n = this.sim.nodes[0];
     if (!n) return;
     f();
-    n.fixedDv = null;
-    n.remaining = null;
-    this.sim.predictionAge = 999;
-    this.sim.refreshPrediction();
+    this.sim.nodeEdited();
     this.plannerKey = '';
   }
 
@@ -849,8 +861,8 @@ export class FlightHUD {
   }
 }
 
-/** 方向舵刻度盘几何：圆心在底部中央，0° 指向正上方，正角度向右（东）。 */
-const DIAL = { cx: 100, cy: 86, r: 70 };
+/** 方向舵刻度盘几何：圆心在中央，0° 指向正上方，正角度顺时针（向东），±180° 指向正下方。 */
+const DIAL = { cx: 100, cy: 100, r: 72 };
 
 function dialPt(deg: number, r: number): [number, number] {
   const a = (deg * Math.PI) / 180;
@@ -862,5 +874,6 @@ function arcPath(from: number, to: number): string {
   const [x2, y2] = dialPt(to, DIAL.r);
   const sweep = to > from ? 1 : 0;
   const large = Math.abs(to - from) > 180 ? 1 : 0;
+  // 正好半圈时两端点相对，按 sweep 方向画半圆
   return `M${x1.toFixed(1)} ${y1.toFixed(1)} A${DIAL.r} ${DIAL.r} 0 ${large} ${sweep} ${x2.toFixed(1)} ${y2.toFixed(1)}`;
 }
