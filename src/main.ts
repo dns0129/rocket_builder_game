@@ -12,6 +12,11 @@ import type { RocketDesign } from './rocket/design';
 import { h } from './ui/dom';
 import { fmtDist, fmtMET } from './ui/format';
 import { MISSIONS } from './game/missions';
+import { FlightRecorder } from './game/recorder';
+import { ReplayPlayer } from './game/replay';
+import { OUTCOME_LABEL, type DemoData } from './game/demo';
+import { loadBuiltinDemo, loadDemo, saveDemo } from './game/demoStore';
+import { ReplayControls, defaultDemoName, demoLibrary } from './ui/demoUI';
 
 const QUALITY_KEY = 'rocket-game-quality';
 const VOLUME_KEY = 'rocket-game-volume';
@@ -43,6 +48,11 @@ interface Flight {
   maxSpeed: number;
   destroyedAt: number | null;
   victoryShown: boolean;
+  /** 飞行记录仪（每次发射都在记录，玩家决定是否保存为 demo） */
+  recorder: FlightRecorder | null;
+  /** 回放模式 */
+  replay: ReplayPlayer | null;
+  replayUI: ReplayControls | null;
 }
 
 class App {
@@ -83,6 +93,7 @@ class App {
     this.builderUI.onLaunch = (d, s) => this.startFlight(d, s);
     this.builderUI.onHelp = () => this.showHelp();
     this.builderUI.onSettings = () => this.showSettings();
+    this.builderUI.onDemos = () => this.showDemoLibrary();
     this.bindInput();
     document.getElementById('loading')!.classList.add('hide');
     requestAnimationFrame(() => this.frame());
@@ -99,6 +110,9 @@ class App {
     this.builderScene.controls.enabled = false;
     const sim = new FlightSim(design, scenario);
     sim.isWater = (_b, dir) => sampleWater(this.maps, dir);
+    // 每次发射都记录：坠毁或开始新的飞行时询问是否保存为 demo
+    const recorder = new FlightRecorder(sim);
+    sim.recorder = recorder;
     const scene = new FlightScene(this.engine, this.maps, sim, this.mapOverlay);
     const hud = new FlightHUD(this.ui, sim, scene, {
       pause: () => this.showPause(),
@@ -106,7 +120,7 @@ class App {
       cycleCamera: () => this.cycleCamera(),
       click: () => this.sound.click(),
     });
-    this.flight = { sim, scene, hud, design, scenario, maxAlt: 0, maxSpeed: 0, destroyedAt: null, victoryShown: false };
+    this.flight = { sim, scene, hud, design, scenario, maxAlt: 0, maxSpeed: 0, destroyedAt: null, victoryShown: false, recorder, replay: null, replayUI: null };
     if (scenario === 'pad') {
       hud.toast('按 空格键 点火升空！（或使用右下角“自动入轨”）', 'info');
       hud.toast('← / → 方向舵（直接设定倾角）· Shift/↓ 油门 · 上方“下一步”会提示每一步该做什么', 'info');
@@ -118,6 +132,7 @@ class App {
   endFlight(showBuilder = true): void {
     const f = this.flight;
     if (!f) return;
+    f.replayUI?.dispose();
     f.scene.dispose();
     f.hud.dispose();
     this.flight = null;
@@ -134,6 +149,8 @@ class App {
     if (!f) return;
     const m = f.scene.mode === 'map' ? 'flight' : 'map';
     f.scene.setMode(m);
+    // 回放时右侧是操作记录，不打开机动规划
+    if (f.replay) return;
     f.hud.togglePlanner(m === 'map' ? true : undefined);
     if (m === 'flight') f.hud.togglePlanner(false);
   }
@@ -152,7 +169,7 @@ class App {
   bindInput(): void {
     // 防止飞行中误触 Ctrl+W 等快捷键关闭页面
     window.addEventListener('beforeunload', (e) => {
-      if (this.flight && !this.flight.sim.destroyed) {
+      if (this.flight && !this.flight.replay && !this.flight.sim.destroyed) {
         e.preventDefault();
         e.returnValue = '';
       }
@@ -169,6 +186,10 @@ class App {
       }
       if (!f || this.modal) return;
       if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+      if (f.replay) {
+        if (!e.repeat) this.replayKey(e.code);
+        return;
+      }
       if (e.repeat) {
         this.keys.add(e.code);
         return;
@@ -261,7 +282,7 @@ class App {
 
   private applyKeys(dt: number): void {
     const f = this.flight;
-    if (!f) return;
+    if (!f || f.replay) return;
     const sim = f.sim;
     const k = this.keys;
     const ax = (a: string, b: string) => (k.has(a) ? 1 : 0) - (k.has(b) ? 1 : 0);
@@ -296,9 +317,14 @@ class App {
       return;
     }
     const sim = f.sim;
-    this.applyKeys(dt);
     sim.paused = !!this.modal;
-    sim.update(dt);
+    if (f.replay) {
+      f.replay.advance(dt);
+      f.replayUI?.update(dt);
+    } else {
+      this.applyKeys(dt);
+      sim.update(dt);
+    }
     const events = sim.drainEvents();
     for (const e of events) this.onEvent(e.type, e.msg, e.level, e.size);
     // 分离、爆炸等事件也要交给三维场景（生成残骸模型与特效）
@@ -323,6 +349,12 @@ class App {
   onEvent(type: string, msg?: string, level?: string, size?: number): void {
     const f = this.flight!;
     if (msg && type !== 'destroyed') f.hud.toast(msg, level);
+    if (f.replay && (type === 'destroyed' || type === 'victory')) {
+      // 回放：只提示，不弹出失败 / 胜利对话框
+      if (type === 'destroyed') f.hud.toast(msg ?? '飞行器损毁', 'bad');
+      if (type === 'victory') this.sound.chime(true);
+      return;
+    }
     switch (type) {
       case 'stage':
         this.sound.stage();
@@ -376,15 +408,132 @@ class App {
     }
   }
 
+  // ---------------------------------------------------------------- 离开飞行 / 保存 demo
+
+  /** 重新发射（开始新的一次飞行）：先问要不要保存这次的 demo。 */
   private restart(): void {
     const f = this.flight;
     if (!f) return;
-    this.startFlight(f.design, f.scenario);
+    if (f.replay) {
+      this.replaySeek(f.replay.t0);
+      f.replay.playing = true;
+      this.closeModal();
+      return;
+    }
+    this.leaveFlight(() => this.startFlight(f.design, f.scenario));
+  }
+
+  /** 返回总装车间。 */
+  private backToBuilder(): void {
+    this.leaveFlight(() => {
+      this.closeModal();
+      this.endFlight(true);
+    });
+  }
+
+  /** 放弃当前飞行之前：有值得保存、还没保存（或保存后又飞了一段）、也没问过的记录时，先询问。 */
+  private leaveFlight(then: () => void): void {
+    const f = this.flight;
+    const rec = f?.recorder;
+    if (!f || f.replay || !rec || !rec.hasContent() || rec.asked || (rec.savedId && !rec.changedSinceSave)) {
+      then();
+      return;
+    }
+    this.askSaveDemo(then, () => this.showPause());
+  }
+
+  private demoName(): string {
+    const f = this.flight!;
+    const sim = f.sim;
+    const outcome = sim.destroyed ? OUTCOME_LABEL.crashed : f.recorder?.victory ? OUTCOME_LABEL.victory : sim.landed ? `${sim.telemetry.body.name}着陆` : `${sim.telemetry.body.name}附近`;
+    return defaultDemoName(f.design.name, outcome);
+  }
+
+  /** 把当前飞行保存为 demo（再次保存时覆盖同一条）。 */
+  private async saveCurrentDemo(name: string): Promise<DemoData | null> {
+    const f = this.flight;
+    const rec = f?.recorder;
+    if (!f || !rec) return null;
+    const d = rec.finish(name.trim() || this.demoName(), { id: rec.savedId ?? undefined });
+    await saveDemo(d);
+    rec.savedId = d.meta.id;
+    rec.savedAtT = rec.lastT;
+    rec.asked = true;
+    return d;
+  }
+
+  /** 名称输入框 + 保存按钮：坠毁对话框和“是否保存”对话框共用。 */
+  private demoSaveBox(onSaved: (d: DemoData) => void): { el: HTMLElement; input: HTMLInputElement; save: () => Promise<boolean>; err: HTMLElement } {
+    const rec = this.flight?.recorder;
+    const input = h('input', { type: 'text', class: 'demo-name-input', value: this.demoName(), maxlength: '80' }) as HTMLInputElement;
+    const err = h('div', { class: 'demo-err' });
+    const info = rec ? h('div', { class: 'demo-sub' }, `已记录 ${rec.frameCount} 个关键帧 · 约 ${Math.max(1, Math.round(rec.frameCount * 0.09))} KB`) : null;
+    const save = async () => {
+      try {
+        const d = await this.saveCurrentDemo(input.value);
+        if (d) onSaved(d);
+        return true;
+      } catch (e) {
+        err.textContent = `保存失败：${(e as Error)?.message ?? e}`;
+        return false;
+      }
+    };
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') void save();
+    });
+    return { el: h('div', { class: 'demo-save' }, input, info, err), input, save, err };
+  }
+
+  /** 询问是否保存 demo；then 为保存或放弃之后要做的事，cancel 为取消时回到哪里。 */
+  private askSaveDemo(then: () => void, cancel?: () => void): void {
+    const rec = this.flight?.recorder;
+    const box = this.demoSaveBox((d) => this.flight?.hud.toast(`已保存 Demo：${d.meta.name}`, 'good'));
+    this.openModal(
+      h(
+        'div',
+        { class: 'modal panel' },
+        h('h2', null, rec?.savedId ? '📼 更新已保存的 Demo？' : '📼 保存这次飞行的 Demo？'),
+        h('p', null, rec?.savedId ? '保存之后你又飞了一段。要用完整的飞行覆盖之前保存的 Demo 吗？' : 'Demo 记录了这次发射的完整路径、姿态、分级和每一步操作，保存在本机浏览器的数据库里，以后可以在“🎬 Demo 回放”里重看。'),
+        box.el,
+        h(
+          'div',
+          { class: 'actions' },
+          h(
+            'button',
+            {
+              class: 'primary',
+              onclick: async () => {
+                if (await box.save()) then();
+              },
+            },
+            rec?.savedId ? '💾 更新并继续' : '💾 保存并继续',
+          ),
+          h(
+            'button',
+            {
+              onclick: () => {
+                if (rec) rec.asked = true;
+                then();
+              },
+            },
+            '不保存',
+          ),
+          h('button', { onclick: () => (cancel ? cancel() : this.closeModal()) }, '取消'),
+        ),
+      ),
+    );
+    setTimeout(() => box.input.select(), 0);
   }
 
   showPause(): void {
     const f = this.flight;
     if (!f) return;
+    if (f.replay) {
+      this.showReplayPause();
+      return;
+    }
+    const rec = f.recorder;
     this.openModal(
       h(
         'div',
@@ -396,16 +545,9 @@ class App {
           { class: 'actions' },
           h('button', { class: 'primary', onclick: () => this.closeModal() }, '继续飞行'),
           h('button', { onclick: () => this.restart() }, '重新发射'),
-          h(
-            'button',
-            {
-              onclick: () => {
-                this.closeModal();
-                this.endFlight(true);
-              },
-            },
-            '返回总装车间',
-          ),
+          h('button', { onclick: () => this.backToBuilder() }, '返回总装车间'),
+          rec?.hasContent() ? h('button', { onclick: () => this.askSaveDemo(() => this.showPause(), () => this.showPause()) }, rec.savedId ? '💾 更新 Demo' : '💾 保存 Demo') : null,
+          h('button', { onclick: () => this.showDemoLibrary() }, '🎬 Demo 回放'),
           h('button', { onclick: () => this.showHelp() }, '操作说明'),
           h('button', { onclick: () => this.showSettings() }, '设置'),
         ),
@@ -416,6 +558,27 @@ class App {
   showFailure(): void {
     const f = this.flight;
     if (!f) return;
+    const rec = f.recorder;
+    // 坠毁时就问是否保存 demo（之后重新发射 / 返回总装车间不再重复询问）
+    let ask: HTMLElement | null = null;
+    if (rec && rec.hasContent()) {
+      rec.asked = true;
+      const box = this.demoSaveBox((d) => {
+        ask!.replaceChildren(h('div', { class: 'demo-saved' }, `✔ 已保存为 Demo《${d.meta.name}》，可以在“🎬 Demo 回放”里重看坠毁前的完整路径`));
+      });
+      ask = h(
+        'div',
+        { class: 'demo-ask' },
+        h('div', { class: 'demo-q' }, '📼 要把这次飞行保存为 Demo 吗？以后可以回放坠毁前的完整路径，看看哪里出了问题。'),
+        box.el,
+        h(
+          'div',
+          { class: 'actions', style: { marginTop: '8px' } },
+          h('button', { onclick: () => void box.save() }, '💾 保存 Demo'),
+          h('button', { onclick: () => ask!.replaceChildren(h('div', { class: 'demo-sub' }, '未保存这次飞行。')) }, '不保存'),
+        ),
+      );
+    }
     this.openModal(
       h(
         'div',
@@ -424,20 +587,12 @@ class App {
         h('p', null, f.sim.destroyReason),
         h('p', null, `任务时间 ${fmtMET(f.sim.met)} · 最高海拔 ${fmtDist(f.maxAlt)} · 最大过载 ${f.sim.maxG.toFixed(1)} g`),
         h('p', { style: { color: '#8a97a8' } }, failureHint(f.sim.destroyReason)),
+        ask,
         h(
           'div',
           { class: 'actions' },
           h('button', { class: 'primary', onclick: () => this.restart() }, '重新发射'),
-          h(
-            'button',
-            {
-              onclick: () => {
-                this.closeModal();
-                this.endFlight(true);
-              },
-            },
-            '返回总装车间',
-          ),
+          h('button', { onclick: () => this.backToBuilder() }, '返回总装车间'),
         ),
       ),
     );
@@ -458,6 +613,171 @@ class App {
           'div',
           { class: 'actions' },
           h('button', { class: 'primary', onclick: () => this.closeModal() }, '继续'),
+          f.recorder ? h('button', { onclick: () => this.askSaveDemo(() => this.closeModal(), () => this.showVictory(mars)) }, '💾 保存 Demo') : null,
+          h('button', { onclick: () => this.backToBuilder() }, '返回总装车间'),
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------- Demo 回放
+
+  showDemoLibrary(): void {
+    const back = () => (this.flight ? this.showPause() : this.closeModal());
+    this.openModal(
+      demoLibrary({
+        close: back,
+        toast: (msg, level) => {
+          if (this.flight) this.flight.hud.toast(msg, level);
+          else if (level === 'bad') alert(msg);
+        },
+        playBuiltin: (id) => this.openDemo(() => loadBuiltinDemo(id)),
+        play: (id) =>
+          this.openDemo(async () => {
+            const d = await loadDemo(id);
+            if (!d) throw new Error('找不到这个 Demo（可能已被删除）');
+            return d;
+          }),
+      }),
+    );
+  }
+
+  /** 载入 demo 并开始回放（正在飞行时先问是否保存当前飞行）。 */
+  private openDemo(load: () => Promise<DemoData>): void {
+    const card = h('div', { class: 'modal panel' }, h('h2', null, '🎬 正在载入 Demo……'));
+    this.openModal(card);
+    load()
+      .then((d) => this.leaveFlight(() => this.startReplay(d)))
+      .catch((e) => {
+        card.replaceChildren(
+          h('h2', null, '载入失败'),
+          h('p', null, String((e as Error)?.message ?? e)),
+          h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => this.showDemoLibrary() }, '返回')),
+        );
+      });
+  }
+
+  startReplay(data: DemoData): void {
+    this.sound.start();
+    this.closeModal();
+    if (this.flight) this.endFlight(false);
+    this.builderUI.show(false);
+    this.builderScene.controls.enabled = false;
+    const player = new ReplayPlayer(data);
+    const builtin = !!data.meta.builtin;
+    // 电脑演示全程按游戏节奏录制（上升段、着陆都是 1×），默认 4 倍速观看
+    player.speed = builtin ? 4 : 1;
+    const sim = ReplayPlayer.createSim(data);
+    sim.isWater = (_b, dir) => sampleWater(this.maps, dir);
+    player.attach(sim);
+    const scene = new FlightScene(this.engine, this.maps, sim, this.mapOverlay);
+    const hud = new FlightHUD(
+      this.ui,
+      sim,
+      scene,
+      {
+        pause: () => this.showPause(),
+        toggleMap: () => this.toggleMap(),
+        cycleCamera: () => this.cycleCamera(),
+        click: () => this.sound.click(),
+      },
+      { replay: true },
+    );
+    hud.guideOverride = () => {
+      const c = player.currentCaption();
+      return c ? { text: c, kind: builtin ? 'computer' : 'replay' } : null;
+    };
+    const ui = new ReplayControls(
+      hud.root,
+      player,
+      {
+        seek: (t) => this.replaySeek(t),
+        exit: () => this.endFlight(true),
+        toggleMap: () => this.toggleMap(),
+        cycleCamera: () => this.cycleCamera(),
+        click: () => this.sound.click(),
+      },
+      builtin,
+    );
+    this.flight = { sim, scene, hud, design: data.design, scenario: data.meta.scenario, maxAlt: data.meta.maxAlt, maxSpeed: 0, destroyedAt: null, victoryShown: true, recorder: null, replay: player, replayUI: ui };
+    hud.toast(builtin ? `电脑演示：${data.meta.name.replace(/^电脑演示：/, '')} —— 屏幕上方是电脑当前的操作，右侧是每一步的记录` : `回放：${data.meta.name}`, 'info');
+    hud.toast('空格 暂停/继续 · ← → 上一步/下一步 · , . 调整速度 · M 地图 · Esc 菜单', 'info');
+  }
+
+  /** 回放跳转；向后跳时先重置飞船与箭体模型。 */
+  private replaySeek(t: number): void {
+    const f = this.flight;
+    const p = f?.replay;
+    if (!f || !p) return;
+    if (!p.seek(t)) {
+      p.resetSim();
+      f.scene.resetVessel();
+      p.seek(t);
+    }
+    // 先让场景处理分离事件（把零件从箭体模型上取下），再清掉残骸
+    f.scene.handleEvents(f.sim.drainEvents());
+    p.clearDebris();
+    f.scene.handleEvents(f.sim.drainEvents());
+  }
+
+  private replayKey(code: string): void {
+    const f = this.flight;
+    const ui = f?.replayUI;
+    if (!f || !ui) return;
+    switch (code) {
+      case 'Space':
+        ui.togglePlay();
+        break;
+      case 'ArrowLeft':
+        ui.step(-1);
+        break;
+      case 'ArrowRight':
+        ui.step(1);
+        break;
+      case 'Home':
+        ui.restart();
+        break;
+      case 'Comma':
+        ui.changeSpeed(-1);
+        break;
+      case 'Period':
+        ui.changeSpeed(1);
+        break;
+      case 'KeyL':
+        ui.toggleLog();
+        break;
+      case 'KeyM':
+        this.toggleMap();
+        break;
+      case 'KeyV':
+        this.cycleCamera();
+        break;
+      case 'Tab':
+        if (f.scene.mode === 'map') f.scene.cycleMapFocus();
+        break;
+      case 'F1':
+        f.hud.root.style.display = f.hud.root.style.display === 'none' ? '' : 'none';
+        break;
+    }
+  }
+
+  private showReplayPause(): void {
+    const f = this.flight;
+    const p = f?.replay;
+    if (!f || !p) return;
+    this.openModal(
+      h(
+        'div',
+        { class: 'modal panel' },
+        h('h2', null, '回放已暂停'),
+        h('p', null, p.data.meta.name),
+        h('p', { class: 'demo-sub' }, `${p.data.meta.designName} · ${OUTCOME_LABEL[p.data.meta.outcome]}（${p.data.meta.outcomeText}）`),
+        h(
+          'div',
+          { class: 'actions' },
+          h('button', { class: 'primary', onclick: () => this.closeModal() }, '继续回放'),
+          h('button', { onclick: () => this.restart() }, '从头播放'),
+          h('button', { onclick: () => this.showDemoLibrary() }, '🎬 其他 Demo'),
           h(
             'button',
             {
@@ -466,8 +786,10 @@ class App {
                 this.endFlight(true);
               },
             },
-            '返回总装车间',
+            '退出回放',
           ),
+          h('button', { onclick: () => this.showHelp() }, '操作说明'),
+          h('button', { onclick: () => this.showSettings() }, '设置'),
         ),
       ),
     );

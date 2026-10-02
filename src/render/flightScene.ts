@@ -196,6 +196,23 @@ export class FlightScene {
     }
   }
 
+  /** 回放向后跳转时：飞船换成了新的 Vessel，按它重建箭体模型，清掉残骸。 */
+  resetVessel(): void {
+    for (const [id, g] of this.debrisViews) {
+      this.scene.remove(g);
+      this.sepFx.onDebrisGone(id);
+    }
+    this.debrisViews.clear();
+    this.sepFx.reset();
+    this.scene.remove(this.vesselView.group);
+    this.vesselView.dispose();
+    this.vesselView = new VesselView(this.sim.vessel.layout);
+    this.scene.add(this.vesselView.group);
+    this.vesselHidden = false;
+    this.firing.clear();
+    this.emitAcc.clear();
+  }
+
   // ---------------------------------------------------------------- 输入
 
   orbitCamera(dx: number, dy: number): void {

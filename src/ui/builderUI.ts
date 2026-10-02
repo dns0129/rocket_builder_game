@@ -31,6 +31,7 @@ export class BuilderUI {
   stats!: DesignStats;
   onLaunch: (d: RocketDesign, s: Scenario) => void = () => {};
   onHelp: () => void = () => {};
+  onDemos: () => void = () => {};
   onSettings: () => void = () => {};
   private scene: BuilderScene;
   private left!: HTMLDivElement;
@@ -169,6 +170,7 @@ export class BuilderUI {
         },
         '💾 保存',
       ),
+      h('button', { onclick: () => this.onDemos(), title: '回放保存的飞行，或观看电脑飞往月球、火星、木星' }, '🎬 Demo 回放'),
       h('button', { onclick: () => this.onHelp() }, '❔ 操作说明'),
       h('button', { onclick: () => this.onSettings() }, '⚙ 设置'),
     );

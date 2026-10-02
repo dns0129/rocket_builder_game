@@ -48,6 +48,8 @@ export class FlightHUD {
   private sasButtons = new Map<string, HTMLButtonElement>();
   private apButtons = new Map<string, HTMLButtonElement>();
   private pips: HTMLDivElement[] = [];
+  /** 回放时代替“下一步”提示：显示电脑当前在做什么 */
+  guideOverride: (() => { text: string; kind: string } | null) | null = null;
   private rud!: {
     svg: SVGSVGElement;
     fill: SVGPathElement;
@@ -58,11 +60,12 @@ export class FlightHUD {
     label: HTMLElement;
   };
 
-  constructor(parent: HTMLElement, sim: FlightSim, scene: FlightScene, cb: HudCallbacks) {
+  constructor(parent: HTMLElement, sim: FlightSim, scene: FlightScene, cb: HudCallbacks, opts: { replay?: boolean } = {}) {
     this.sim = sim;
     this.scene = scene;
     this.cb = cb;
-    this.root = h('div', { class: 'hud' });
+    // 回放：操作类控件只显示状态，不响应点击（见 styles.css 的 .hud.replay）
+    this.root = h('div', { class: opts.replay ? 'hud replay' : 'hud' });
     parent.appendChild(this.root);
     const E = this.els;
     const row = (k: string, key: string) => h('div', { class: 'hud-row' }, h('span', { class: 'k' }, k), (E[key] = h('span', { class: 'v' })));
@@ -499,7 +502,7 @@ export class FlightHUD {
     setText(E.vv, fmtSpeed(tel.vVert));
     setText(E.hv, fmtSpeed(tel.vHoriz));
     setText(E.g, `${tel.gforce.toFixed(2)} g`);
-    const step = nextStep(sim);
+    const step = this.guideOverride ? this.guideOverride() : nextStep(sim);
     setText(E.guide, step ? step.text : '');
     E.guide.className = `guide ${step ? step.kind : 'hidden'}`;
 

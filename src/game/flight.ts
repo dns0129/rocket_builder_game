@@ -33,6 +33,7 @@ import { burnTime, solveTransfer } from './maneuver';
 import { Autopilot } from './autopilot';
 import { MissionTracker } from './missions';
 import { FlightTrail } from './trail';
+import type { FlightRecorder } from './recorder';
 
 export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000, 1000000];
 export const PHYS_WARP_MAX = 3;
@@ -58,6 +59,8 @@ export interface FlightEvent {
   pos?: Vector3;
   size?: number;
   debrisId?: number;
+  /** 任务 id、熄火发动机的零件 key 等 */
+  id?: string;
 }
 
 export interface Telemetry {
@@ -172,6 +175,8 @@ export class FlightSim {
   contactCount = 0;
   tempLimit = 1500;
   private warnedFlameout = new Set<string>();
+  /** 飞行记录仪（demo）：每次 update 之后取样，并接收所有事件 */
+  recorder: FlightRecorder | null = null;
 
   constructor(design: RocketDesign, scenario: Scenario = 'pad') {
     this.vessel = new Vessel(design);
@@ -188,6 +193,7 @@ export class FlightSim {
 
   emit(e: FlightEvent): void {
     this.events.push(e);
+    this.recorder?.onEvent(e);
   }
 
   drainEvents(): FlightEvent[] {
@@ -253,7 +259,8 @@ export class FlightSim {
 
   // ---------------------------------------------------------------- 玩家操作
 
-  stage(): void {
+  /** quiet：回放时重现分级，只产生分离（残骸）事件，不弹提示 */
+  stage(quiet = false): void {
     if (this.destroyed) return;
     const V = this.vessel;
     const origin = V.r.clone().sub(V.com.clone().applyQuaternion(V.q));
@@ -318,7 +325,8 @@ export class FlightSim {
         if (rp && !rp.flameout) rp.igniteDelay = IGNITION_DELAY;
       }
       this.ullageT = IGNITION_DELAY + 0.25;
-    } else if (res.action.ignite.length) this.emit({ type: 'ignite' });
+    } else if (res.action.ignite.length && !quiet) this.emit({ type: 'ignite' });
+    if (quiet) return;
     if (res.action.chutes.length) this.emit({ type: 'chuteArm', msg: '降落伞已启用：低于 7 km 且速度足够低时自动张开', level: 'info' });
     this.emit({ type: 'stage', msg: `第 ${V.stageIndex} 级：${res.action.label}`, level: 'info' });
   }
@@ -514,6 +522,7 @@ export class FlightSim {
     const thrusting = this.vessel.parts.some((rp) => rp.thrustNow > 0);
     const interval = thrusting ? 0.25 : this.warpIndex > PHYS_WARP_MAX ? 0.1 : 0.5;
     if (this.predictionAge > interval) this.refreshPrediction();
+    this.recorder?.sample(dtReal);
   }
 
   refreshPrediction(): void {
@@ -884,7 +893,7 @@ export class FlightSim {
       if (this.warnedFlameout.has(k)) continue;
       this.warnedFlameout.add(k);
       const rp = V.byKey.get(k);
-      this.emit({ type: 'flameout', msg: `${rp?.p.def.name ?? '发动机'} 燃料耗尽`, level: 'warn' });
+      this.emit({ type: 'flameout', msg: `${rp?.p.def.name ?? '发动机'} 燃料耗尽`, level: 'warn', id: k });
     }
 
     // ------------------------------------------------ 温度
@@ -979,7 +988,8 @@ export class FlightSim {
 
   // ---------------------------------------------------------------- 残骸
 
-  private updateDebris(dt: number): void {
+  /** 推进残骸（回放时也由回放驱动调用）。 */
+  updateDebris(dt: number): void {
     if (!this.debris.length) return;
     const V = this.vessel;
     const rails = this.warpIndex > PHYS_WARP_MAX;

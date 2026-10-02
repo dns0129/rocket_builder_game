@@ -70,7 +70,7 @@ export class MissionTracker {
     const first = !all.has(id);
     all.add(id);
     saveAchievements(all);
-    this.sim.emit({ type: 'mission', msg: `任务达成：${label}${first ? '（首次！）' : ''}`, level: 'good' });
+    this.sim.emit({ type: 'mission', msg: `任务达成：${label}${first ? '（首次！）' : ''}`, level: 'good', id });
   }
 
   update(): void {

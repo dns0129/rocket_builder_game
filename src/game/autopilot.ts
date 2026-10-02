@@ -215,6 +215,14 @@ export class Autopilot {
       this.status = '推力不足，无法悬停！';
     }
     const h = Math.max(0, tel.radarAlt);
+    // 触地即关机：否则在重力较大的天体（火星）上，最低节流的推力会让着陆器一直“悬”在地面上，
+    // 无法判定为着陆，直到烧光燃料
+    if (sim.contactCount > 0 && h < 3 && tel.vVert > -2.5) {
+      V.throttle = 0;
+      this.targetDir = tel.up.clone();
+      this.status = '触地，发动机关机';
+      return;
+    }
     const brake = Math.max(0.3, (aMax - g) * 0.55);
     let vTarget = -Math.min(1.0 + Math.min(Math.sqrt(2 * brake * h), h * 0.22), 400);
     if (h < 4) vTarget = -1.0;

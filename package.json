@@ -10,7 +10,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "demos": "vitest run --config scripts/vitest.demos.config.ts"
   },
   "dependencies": {
     "three": "^0.186.1"
