@@ -38,8 +38,10 @@ import type { FlightRecorder } from './recorder';
 
 export const WARP_LEVELS = [1, 2, 3, 4, 10, 50, 100, 1000, 10000, 100000, 1000000];
 export const PHYS_WARP_MAX = 3;
-/** 方向舵设定与实际倾角相差较大时，每次只朝设定方向领先这么多，让火箭在“竖直—正东”平面内转过去 */
+/** 方向舵设定与实际倾角相差较大时，每次只朝设定方向领先这么多，让火箭在“竖直—航向”平面内转过去 */
 const RUDDER_LEAD = (60 * Math.PI) / 180;
+/** 方向舵的默认航向：正东（90°），与地球自转方向一致 */
+export const RUDDER_HEADING_EAST = Math.PI / 2;
 /** 机动节点在点火前多久锁定（开始闭环制导） */
 const NODE_LOCK_LEAD = 20;
 /** 自动执行机动时，时间加速在点火前多久停下（留出转向的时间） */
@@ -134,6 +136,24 @@ export interface ManeuverNode extends NodeSpec {
 
 const UP = new Vector3(0, 1, 0);
 
+/**
+ * 航向（0 正北、90° 正东、180° 正南、270° 正西）对应的水平单位向量。
+ * 极小的分量取 0：默认的正东航向得到的正好是 east，与加入航向之前逐位一致。
+ */
+export function headingDir(heading: number, north: Vector3, east: Vector3, out = new Vector3()): Vector3 {
+  let c = Math.cos(heading);
+  let s = Math.sin(heading);
+  if (Math.abs(c) < 1e-12) c = 0;
+  if (Math.abs(s) < 1e-12) s = 0;
+  return out.copy(north).multiplyScalar(c).addScaledVector(east, s);
+}
+
+/** 把角度规整到 [0, 2π)。 */
+export function wrapHeading(a: number): number {
+  a %= 2 * Math.PI;
+  return a < 0 ? a + 2 * Math.PI : a;
+}
+
 /** 把角度规整到 (-π, π]。 */
 export function wrapAngle(a: number): number {
   a %= 2 * Math.PI;
@@ -160,8 +180,13 @@ export class FlightSim {
   controlCmd = new Vector3(); // 实际控制量（x 俯仰, y 滚转, z 偏航），用于喷管摆动显示
   sasOn = true;
   sasMode: SasMode = 'stability';
-  /** 方向舵设定的倾角（弧度，-π..π，可以转满一圈）：0 竖直向上，正值向东，负值向西，±π 竖直向下 */
+  /** 方向舵设定的倾角（弧度，-π..π，可以转满一圈）：0 竖直向上，正值倒向航向一侧（默认正东），负值倒向相反一侧，±π 竖直向下 */
   rudderAngle = 0;
+  /**
+   * 方向舵的航向（弧度，[0, 2π)，从正北顺时针量）：倾斜所在的竖直平面朝向哪里。
+   * 默认 90° 正东；改成正北/正南发射可以进入极地轨道。自动入轨也沿这个航向转弯。
+   */
+  rudderHeading = RUDDER_HEADING_EAST;
   /** 沉底发动机剩余工作时间 s */
   ullageT = 0;
   /** 上一次 update 实际推进的模拟时间 s（粒子特效与之同步） */
@@ -431,11 +456,27 @@ export class FlightSim {
     this.emit({ type: 'msg', msg: this.sasOn ? '姿态稳定 SAS 开启' : 'SAS 关闭', level: 'info' });
   }
 
-  /** 箭体在“竖直—正东”平面内的倾角（弧度）：0 竖直向上，正值偏东，负值偏西。 */
+  /** 方向舵航向上的水平单位向量（默认正东）。 */
+  rudderDir(out = new Vector3()): Vector3 {
+    const tel = this.telemetry;
+    return headingDir(this.rudderHeading, tel.north, tel.east, out);
+  }
+
+  /** 箭体在“竖直—航向”平面内的倾角（弧度）：0 竖直向上，正值倒向航向一侧（默认偏东），负值倒向另一侧。 */
   tiltAngle(): number {
     const tel = this.telemetry;
     const fwd = UP.clone().applyQuaternion(this.vessel.q);
-    return Math.atan2(fwd.dot(tel.east), fwd.dot(tel.up));
+    return Math.atan2(fwd.dot(this.rudderDir(_v1)), fwd.dot(tel.up));
+  }
+
+  /** 箭体实际指向的航向（弧度，[0, 2π)）；接近竖直、看不出方向时返回 null。 */
+  actualHeading(): number | null {
+    const tel = this.telemetry;
+    const fwd = UP.clone().applyQuaternion(this.vessel.q);
+    const n = fwd.dot(tel.north);
+    const e = fwd.dot(tel.east);
+    if (Math.hypot(n, e) < 0.05) return null;
+    return wrapHeading(Math.atan2(e, n));
   }
 
   get rudderActive(): boolean {
@@ -443,7 +484,7 @@ export class FlightSim {
   }
 
   /**
-   * 方向舵：直接设定箭体倾角，可以转满一圈（0 竖直向上，+90° 水平向东，-90° 水平向西，±180° 竖直向下），
+   * 方向舵：直接设定箭体倾角，可以转满一圈（0 竖直向上，+90° 水平指向航向（默认正东），-90° 指向相反方向，±180° 竖直向下），
    * 姿态控制系统（喷管摆动 + 尾翼 + 姿控）自动把火箭转过去并保持。
    */
   setRudder(angle: number): void {
@@ -459,6 +500,42 @@ export class FlightSim {
   nudgeRudder(delta: number): void {
     const base = this.rudderActive ? this.rudderAngle : this.tiltAngle();
     this.setRudder(base + delta);
+  }
+
+  /**
+   * 方向舵的航向轴：设定倾斜朝向哪个方位（0 正北，90° 正东，180° 正南，270° 正西）。
+   * 方向舵已开启时倾角不变，火箭绕竖直方向转到新的航向；未开启时从当前姿态接管（倾角取箭体偏离竖直的角度）。
+   */
+  setRudderHeading(heading: number): void {
+    if (this.destroyed) return;
+    if (!this.rudderActive) {
+      const tel = this.telemetry;
+      const fwd = UP.clone().applyQuaternion(this.vessel.q);
+      this.rudderAngle = Math.acos(Math.max(-1, Math.min(1, fwd.dot(tel.up))));
+    }
+    const a = this.rudderAngle;
+    this.rudderHeading = wrapHeading(heading);
+    this.setRudder(a);
+  }
+
+  /** 在当前航向（方向舵未开启时为箭体实际指向的航向）基础上增减。 */
+  nudgeRudderHeading(delta: number): void {
+    const base = this.rudderActive ? this.rudderHeading : (this.actualHeading() ?? this.rudderHeading);
+    this.setRudderHeading(base + delta);
+  }
+
+  /** 从当前姿态开启方向舵：航向取箭体实际指向的方位（接近竖直时保持原航向），倾角取当前倾角。 */
+  engageRudder(): void {
+    const h = this.actualHeading();
+    if (h !== null) {
+      // 倒向航向背面（负倾角）比把航向转半圈更直观时，保留原航向
+      const tel = this.telemetry;
+      const fwd = UP.clone().applyQuaternion(this.vessel.q);
+      const side = Math.abs(fwd.dot(this.rudderDir(_v1)));
+      const horiz = Math.hypot(fwd.dot(tel.north), fwd.dot(tel.east));
+      if (side < horiz * 0.97) this.rudderHeading = h;
+    }
+    this.setRudder(this.tiltAngle());
   }
 
   /**
@@ -1236,15 +1313,18 @@ export class FlightSim {
       }
       case 'rudder': {
         // 设定角与实际倾角相差很大（例如直接拖到背面）时，目标只领先实际姿态 RUDDER_LEAD，
-        // 让火箭沿较短的方向在“竖直—正东”平面内转过去，而不是绕一个不确定的轴翻转
+        // 让火箭沿较短的方向在“竖直—航向”平面内转过去，而不是绕一个不确定的轴翻转
         let a = this.rudderAngle;
         const fwd = UP.clone().applyQuaternion(V.q);
-        if (Math.abs(fwd.dot(tel.north)) < 0.7) {
-          const cur = Math.atan2(fwd.dot(tel.east), fwd.dot(tel.up));
+        const hd = this.rudderDir(new Vector3());
+        // 航向平面的法向（水平、垂直于航向）：默认航向正东时就是正北
+        const side = new Vector3().crossVectors(tel.up, hd);
+        if (Math.abs(fwd.dot(side)) < 0.7) {
+          const cur = Math.atan2(fwd.dot(hd), fwd.dot(tel.up));
           const d = wrapAngle(a - cur);
           if (Math.abs(d) > RUDDER_LEAD) a = cur + Math.sign(d) * RUDDER_LEAD;
         }
-        return tel.up.clone().multiplyScalar(Math.cos(a)).addScaledVector(tel.east, Math.sin(a)).normalize();
+        return tel.up.clone().multiplyScalar(Math.cos(a)).addScaledVector(hd, Math.sin(a)).normalize();
       }
       default:
         return null;

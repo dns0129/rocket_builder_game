@@ -280,7 +280,8 @@ class App {
     });
     canvas.addEventListener('pointermove', (e) => {
       if (!drag || !this.flight) return;
-      this.flight.scene.orbitCamera(e.clientX - lx, e.clientY - ly);
+      // 右键或中键拖动：三维地图中平移（Shift 是加油门，不用作修饰键）
+      this.flight.scene.orbitCamera(e.clientX - lx, e.clientY - ly, (e.buttons & 6) !== 0);
       lx = e.clientX;
       ly = e.clientY;
     });
@@ -309,6 +310,9 @@ class App {
     // ← / →：方向舵，每秒转 35°
     const steer = ax('ArrowRight', 'ArrowLeft');
     if (steer !== 0) sim.nudgeRudder(((steer * 35 * Math.PI) / 180) * dt);
+    // [ / ]：方向舵的航向轴，每秒转 45°
+    const turn = ax('BracketRight', 'BracketLeft');
+    if (turn !== 0) sim.nudgeRudderHeading(((turn * 45 * Math.PI) / 180) * dt);
     const thr = (k.has('ShiftLeft') || k.has('ShiftRight') || k.has('ArrowUp') ? 1 : 0) - (k.has('ArrowDown') || k.has('ControlLeft') ? 1 : 0);
     if (thr !== 0) {
       sim.vessel.throttle = Math.max(0, Math.min(1, sim.vessel.throttle + thr * dt * 0.8));
@@ -831,19 +835,21 @@ class App {
           ...k('Shift ↑', '增加油门'),
           ...k('↓ Ctrl', '减小油门'),
           ...k('Z X', '油门全开 / 关闭'),
-          ...k('← →', '方向舵：逆时针（向西）/ 顺时针（向东）转动，可以转满一圈；火箭自动转到设定角度并保持（也可拖动导航球右侧的圆形刻度盘）'),
+          ...k('← →', '方向舵：逆时针 / 顺时针转动（默认在“竖直—正东”平面内，→ 向东倒），可以转满一圈；火箭自动转到设定角度并保持（也可拖动导航球右侧的圆形刻度盘）'),
+          ...k('[ ]', '方向舵的航向轴：把倾斜的方向向左 / 向右转（默认正东 090°；正北 000° 或正南 180° 发射进入极地轨道，自动入轨也沿这个航向）'),
           ...k('W S', '俯仰（W 低头，S 抬头）'),
           ...k('A D', '偏航'),
           ...k('Q E', '滚转'),
           ...k('T', '开关 SAS 姿态稳定'),
           ...k('G', '收放着陆腿'),
           ...k('P', '启用降落伞'),
-          ...k('M', '二维地图：拖动平移、滚轮缩放，“自动”视图始终框住整条预测轨迹'),
+          ...k('M', '三维地图：拖动旋转、右键拖动平移、滚轮缩放，“自动”视图始终框住整条预测轨迹；工具栏“3D”按钮切换二维俯视'),
           ...k('N', '机动规划面板'),
           ...k(', . /', '时间加速：减 / 加 / 恢复实时'),
           ...k('V', '切换相机模式'),
           ...k('Tab', '地图中切换焦点（地球 / 月球 / 飞船）'),
-          ...k('鼠标拖动 滚轮', '飞行视图：旋转视角 / 缩放；地图：平移 / 缩放'),
+          ...k('鼠标拖动 滚轮', '飞行视图与三维地图：旋转视角 / 缩放；二维地图：平移 / 缩放'),
+          ...k('方向轴', '左上角随视角转动的小坐标轴：飞行时显示东 / 北 / 上，地图中显示赤道坐标（北 = 地轴北极）；点击轴端从该方向观察'),
           ...k('Esc', '暂停菜单'),
           ...k('F1', '隐藏 / 显示界面'),
         ),

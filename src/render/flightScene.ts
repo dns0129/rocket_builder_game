@@ -30,6 +30,8 @@ const HEMI_LOOK: Partial<Record<BodyId, { sky: THREE.Color; ground: THREE.Color;
 const UP = new THREE.Vector3(0, 1, 0);
 /** 二维地图相机的基准视场角：远处的长焦相机近似正投影，但保留大气辉光等透视效果 */
 const MAP_FOV = (10 * Math.PI) / 180;
+/** 三维地图相机的视场角（度） */
+const MAP3D_FOV = 40;
 const MAP_MIN_EXTENT = 1_500;
 const MAP_MAX_EXTENT = 2.5e11;
 
@@ -62,12 +64,27 @@ export class FlightScene {
   mapExtent = 3e6;
   mapPan = new THREE.Vector2();
   mapFocus: 'auto' | MapFocus = 'auto';
-  /** 地图中的三维游览：围绕焦点天体旋转观察（拖动旋转、滚轮缩放）。在地图里选中某个天体时默认开启 */
-  map3d = false;
+  /** 三维地图：围绕焦点旋转观察（拖动旋转、右键拖动平移、滚轮缩放）。默认开启，工具栏的“3D”按钮可切回二维俯视 */
+  map3d = true;
+  /** 玩家选择的地图维度（打开地图、切换焦点时沿用） */
+  map3dPref = true;
+  /**
+   * 三维地图相机：围绕目标点（焦点 + orbPan）转动的“转盘”。orbBasis.up 为转轴（通常是北极方向），
+   * yaw = 0、pitch = 0 时从 orbBasis.normal 一侧看过去，屏幕右方为 orbBasis.right。
+   */
   private orbYaw = 0;
   private orbPitch = 0.4;
   private orbDist = 1;
   private orbDistTarget = 1;
+  private orbPan = new THREE.Vector3();
+  private orbBasis = { right: new THREE.Vector3(1, 0, 0), up: new THREE.Vector3(0, 1, 0), normal: new THREE.Vector3(0, 0, 1) };
+  /** 三维自动视图的目标：框住预测轨迹的球（中心相对焦点）与相机距离 */
+  private fitCenter = new THREE.Vector3();
+  private fitDist = 0;
+  /** 地图浮动原点所在的焦点（自动视图跟着飞船换天体时，用来平移视图使画面不跳） */
+  private mapOriginId: MapFocus | null = null;
+  /** 点击方向轴后相机转过去的动画 */
+  private viewTween: { t: number; yaw0: number; pitch0: number; yaw1: number; pitch1: number; map: boolean } | null = null;
   private mapNormal = new THREE.Vector3(0, 1, 0);
   private mapRight = new THREE.Vector3(1, 0, 0);
   private mapUp = new THREE.Vector3(0, 0, -1);
@@ -215,11 +232,21 @@ export class FlightScene {
 
   // ---------------------------------------------------------------- 输入
 
-  orbitCamera(dx: number, dy: number): void {
-    if (this.mode === 'map' && this.map3d) {
-      // 三维游览：拖动旋转视角
-      this.orbYaw += dx * 0.006;
-      this.orbPitch = Math.max(-1.5, Math.min(1.5, this.orbPitch + dy * 0.006));
+  /** 拖动：飞行视图与三维地图旋转视角（pan = true 时三维地图平移），二维地图平移。 */
+  orbitCamera(dx: number, dy: number, pan = false): void {
+    if (dx || dy) this.viewTween = null;
+    if (this.mode === 'map' && this.map3d && pan) {
+      // 三维地图：右键拖动平移目标点
+      const cam = this.camera;
+      const mpp = (2 * this.orbDist * Math.tan(((cam.fov / 2) * Math.PI) / 180)) / Math.max(1, this.engine.height);
+      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion);
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion);
+      this.orbPan.addScaledVector(right, -dx * mpp).addScaledVector(up, dy * mpp);
+      if (dx || dy) this.mapAutoFit = false;
+    } else if (this.mode === 'map' && this.map3d) {
+      // 三维地图：拖动旋转视角（自动视图仍然自动框住轨迹）
+      this.orbYaw -= dx * 0.006;
+      this.orbPitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.orbPitch + dy * 0.006));
     } else if (this.mode === 'map') {
       // 二维地图：拖动即平移
       const mpp = (2 * this.mapExtent) / Math.max(1, this.engine.height);
@@ -237,6 +264,7 @@ export class FlightScene {
     const f = Math.exp(delta * 0.0012);
     if (this.mode === 'map' && this.map3d) {
       this.orbDistTarget = Math.max(this.orbMinDist(), Math.min(MAP_MAX_EXTENT * 4, this.orbDistTarget * f));
+      this.mapAutoFit = false;
     } else if (this.mode === 'map') {
       const e0 = this.mapExtent;
       const e1 = Math.max(MAP_MIN_EXTENT, Math.min(MAP_MAX_EXTENT, e0 * f));
@@ -281,33 +309,113 @@ export class FlightScene {
     return tel.orbit.peAlt < (tel.body.atmosphere?.height ?? 8_000) && tel.alt < tel.body.radius * 0.6 && !tel.orbit.hyperbolic;
   }
 
-  /** 三维游览时相机离焦点的最近距离（不钻进星球里） */
+  /**
+   * 三维地图相机离目标点的最近距离：目标点在星球内部（例如以星球为焦点）时，相机从任何方向看都不钻进星球里。
+   * 目标点在星球外（跟随贴地飞行的飞船）时不限制，由 updateCamera 把相机推到地面以上。
+   */
   private orbMinDist(): number {
-    const f = this.mapFocusBody();
-    return f === 'vessel' ? 30 : BODY_BY_ID[f].radius * 1.12;
+    const sim = this.sim;
+    const target = this.orbPan.clone().add(this.origin);
+    let d = this.mapFocusBody() === 'vessel' ? 20 : 200;
+    const c = new THREE.Vector3();
+    for (const b of BODIES) {
+      const k = bodyPosition(b, sim.t, c).distanceTo(target);
+      if (k < b.radius) d = Math.max(d, b.radius * 1.12 + k);
+    }
+    return d;
   }
 
-  /** 二维地图 ↔ 三维游览。自动视图下切到三维时，以飞船所在的天体为焦点。 */
+  /** 二维地图 ↔ 三维地图（保持当前焦点；自动视图仍是自动视图）。 */
   toggleMap3d(): void {
-    this.setMapFocus(this.mapFocusBody(), !this.map3d);
+    this.map3dPref = !this.map3d;
+    this.setMapFocus(this.mapAutoFit ? 'auto' : this.mapFocusBody(), this.map3dPref);
   }
 
-  /** 进入三维游览：从太阳一侧斜着看过去（大半个星球是亮的），星球约占画面高度的六成。 */
-  private initOrbit(): void {
+  /**
+   * 进入三维地图：
+   * - 自动视图的上升段：转盘以当地竖直方向为轴、从轨道面的法向斜着看，弹道仍从地平线向上升起；
+   * - 其余：以北极方向为转轴，从太阳一侧偏开约 60° 斜着看过去（大半个星球是亮的，一侧露出晨昏线）。
+   */
+  private initOrbit(auto: boolean): void {
     const sim = this.sim;
     const f = this.mapFocusBody();
-    const center = f === 'vessel' ? sim.vessel.r.clone() : bodyPosition(BODY_BY_ID[f], sim.t, new THREE.Vector3());
-    const sd = f === 'sun' ? new THREE.Vector3(1, 0, 0) : sunDirection(center, sim.t, new THREE.Vector3());
-    // 从太阳一侧偏开约 60°：大半个星球是亮的，一侧露出晨昏线，低角度的光让地形起伏更立体
-    this.orbYaw = Math.atan2(sd.z, sd.x) - 1.05;
-    this.orbPitch = 0.38;
+    const B = this.orbBasis;
+    this.orbPan.set(0, 0, 0);
+    this.viewTween = null;
+    if (auto && this.mapUpRef) {
+      this.mapSnap = true;
+      const b = this.updateMapBasis(0);
+      B.right.copy(b.right);
+      B.up.copy(b.up);
+      B.normal.copy(b.normal);
+      this.orbYaw = 0.5;
+      this.orbPitch = 0.22;
+    } else {
+      B.right.set(1, 0, 0);
+      B.up.set(0, 1, 0);
+      B.normal.set(0, 0, 1);
+      const center = f === 'vessel' ? sim.vessel.r.clone() : bodyPosition(BODY_BY_ID[f], sim.t, new THREE.Vector3());
+      const sd = f === 'sun' ? new THREE.Vector3(1, 0, 0) : sunDirection(center, sim.t, new THREE.Vector3());
+      this.orbYaw = Math.atan2(sd.x, sd.z) - 1.05;
+      this.orbPitch = auto ? 0.62 : 0.38;
+    }
+    if (auto) {
+      this.computeFit();
+      this.orbPan.copy(this.fitCenter);
+      this.orbDist = this.orbDistTarget = this.fitDist;
+      return;
+    }
     // 星球约占画面高度的 60%，四周留出星空背景；土星要把光环也框进来
     const k = f === 'saturn' ? 7.5 : f === 'sun' ? 5 : 4.6;
     const d = f === 'vessel' ? Math.max(200, this.defaultMapExtent('vessel') * 2.2) : BODY_BY_ID[f].radius * k;
     this.orbDist = this.orbDistTarget = d;
   }
 
-  /** 切换地图焦点；'auto' 为自动视图：始终框住整条预测轨迹。view3d 不给时，选中天体进入三维游览，其余为二维地图。 */
+  /**
+   * 方向轴：从 dir（世界方向）一侧看过去。
+   * 飞行视图转动跟随相机；地图转动三维相机（二维地图先切换到三维）。
+   */
+  viewFrom(dir: THREE.Vector3): void {
+    const d = dir.clone().normalize();
+    if (this.mode === 'map') {
+      if (!this.map3d) {
+        this.map3dPref = true;
+        this.setMapFocus(this.mapAutoFit ? 'auto' : this.mapFocusBody(), true);
+      }
+      const B = this.orbBasis;
+      const y = d.dot(B.up);
+      const pitch = Math.asin(Math.max(-1, Math.min(1, y)));
+      const yaw = Math.abs(y) > 0.999 ? this.orbYaw : Math.atan2(d.dot(B.right), d.dot(B.normal));
+      this.startTween(this.orbYaw, this.orbPitch, yaw, pitch, true);
+    } else {
+      const { a, b, up } = this.flightCamFrame();
+      const y = d.dot(up);
+      const pitch = Math.max(-1.45, Math.min(1.45, Math.asin(Math.max(-1, Math.min(1, y)))));
+      const yaw = Math.abs(y) > 0.999 ? this.camYaw : Math.atan2(d.dot(b), d.dot(a));
+      this.startTween(this.camYaw, this.camPitch, yaw, pitch, false);
+    }
+  }
+
+  private startTween(yaw0: number, pitch0: number, yaw1: number, pitch1: number, map: boolean): void {
+    // 沿较短的方向转过去
+    let dy = (yaw1 - yaw0) % (2 * Math.PI);
+    if (dy > Math.PI) dy -= 2 * Math.PI;
+    if (dy < -Math.PI) dy += 2 * Math.PI;
+    this.viewTween = { t: 0, yaw0, pitch0, yaw1: yaw0 + dy, pitch1, map };
+  }
+
+  /** 飞行视图相机所在的参考系：a、b 为水平面内的两个方向，up 为转轴（随相机模式而定）。 */
+  private flightCamFrame(): { a: THREE.Vector3; b: THREE.Vector3; up: THREE.Vector3 } {
+    const tel = this.sim.telemetry;
+    if (this.camMode === 'chase') {
+      const q = this.sim.vessel.q;
+      return { up: UP.clone().applyQuaternion(q), a: new THREE.Vector3(0, 0, 1).applyQuaternion(q), b: new THREE.Vector3(1, 0, 0).applyQuaternion(q) };
+    }
+    if (this.camMode === 'free') return { up: new THREE.Vector3(0, 1, 0), a: new THREE.Vector3(1, 0, 0), b: new THREE.Vector3(0, 0, 1) };
+    return { up: tel.up.clone(), a: tel.north.clone(), b: tel.east.clone() };
+  }
+
+  /** 切换地图焦点；'auto' 为自动视图：始终框住整条预测轨迹。view3d 不给时沿用玩家选择的维度（默认三维）。 */
   setMapFocus(f: MapFocus | 'auto', view3d?: boolean): void {
     this.mapPan.set(0, 0);
     this.fitPred = undefined;
@@ -323,19 +431,19 @@ export class FlightScene {
       this.mapUpRef = null;
     }
     this.mapExtent = this.defaultMapExtent(this.mapFocusBody());
-    this.map3d = view3d ?? (f !== 'auto' && f !== 'vessel');
-    if (this.map3d) {
-      // 三维游览没有“自动”视图
-      if (f === 'auto') {
-        this.mapFocus = this.mapFocusBody();
-        this.mapAutoFit = false;
-      }
-      this.initOrbit();
-    }
+    this.mapOriginId = this.mapFocusBody();
+    const was3d = this.map3d;
+    this.map3d = view3d ?? this.map3dPref;
+    // 从三维切回二维：视平面直接对准当前轨道面
+    if (was3d && !this.map3d) this.mapSnap = true;
+    if (this.map3d) this.initOrbit(f === 'auto');
     this.map.set3d(this.map3d);
   }
 
-  /** 自动视图的目标：框住飞船、预测轨迹（上升段还包括已飞过的航迹）。 */
+  /**
+   * 自动视图的目标：框住飞船、预测轨迹（上升段还包括已飞过的航迹）。
+   * 二维地图得到视平面内的矩形（fitPan、fitExtent），三维地图得到包住这些点的球（fitCenter、fitDist）。
+   */
   private computeFit(): void {
     const sim = this.sim;
     const t = sim.t;
@@ -347,10 +455,12 @@ export class FlightScene {
     let x1 = -Infinity;
     let y0 = Infinity;
     let y1 = -Infinity;
+    const pts: number[] = [];
     const add = (x: number, y: number, z: number) => {
       const dx = x - center.x;
       const dy = y - center.y;
       const dz = z - center.z;
+      pts.push(dx, dy, dz);
       const u = dx * R.x + dy * R.y + dz * R.z;
       const v = dx * U.x + dy * U.y + dz * U.z;
       x0 = Math.min(x0, u);
@@ -391,6 +501,24 @@ export class FlightScene {
     const min = sim.landed ? 60_000 : 20_000;
     this.fitExtent = Math.max(min, Math.min(MAP_MAX_EXTENT, ext));
     this.fitPan.set((x0 + x1) / 2, (y0 + y1) / 2);
+
+    // 三维：包围盒中心 + 最远点的距离，相机后退到整个球都落在视场内
+    const lo = new THREE.Vector3(Infinity, Infinity, Infinity);
+    const hi = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+    const p = new THREE.Vector3();
+    for (let i = 0; i < pts.length; i += 3) {
+      p.fromArray(pts, i);
+      lo.min(p);
+      hi.max(p);
+    }
+    const c = lo.clone().add(hi).multiplyScalar(0.5);
+    let r = 0;
+    for (let i = 0; i < pts.length; i += 3) r = Math.max(r, p.fromArray(pts, i).distanceTo(c));
+    r = Math.max(min * 0.7, Math.min(MAP_MAX_EXTENT, r));
+    const half = (MAP3D_FOV * Math.PI) / 360;
+    const halfMin = Math.min(half, Math.atan(Math.tan(half) * aspect));
+    this.fitCenter.copy(c);
+    this.fitDist = (r / Math.sin(halfMin)) * 1.15;
   }
 
   private defaultMapExtent(f: MapFocus): number {
@@ -419,7 +547,7 @@ export class FlightScene {
     if (m === 'map') {
       this.mapSnap = true;
       this.setMapFocus('auto');
-    }
+    } else this.viewTween = null;
   }
 
   /** 地图视平面：法向取飞船相对焦点天体的轨道角动量方向（平滑过渡），屏幕“上”方向随焦点而定。 */
@@ -491,6 +619,18 @@ export class FlightScene {
       const f = this.mapFocusBody();
       if (f === 'vessel') this.origin.copy(V.r);
       else bodyPosition(BODY_BY_ID[f], t, this.origin);
+      // 自动视图跟着飞船换了天体（例如进入月球影响球）：平移视图抵消原点的跳变，再平滑地移到新的目标
+      if (f !== this.mapOriginId) {
+        if (this.mapOriginId !== null) {
+          const prevAbs = this.mapOriginId === 'vessel' ? V.r.clone() : bodyPosition(BODY_BY_ID[this.mapOriginId], t, new THREE.Vector3());
+          const shift = prevAbs.sub(this.origin);
+          this.orbPan.add(shift);
+          this.mapPan.x += shift.dot(this.mapRight);
+          this.mapPan.y += shift.dot(this.mapUp);
+        }
+        this.mapOriginId = f;
+        this.fitPred = undefined;
+      }
     } else {
       this.origin.copy(V.r);
     }
@@ -845,19 +985,51 @@ export class FlightScene {
     const sim = this.sim;
     const tel = sim.telemetry;
     const cam = this.camera;
+    this.stepTween(dt);
     if (this.mode === 'map' && this.map3d) {
-      // 三维游览：相机围绕焦点（浮动原点）旋转，普通视场角，背景是三维星空
-      this.orbDist *= Math.pow(this.orbDistTarget / this.orbDist, 1 - Math.exp(-dt * 10));
-      const d = this.orbDist;
-      const fov = 40;
-      const cp = Math.cos(this.orbPitch);
-      cam.position.set(cp * Math.cos(this.orbYaw), Math.sin(this.orbPitch), cp * Math.sin(this.orbYaw)).multiplyScalar(d);
-      cam.up.set(0, 1, 0);
-      cam.lookAt(0, 0, 0);
-      cam.fov = fov;
+      // 三维地图：相机围绕目标点（焦点 + 平移量）转动，普通视场角，背景是三维星空
       const f = this.mapFocusBody();
-      const R = f === 'vessel' ? 0 : BODY_BY_ID[f].radius;
-      cam.near = Math.max(0.3, (d - R) * 0.02);
+      if (this.mapAutoFit) {
+        // 自动视图：预测轨迹更新时重新计算包围球，平滑地移过去（旋转视角不影响）
+        const pred = this.sim.prediction;
+        if (pred !== this.fitPred) {
+          this.fitPred = pred;
+          this.computeFit();
+        }
+        const kf = 1 - Math.exp(-dt * 2.5);
+        this.orbPan.lerp(this.fitCenter, kf);
+        this.orbDistTarget = this.fitDist;
+        this.map.setFocusButton('auto');
+      } else this.map.setFocusButton(f);
+      this.orbDistTarget = Math.max(this.orbDistTarget, this.orbMinDist());
+      this.orbDist *= Math.pow(this.orbDistTarget / this.orbDist, 1 - Math.exp(-dt * (this.mapAutoFit ? 2.5 : 10)));
+      const d = this.orbDist;
+      const fov = MAP3D_FOV;
+      const B = this.orbBasis;
+      const cp = Math.cos(this.orbPitch);
+      const sp = Math.sin(this.orbPitch);
+      const sy = Math.sin(this.orbYaw);
+      const cy = Math.cos(this.orbYaw);
+      const dir = B.right.clone().multiplyScalar(cp * sy).addScaledVector(B.up, sp).addScaledVector(B.normal, cp * cy);
+      // 相机的“上”方向取俯仰角的切向：正对两极（pitch = ±90°）时也不会翻转
+      const camUp = B.right.clone().multiplyScalar(-sp * sy).addScaledVector(B.up, cp).addScaledVector(B.normal, -sp * cy);
+      const target = this.orbPan;
+      cam.position.copy(target).addScaledVector(dir, d);
+      // 不钻进星球里（贴近地面跟随飞船时只留几十米）
+      const c = new THREE.Vector3();
+      let surf = Infinity;
+      for (const b of BODIES) {
+        bodyPosition(b, sim.t, c).sub(this.origin);
+        const rel = cam.position.clone().sub(c);
+        const k = rel.length();
+        const m = Math.max(30, Math.min(b.radius * 0.02, d * 0.05));
+        if (k < b.radius + m) cam.position.copy(c).addScaledVector(rel.normalize(), b.radius + m);
+        surf = Math.min(surf, Math.max(0, k - b.radius));
+      }
+      cam.up.copy(camUp);
+      cam.lookAt(target);
+      cam.fov = fov;
+      cam.near = Math.max(0.3, Math.min(surf, d) * 0.02);
       cam.updateMatrixWorld();
       this.mapBasis = {
         right: new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion),
@@ -865,7 +1037,6 @@ export class FlightScene {
         normal: new THREE.Vector3(0, 0, 1).applyQuaternion(cam.quaternion),
         extent: d * Math.tan(((fov / 2) * Math.PI) / 180),
       };
-      this.map.setFocusButton(f);
     } else if (this.mode === 'map') {
       // 远处的长焦相机沿视平面法向俯视：平面内的轨迹没有透视变形，相当于二维地图
       const b = (this.mapBasis = this.updateMapBasis(dt));
@@ -879,23 +1050,7 @@ export class FlightScene {
       cam.near = Math.max(1, d * 0.001);
     } else {
       cam.fov = 55;
-      let up: THREE.Vector3;
-      let a: THREE.Vector3;
-      let b: THREE.Vector3;
-      if (this.camMode === 'chase') {
-        const q = sim.vessel.q;
-        up = UP.clone().applyQuaternion(q);
-        a = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
-        b = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
-      } else if (this.camMode === 'free') {
-        up = new THREE.Vector3(0, 1, 0);
-        a = new THREE.Vector3(1, 0, 0);
-        b = new THREE.Vector3(0, 0, 1);
-      } else {
-        up = tel.up.clone();
-        a = tel.north.clone();
-        b = tel.east.clone();
-      }
+      const { up, a, b } = this.flightCamFrame();
       const off = a
         .clone()
         .multiplyScalar(Math.cos(this.camPitch) * Math.cos(this.camYaw))
@@ -924,6 +1079,28 @@ export class FlightScene {
     }
     cam.updateProjectionMatrix();
     cam.updateMatrixWorld();
+  }
+
+  /** 点击方向轴后的转动动画（约 0.4 秒，先快后慢） */
+  private stepTween(dt: number): void {
+    const tw = this.viewTween;
+    if (!tw) return;
+    if (tw.map !== (this.mode === 'map')) {
+      this.viewTween = null;
+      return;
+    }
+    tw.t = Math.min(1, tw.t + dt / 0.4);
+    const k = 1 - Math.pow(1 - tw.t, 3);
+    const yaw = tw.yaw0 + (tw.yaw1 - tw.yaw0) * k;
+    const pitch = tw.pitch0 + (tw.pitch1 - tw.pitch0) * k;
+    if (tw.map) {
+      this.orbYaw = yaw;
+      this.orbPitch = pitch;
+    } else {
+      this.camYaw = yaw;
+      this.camPitch = pitch;
+    }
+    if (tw.t >= 1) this.viewTween = null;
   }
 
   render(): void {

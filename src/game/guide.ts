@@ -1,6 +1,6 @@
 import { BODY_BY_ID } from '../physics/bodies';
 import type { FlightSim } from './flight';
-import { fmtTime } from '../ui/format';
+import { compassName, fmtTime } from '../ui/format';
 
 /** 上升段建议倾角（度，0 = 竖直），与自动入轨使用同一条重力转弯曲线。 */
 export function suggestedTilt(alt: number): number {
@@ -36,6 +36,9 @@ export function nextStep(sim: FlightSim): GuideStep | null {
   // 去过其他天体（不再是从地面起飞的上升段）
   const fromAfar = done.has('moonSoi') || [...done].some((id) => id.endsWith('Soi')) || sim.scenario === 'lmo';
 
+  // 方向舵的航向（默认正东）
+  const dirName = compassName(sim.rudderHeading);
+
   if (ap.mode !== 'off') return { text: `飞行辅助工作中 —— ${ap.status || '请稍候'}（按 ← / → 可随时接管）`, kind: 'wait' };
 
   // 发射前
@@ -44,11 +47,11 @@ export function nextStep(sim: FlightSim): GuideStep | null {
   // 地球上升段
   if (earth && !done.has('return') && !inOrbit && !fromAfar && !o.hyperbolic && !sim.landed) {
     if (o.apAlt < 90_000 && thrust) {
-      if (tel.alt < 900) return { text: '竖直爬升中……到 1 km 后按 → 让火箭向东倾斜', kind: 'wait' };
+      if (tel.alt < 900) return { text: `竖直爬升中……到 1 km 后按 → 让火箭向${dirName}倾斜`, kind: 'wait' };
       const want = suggestedTilt(tel.alt);
       const cur = (sim.tiltAngle() * 180) / Math.PI;
       const diff = want - cur;
-      const hint = Math.abs(diff) < 4 ? '保持住' : diff > 0 ? '按 → 再向东倾斜' : '按 ← 回正一点';
+      const hint = Math.abs(diff) < 4 ? '保持住' : diff > 0 ? `按 → 再向${dirName}倾斜` : '按 ← 回正一点';
       return { text: `重力转弯：建议倾角 ${want.toFixed(0)}°（当前 ${cur.toFixed(0)}°），${hint} · 远地点 ${km(o.apAlt)} / 目标 100 km`, kind: 'act' };
     }
     if (o.apAlt >= 90_000 && thrust && tel.alt < atmoTop) return { text: '远地点已够高：按 X 关机，滑行出大气层（看蓝色预测弹道的最高点）', kind: 'act' };
@@ -56,7 +59,7 @@ export function nextStep(sim: FlightSim): GuideStep | null {
       if (sim.nodes.length) return { text: '已规划圆化机动：点“执行机动”自动点火（或 ⏩ 加速到节点前）', kind: 'act' };
       return { text: `滑行至远地点（${Math.max(0, o.timeToAp).toFixed(0)} 秒后）：按 N 打开机动规划 → “远拱点圆化” → “执行机动”`, kind: 'act' };
     }
-    if (tel.vVert < 0 && o.apAlt < 70_000 && sim.launched) return { text: '弹道正在下落：继续点火并向东倾斜，把远地点抬到 100 km；无法入轨时准备降落伞 (P)', kind: 'act' };
+    if (tel.vVert < 0 && o.apAlt < 70_000 && sim.launched) return { text: `弹道正在下落：继续点火并向${dirName}倾斜，把远地点抬到 100 km；无法入轨时准备降落伞 (P)`, kind: 'act' };
   }
 
   const node = sim.nodes[0];

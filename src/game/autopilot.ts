@@ -145,7 +145,8 @@ export class Autopilot {
       let pitch = 90;
       if (alt > turnStart) pitch = 90 - 88 * Math.pow(Math.min(1, (alt - turnStart) / (turnEnd - turnStart)), 0.42);
       const pr = (pitch * Math.PI) / 180;
-      const dir = tel.up.clone().multiplyScalar(Math.sin(pr)).addScaledVector(tel.east, Math.cos(pr)).normalize();
+      // 沿方向舵的航向转弯（默认正东；改成正北/正南得到极地轨道）
+      const dir = tel.up.clone().multiplyScalar(Math.sin(pr)).addScaledVector(sim.rudderDir(), Math.cos(pr)).normalize();
       // 大动压时限制攻角
       if (tel.dynPressure > 4000 && tel.surfSpeed > 50) {
         const pro = tel.vSurfVec.clone().normalize();

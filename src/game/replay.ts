@@ -2,7 +2,7 @@ import { Quaternion, Vector3 } from 'three';
 import { BODIES, type Body, type BodyId, atmoPressure, bodyPosition, bodyRotation, bodyVelocity, dominantBody, fromBodyFixed, surfaceVelocity } from '../physics/bodies';
 import { cloneDesign } from '../rocket/design';
 import { FRAME_DEAD, FRAME_LANDED, FRAME_THRUST, FRAME_WATER, type DemoData, type DemoEvent } from './demo';
-import { FlightSim, PHYS_WARP_MAX, WARP_LEVELS, type SasMode, type SpeedMode } from './flight';
+import { FlightSim, PHYS_WARP_MAX, RUDDER_HEADING_EAST, WARP_LEVELS, type SasMode, type SpeedMode } from './flight';
 import { orbitalFrame } from './recorder';
 import { FlightTrail } from './trail';
 import { Vessel, type ChuteState, type RuntimePart } from './vessel';
@@ -663,6 +663,8 @@ export class ReplayPlayer {
         sim.sasOn = !!e.on;
         sim.sasMode = e.mode as SasMode;
         sim.rudderAngle = (e.rud as number) ?? 0;
+        // 加入航向轴之前录制的 Demo 没有 hdg：方向舵只能朝正东
+        sim.rudderHeading = (e.hdg as number) ?? RUDDER_HEADING_EAST;
         break;
       case 'ap':
         sim.autopilot.mode = e.mode as APMode;

@@ -52,8 +52,8 @@ void main() {
 `;
 
 /**
- * 二维地图：相机始终垂直于飞船的轨道平面俯视，只能平移与缩放（不再三维旋转），
- * 但地球、月球、大气辉光仍用飞行视图同一套三维着色器渲染，保持原来的质感。
+ * 地图：默认三维（相机围绕焦点转动，可以从任意角度看轨道面与倾角）；也可切换为二维俯视
+ * （相机始终垂直于飞船的轨道平面，只能平移与缩放）。星球与大气辉光用飞行视图同一套三维着色器渲染。
  * 画面内容：飞船当前的预测轨迹（带流动光点，不画已飞过的航迹）、1 秒前的幽灵轨迹、月球轨道、影响球、大气层边界，
  * 以及远/近拱点（含变化量）、落点、进出影响球、机动节点等标记。
  */
@@ -81,8 +81,8 @@ export class MapView {
   private focusBtns = new Map<MapFocus | 'auto', HTMLButtonElement>();
   onFocus: (f: MapFocus | 'auto') => void = () => {};
   onToggle3d: () => void = () => {};
-  /** 三维游览模式（围绕天体旋转观察） */
-  is3d = false;
+  /** 三维地图（默认；围绕焦点旋转观察） */
+  is3d = true;
   private btn3d!: HTMLButtonElement;
   private hint!: HTMLSpanElement;
   visible = false;
@@ -176,12 +176,12 @@ export class MapView {
     this.btn3d = document.createElement('button');
     this.btn3d.className = 'map-3d';
     this.btn3d.textContent = '3D';
-    this.btn3d.title = '三维游览：拖动旋转、滚轮缩放（点选天体时自动进入）';
+    this.btn3d.title = '三维地图（默认）：拖动旋转、右键拖动平移、滚轮缩放；再点一次切换为二维俯视（相机垂直于轨道面）';
     this.btn3d.addEventListener('click', () => this.onToggle3d());
     this.toolbar.append(this.btn3d);
     const hint = (this.hint = document.createElement('span'));
     hint.className = 'map-hint';
-    hint.textContent = '拖动平移 · 滚轮缩放';
+    hint.textContent = '拖动旋转 · 右键平移 · 滚轮缩放';
     this.toolbar.append(hint);
     overlay.appendChild(this.toolbar);
   }
@@ -199,14 +199,15 @@ export class MapView {
   }
 
   /**
-   * 切换三维游览：屏幕空间的星点换成随视角转动的三维星空；
+   * 切换三维地图：屏幕空间的星点换成随视角转动的三维星空；
    * 轨迹线与轨道圈参与深度测试，转到星球背面时被星球挡住。
    */
   set3d(on: boolean): void {
     this.is3d = on;
     this.stars.visible = !on;
     this.btn3d.classList.toggle('on', on);
-    this.hint.textContent = on ? '拖动旋转 · 滚轮缩放' : '拖动平移 · 滚轮缩放';
+    this.btn3d.textContent = on ? '3D' : '2D';
+    this.hint.textContent = on ? '拖动旋转 · 右键平移 · 滚轮缩放' : '拖动平移 · 滚轮缩放';
     this.group.traverse((o) => {
       const m = (o as THREE.Mesh).material as THREE.Material | undefined;
       if (m && o !== this.stars) m.depthTest = on;

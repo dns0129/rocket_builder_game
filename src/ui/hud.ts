@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { FlightSim, SasMode } from '../game/flight';
-import { WARP_LEVELS, PHYS_WARP_MAX } from '../game/flight';
+import { WARP_LEVELS, PHYS_WARP_MAX, RUDDER_HEADING_EAST } from '../game/flight';
 import { MISSIONS, PLANET_MISSIONS, loadAchievements } from '../game/missions';
 import { solveCapture, solveCaptureAt, solveChangeApsis, solveCircularize, solveCorrection, solvePlanetCorrection, solveReturn, solveTLI, solveTransfer, type SolveResult, type TransferPlan } from '../game/maneuver';
 import { BODY_BY_ID, EARTH, HELIO, type BodyId } from '../physics/bodies';
@@ -9,7 +9,8 @@ import { Navball } from '../render/navball';
 import { nextStep } from '../game/guide';
 import { TrajectoryProfile } from './profile';
 import { h, setText } from './dom';
-import { fmtDist, fmtMET, fmtSpeed, fmtTime, fmtMass } from './format';
+import { compassName, fmtDist, fmtHeading, fmtMET, fmtSpeed, fmtTime, fmtMass } from './format';
+import { AxisGizmo, type GizmoAxis } from './axisGizmo';
 
 export interface HudCallbacks {
   pause: () => void;
@@ -22,6 +23,17 @@ const UP = new THREE.Vector3(0, 1, 0);
 
 /** 导航球直径（px） */
 const NAVBALL = 116;
+
+/** 方向轴的颜色：东（红）、上（绿）、北（蓝），对应三维软件里 X / Y / Z 的习惯配色 */
+const AXIS_COLORS = { x: '#ff6b5b', y: '#7fe08a', z: '#5aa9ff' };
+/** 地图的方向轴：模拟所用的赤道坐标系（Y 轴 = 地轴北极方向，XZ = 赤道面，月球与行星都在这个面内公转） */
+const MAP_AXES: GizmoAxis[] = [
+  { dir: new THREE.Vector3(1, 0, 0), label: 'X', color: AXIS_COLORS.x },
+  { dir: new THREE.Vector3(0, 1, 0), label: '北', negLabel: '南', color: AXIS_COLORS.y },
+  { dir: new THREE.Vector3(0, 0, 1), label: 'Z', color: AXIS_COLORS.z },
+];
+const GIZMO_TITLE_FLIGHT = '方向轴（当地方向）：东 / 北 / 上随视角转动，空心圆是反方向（西 / 南 / 下）。点击轴端，相机转到从该方向看火箭';
+const GIZMO_TITLE_MAP = '方向轴（赤道坐标系）：“北”指向地轴北极，X、Z 在赤道面内（月球和行星都在这个面上公转）。点击轴端从该方向观察，例如点“北”从正上方俯视赤道面';
 
 export class FlightHUD {
   root: HTMLDivElement;
@@ -58,7 +70,13 @@ export class FlightHUD {
     rocket: SVGGElement;
     ap: SVGPathElement;
     label: HTMLElement;
+    /** 刻度盘左右两侧的方位字（随航向轴变化） */
+    left: SVGTextElement;
+    right: SVGTextElement;
+    hdgLabel: HTMLElement;
   };
+  /** 方向轴（左上角，随视角转动） */
+  private gizmo: AxisGizmo;
 
   constructor(parent: HTMLElement, sim: FlightSim, scene: FlightScene, cb: HudCallbacks, opts: { replay?: boolean } = {}) {
     this.sim = sim;
@@ -82,6 +100,14 @@ export class FlightHUD {
         row('过载', 'g'),
       ),
     );
+
+    // 左上：方向轴（随视角转动，点击轴端从该方向观察）
+    this.gizmo = new AxisGizmo(GIZMO_TITLE_FLIGHT);
+    this.gizmo.onPick = (d) => {
+      this.cb.click();
+      this.scene.viewFrom(d);
+    };
+    this.root.appendChild(this.gizmo.el);
 
     // 顶部：下一步提示
     this.root.appendChild((E.guide = h('div', { class: 'guide' })));
@@ -318,6 +344,7 @@ export class FlightHUD {
       const t = el('text', { x, y: y + 5.5, class: 'rud-num' }, svg);
       t.textContent = String(Math.abs(a));
     }
+    // 两侧的方位字：默认航向正东时右东左西，随航向轴变化
     const w = el('text', { x: 9, y: 126, class: 'rud-dir' }, svg);
     w.textContent = '西';
     const e = el('text', { x: 191, y: 126, class: 'rud-dir' }, svg);
@@ -357,15 +384,29 @@ export class FlightHUD {
       onclick: () => {
         this.cb.click();
         if (this.sim.rudderActive) this.sim.setSas('stability');
-        else this.sim.setRudder(this.sim.tiltAngle());
+        else this.sim.engageRudder();
       },
     });
-    this.rud = { svg, fill, knob, link, rocket, ap, label };
+    // 航向轴：倾斜所在的竖直平面朝向哪个方位（默认正东）
+    const turn = (deg: number) => () => {
+      this.cb.click();
+      this.sim.nudgeRudderHeading((deg * Math.PI) / 180);
+    };
+    const hdgLabel = h('div', {
+      class: 'rudder-lbl',
+      title: '方向舵的航向轴：火箭朝这个方位倾斜（点击恢复正东 090°）。正北 / 正南发射进入极地轨道，自动入轨也沿这个航向转弯',
+      onclick: () => {
+        this.cb.click();
+        this.sim.setRudderHeading(RUDDER_HEADING_EAST);
+      },
+    });
+    this.rud = { svg, fill, knob, link, rocket, ap, label, left: w, right: e, hdgLabel };
     return h(
       'div',
-      { class: 'rudder', title: '方向舵：拖动旋钮或按 ← / → 直接设定火箭倾角，可以转满一圈' },
+      { class: 'rudder', title: '方向舵：拖动旋钮或按 ← / → 直接设定火箭倾角，可以转满一圈；[ / ] 转动航向轴' },
       svg,
-      h('div', { class: 'rudder-row' }, h('button', { onclick: step(-5), title: '逆时针 5°（向西）' }, '↺'), label, h('button', { onclick: step(5), title: '顺时针 5°（向东）' }, '↻')),
+      h('div', { class: 'rudder-row' }, h('button', { onclick: step(-5), title: '逆时针 5°' }, '↺'), label, h('button', { onclick: step(5), title: '顺时针 5°' }, '↻')),
+      h('div', { class: 'rudder-row' }, h('button', { onclick: turn(-15), title: '航向向左转 15°（[ 键）' }, '↶'), hdgLabel, h('button', { onclick: turn(15), title: '航向向右转 15°（] 键）' }, '↷')),
     );
   }
 
@@ -386,18 +427,42 @@ export class FlightHUD {
     R.link.setAttribute('x2', kx.toFixed(1));
     R.link.setAttribute('y2', ky.toFixed(1));
     R.fill.setAttribute('d', active && Math.abs(cmd) > 0.5 ? arcPath(0, cmd) : '');
-    // 飞行辅助的目标倾角（蓝色三角）
+    // 飞行辅助的目标倾角（蓝色三角），投影到航向平面内
     const ap = sim.autopilot.mode !== 'off' ? sim.autopilot.targetDir : null;
     if (ap) {
       const tel = sim.telemetry;
-      const a = deg(Math.atan2(ap.dot(tel.east), ap.dot(tel.up)));
+      const a = deg(Math.atan2(ap.dot(sim.rudderDir()), ap.dot(tel.up)));
       const [x, y] = dialPt(a, DIAL.r + 14);
       R.ap.setAttribute('transform', `translate(${x.toFixed(1)} ${y.toFixed(1)}) rotate(${a.toFixed(1)})`);
       R.ap.style.display = '';
     } else R.ap.style.display = 'none';
-    const dirTxt = (d: number) => (Math.abs(d) < 0.5 ? '竖直 0°' : Math.abs(d) > 179.5 ? '倒立 180°' : `${d > 0 ? '东' : '西'} ${Math.abs(d).toFixed(0)}°`);
+    // 航向轴：刻度盘右侧是航向，左侧是相反方向
+    const fwdName = compassName(sim.rudderHeading);
+    const backName = compassName(sim.rudderHeading + Math.PI);
+    setDialDir(R.right, fwdName, 191);
+    setDialDir(R.left, backName, 9);
+    const dirTxt = (d: number) => (Math.abs(d) < 0.5 ? '竖直 0°' : Math.abs(d) > 179.5 ? '倒立 180°' : `${d > 0 ? fwdName : backName} ${Math.abs(d).toFixed(0)}°`);
     setText(R.label, active ? `方向舵 ${dirTxt(cmd)}` : `方向舵 关 · ${dirTxt(actual)}`);
     R.label.classList.toggle('on', active);
+    setText(R.hdgLabel, `航向 ${fmtHeading(sim.rudderHeading)}`);
+    R.hdgLabel.classList.toggle('on', active);
+  }
+
+  /** 方向轴：飞行视图显示当地的东 / 北 / 上，地图显示赤道坐标系。 */
+  private updateGizmo(): void {
+    const sc = this.scene;
+    const tel = this.sim.telemetry;
+    if (sc.mode === 'map') {
+      this.gizmo.update(sc.camera.quaternion, MAP_AXES);
+      this.gizmo.setTitle(GIZMO_TITLE_MAP);
+    } else {
+      this.gizmo.update(sc.camera.quaternion, [
+        { dir: tel.east, label: '东', negLabel: '西', color: AXIS_COLORS.x },
+        { dir: tel.up, label: '上', negLabel: '下', color: AXIS_COLORS.y },
+        { dir: tel.north, label: '北', negLabel: '南', color: AXIS_COLORS.z },
+      ]);
+      this.gizmo.setTitle(GIZMO_TITLE_FLIGHT);
+    }
   }
 
   togglePlanner(v?: boolean): void {
@@ -430,6 +495,7 @@ export class FlightHUD {
     // 导航球：隔帧更新（第二个 WebGL 画布，30 帧足够）
     if (this.frameNo % 2 === 0) this.updateNavball();
     this.updateGauges();
+    this.updateGizmo();
     this.textTimer -= dt;
     if (this.textTimer > 0) return;
     this.textTimer = 0.1;
@@ -872,12 +938,22 @@ export class FlightHUD {
   }
 
   dispose(): void {
+    this.gizmo.dispose();
     this.root.remove();
   }
 }
 
-/** 方向舵刻度盘几何：圆心在中央，0° 指向正上方，正角度顺时针（向东），±180° 指向正下方。 */
+/** 方向舵刻度盘几何：圆心在中央，0° 指向正上方，正角度顺时针（倒向航向一侧，默认向东），±180° 指向正下方。 */
 const DIAL = { cx: 100, cy: 100, r: 72 };
+
+/** 刻度盘两侧的方位字：两个字（东北等）时缩小并往里收，不被画布裁掉 */
+function setDialDir(t: SVGTextElement, name: string, x: number): void {
+  if (t.textContent === name) return;
+  t.textContent = name;
+  const long = name.length > 1;
+  t.setAttribute('x', String(long ? (x < 100 ? x + 6 : x - 6) : x));
+  t.style.fontSize = long ? '13px' : '';
+}
 
 function dialPt(deg: number, r: number): [number, number] {
   const a = (deg * Math.PI) / 180;

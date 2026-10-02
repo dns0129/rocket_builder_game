@@ -103,6 +103,7 @@ export class FlightRecorder {
     sasOn: true,
     sasMode: '',
     rudder: 0,
+    hdg: 0,
     ap: 'off',
     apStatus: '',
     apStatusT: -Infinity,
@@ -342,11 +343,14 @@ export class FlightRecorder {
       this.push({ t, k: 'chute', s: S.chute });
     }
     const rud = sim.sasMode === 'rudder' ? sim.rudderAngle : 0;
-    if (sim.sasOn !== S.sasOn || sim.sasMode !== S.sasMode || Math.abs(rud - S.rudder) > 0.5 * DEG) {
+    // 方向舵的航向（自动入轨也沿它转弯）：变化时一并记录
+    const hdg = sim.rudderHeading;
+    if (sim.sasOn !== S.sasOn || sim.sasMode !== S.sasMode || Math.abs(rud - S.rudder) > 0.5 * DEG || Math.abs(hdg - S.hdg) > 0.5 * DEG) {
       S.sasOn = sim.sasOn;
       S.sasMode = sim.sasMode;
       S.rudder = rud;
-      this.push({ t, k: 'sas', on: S.sasOn, mode: S.sasMode, rud });
+      S.hdg = hdg;
+      this.push({ t, k: 'sas', on: S.sasOn, mode: S.sasMode, rud, hdg });
     }
     const ap = sim.autopilot;
     const prefix = (s: string) => s.split(/[：:]/)[0];

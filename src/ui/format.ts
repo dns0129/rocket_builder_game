@@ -49,3 +49,17 @@ export function fmtMET(s: number): string {
   const p2 = (x: number) => String(x).padStart(2, '0');
   return `${neg ? 'T-' : 'T+'}${d > 0 ? d + '天 ' : ''}${p2(h)}:${p2(m)}:${p2(sec)}`;
 }
+
+const COMPASS = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'];
+
+/** 航向（弧度，0 正北、顺时针）对应的八方位名称。 */
+export function compassName(heading: number): string {
+  const k = Math.round(heading / (Math.PI / 4));
+  return COMPASS[((k % 8) + 8) % 8];
+}
+
+/** 航向读数，例如“东 090°”。 */
+export function fmtHeading(heading: number): string {
+  const d = Math.round((heading * 180) / Math.PI);
+  return `${compassName(heading)} ${String(((d % 360) + 360) % 360).padStart(3, '0')}°`;
+}
