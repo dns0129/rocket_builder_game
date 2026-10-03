@@ -1388,23 +1388,6 @@ input[type='text'] {
   color: #ff6a5a;
 }
 
-.mk-vessel {
-  padding-left: 0;
-  margin-left: -12px;
-  margin-top: -12px;
-}
-
-.mk-vessel svg {
-  display: block;
-  width: 24px;
-  height: 24px;
-  fill: #ffe34a;
-  stroke: #201a00;
-  stroke-width: 1.2;
-  stroke-linejoin: round;
-  filter: drop-shadow(0 0 5px rgba(255, 227, 74, 0.75));
-}
-
 /* 远/近拱点的变化量 */
 .d-up {
   color: var(--good);
@@ -1464,7 +1447,6 @@ input[type='text'] {
   white-space: nowrap;
 }
 
-.mk-vessel::before,
 .mk-body::before {
   display: none;
 }

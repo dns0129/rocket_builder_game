@@ -5,6 +5,7 @@ import type { FlightSim } from '../game/flight';
 import type { Prediction } from '../game/predictor';
 import { DynLine, PolyBuilder, RingLine, fadeLineMaterial } from './lines';
 import { ScreenLabels } from './labels';
+import { VesselMarker } from './vesselMarker';
 import { TRAJ, apsisName, deltaHtml, placeSegments, segColor, segImpactT, type SegPlacement } from './trajectoryView';
 import { fmtDist, fmtTime } from '../ui/format';
 
@@ -27,7 +28,6 @@ function orbitRadius(b: Body): number {
 function ringAlpha(rPx: number, max: number): number {
   return THREE.MathUtils.clamp((rPx - 6) / 30, 0, 1) * (1 - THREE.MathUtils.smoothstep(rPx, 2e4, 1e5)) * max;
 }
-const UP = new THREE.Vector3(0, 1, 0);
 
 /** 屏幕空间星空（二维地图的背景，叠加在大气散射天空上）。 */
 const STAR_FRAG = /* glsl */ `
@@ -61,6 +61,8 @@ export class MapView {
   group = new THREE.Group();
   private overlay: HTMLDivElement;
   private labels: ScreenLabels;
+  /** 飞船标记：随箭体姿态转动的三维三角锥 */
+  private marker = new VesselMarker();
   private pb = new PolyBuilder();
   private pred: Record<BodyId, DynLine>;
   private ghost: Record<BodyId, DynLine>;
@@ -90,6 +92,7 @@ export class MapView {
   constructor(overlay: HTMLDivElement) {
     this.overlay = overlay;
     this.labels = new ScreenLabels(overlay);
+    this.group.add(this.marker.group);
     const mkSet = (make: () => DynLine) => Object.fromEntries(BODY_IDS.map((id) => [id, make()])) as Record<BodyId, DynLine>;
     // 线宽含两侧各约 1 像素的抗锯齿渐变；流动光点亮度低于泛光阈值，避免泛光把细线糊成一串方块
     this.ghost = mkSet(() => new DynLine([fadeLineMaterial({ width: 1.8, depthTest: false })], 52));
@@ -208,9 +211,10 @@ export class MapView {
     this.btn3d.classList.toggle('on', on);
     this.btn3d.textContent = on ? '3D' : '2D';
     this.hint.textContent = on ? '拖动旋转 · 右键平移 · 滚轮缩放' : '拖动平移 · 滚轮缩放';
+    // 飞船标记始终画在最上层（被星球挡住时整个隐藏），不参与深度测试
     this.group.traverse((o) => {
       const m = (o as THREE.Mesh).material as THREE.Material | undefined;
-      if (m && o !== this.stars) m.depthTest = on;
+      if (m && o !== this.stars && o.parent !== this.marker.group) m.depthTest = on;
     });
   }
 
@@ -254,7 +258,7 @@ export class MapView {
 
   // ---------------------------------------------------------------- 每帧
 
-  update(sim: FlightSim, ghost: Prediction | null, origin: THREE.Vector3, camera: THREE.Camera, w: number, h: number, view: MapBasis, dt: number): void {
+  update(sim: FlightSim, ghost: Prediction | null, origin: THREE.Vector3, camera: THREE.PerspectiveCamera, w: number, h: number, view: MapBasis, dt: number): void {
     this.labels.begin();
     if (!this.visible) return;
     const t = sim.t;
@@ -364,17 +368,6 @@ export class MapView {
         }
       }
     }
-    // 飞船图标：箭头指向机头方向（机头垂直于屏幕时改用速度方向）
-    const fwd = UP.clone().applyQuaternion(V.q);
-    let sx = fwd.dot(view.right);
-    let sy = fwd.dot(view.up);
-    if (Math.hypot(sx, sy) < 0.25) {
-      const vr = sim.telemetry.vOrbVec;
-      sx = vr.dot(view.right);
-      sy = vr.dot(view.up);
-    }
-    const rot = (Math.atan2(sx, sy) * 180) / Math.PI;
-    this.labels.add(vesselW, '<svg viewBox="-12 -12 24 24"><path d="M0,-10 L6,7 L0,3.5 L-6,7 Z"/></svg>', 'mk-vessel', rot);
     // 天体名称：与上级天体在屏幕上挤在一起时省略
     for (const b of BODIES) {
       if (b.parent && bodyW[b.id].distanceTo(bodyW[b.parent]) / mpp < 26) continue;
@@ -383,7 +376,7 @@ export class MapView {
       this.labels.add(bodyW[b.id].clone().addScaledVector(view.up, -off), tgt ? `◎ ${b.name}` : b.name, tgt ? 'mk-body mk-target' : 'mk-body');
     }
     for (const e of encs) this.labels.add(e.pos.clone().addScaledVector(view.up, Math.max(e.body.radius * 1.3, mpp * 13)), `${e.body.name}（相遇时）<br><small>${fmtTime(e.t - t)} 后</small>`, 'mk-body mk-enc');
-    // 三维游览：被星球挡住的标签不显示
+    // 三维地图：被星球挡住的标签不显示
     let hidden: ((p: THREE.Vector3) => boolean) | undefined;
     if (this.is3d) {
       const c = camera.position;
@@ -407,6 +400,8 @@ export class MapView {
       };
     }
     this.labels.layout(camera, w, h, hidden);
+    // 飞船：三维三角锥，随箭体姿态实时转动（被星球挡住时隐藏）
+    this.marker.update(vesselW, V.q, camera, h, !sim.destroyed && !hidden?.(vesselW));
 
     // 比例尺
     const target = mpp * 110;
@@ -419,6 +414,7 @@ export class MapView {
   dispose(): void {
     for (const id of BODY_IDS) for (const set of [this.ghost, this.pred]) set[id].dispose();
     for (const r of this.allRings) r.dispose();
+    this.marker.dispose();
     this.labels.dispose();
     this.toolbar.remove();
   }
