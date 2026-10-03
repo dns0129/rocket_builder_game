@@ -193,6 +193,15 @@ export class SeparationFx {
     this.ullage = [];
   }
 
+  /** 清掉所有分离特效（回放向后跳转、重建箭体模型时）。 */
+  reset(): void {
+    this.clearUllage();
+    for (const fx of this.fx.values()) for (const m of fx.motors) m.plume.dispose();
+    this.fx.clear();
+    this.flashT = 0;
+    this.flash.intensity = 0;
+  }
+
   onDebrisGone(id: number): void {
     const fx = this.fx.get(id);
     if (!fx) return;

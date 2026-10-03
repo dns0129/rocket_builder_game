@@ -1,8 +1,8 @@
 import * as THREE from 'three';
-import { type Body, bodyRotation, fromBodyFixed } from '../physics/bodies';
+import { type Body, type BodyId, bodyRotation, fromBodyFixed } from '../physics/bodies';
 import { generatePatch, type PatchJob, type PatchResult } from './terrainGen';
 import { ATMOSPHERE_GLSL } from './atmosphereGLSL';
-import { LIGHT_GLSL, sharedUniforms } from './planets';
+import { ATMO_LOOK, LIGHT_GLSL, sharedUniforms } from './planets';
 import type { PlanetMaps } from './planetBake';
 import { groundDetail } from './textures';
 
@@ -25,6 +25,35 @@ const EARTH_NEAR_GRADE = /* glsl */ `
           diffuseColor.rgb = mix(cc, veg, nearF * k);
         }`;
 
+/**
+ * 近处水面：两层以不同方向缓慢流动的法线贴图叠成波浪，替换掉陆地用的细节法线；
+ * 浅水区（靠近海岸）颜色更绿更亮，岸边有一圈白色浪花。
+ */
+const SHORE = /* glsl */ `
+        {
+          // 离海岸的远近：用模糊（低分辨率 mip）后的水体遮罩估计
+          float wBlur = textureLod(map, vMapUv, 4.0).a;
+          float shallow = clamp((1.0 - wBlur) * 2.5, 0.0, 1.0) * waterMask;
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.16, 0.42, 0.42), shallow * 0.55);
+          // 岸边的浪花：水陆交界附近一窄条，随时间起伏
+          float edge = waterMask * (1.0 - waterMask) * 4.0;
+          float foam = edge * (0.6 + 0.4 * sin(uTime * 0.9 + vNormalMapUv.x * 0.7 + vNormalMapUv.y * 0.5));
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.9), clamp(foam, 0.0, 1.0) * (1.0 - smoothstep(1500.0, 6000.0, vDist)));
+        }`;
+
+const WATER_WAVES = /* glsl */ `
+        #ifdef USE_NORMALMAP_TANGENTSPACE
+        if (waterMask > 0.01) {
+          float tw = uTime;
+          vec2 wuv = vNormalMapUv * 0.55;
+          vec3 w1 = texture2D(normalMap, wuv + vec2(tw * 0.011, tw * 0.006)).xyz * 2.0 - 1.0;
+          vec3 w2 = texture2D(normalMap, wuv * 2.7 + vec2(-tw * 0.008, tw * 0.013)).xyz * 2.0 - 1.0;
+          float calm = smoothstep(2000.0, 12000.0, vDist);
+          vec3 wn = normalize(vec3((w1.xy * 0.6 + w2.xy * 0.4) * mix(0.55, 0.15, calm), 1.0));
+          normal = normalize(mix(normal, normalize(tbn * wn), waterMask));
+        }
+        #endif`;
+
 export class TerrainPatch {
   mesh: THREE.Mesh;
   body: Body | null = null;
@@ -40,8 +69,8 @@ export class TerrainPatch {
   private pendingSince = 0;
   private jobId = 0;
   private worker: Worker | null = null;
-  private earthMat: THREE.MeshStandardMaterial;
-  private moonMat: THREE.MeshStandardMaterial;
+  private maps: PlanetMaps;
+  private mats = new Map<BodyId, THREE.MeshStandardMaterial>();
 
   constructor(maps: PlanetMaps) {
     const nv = 1 + this.rings * this.segs;
@@ -66,11 +95,8 @@ export class TerrainPatch {
     this.geo.setAttribute('uv', dyn(2));
     this.geo.setAttribute('uv1', dyn(2));
 
-    const grass = groundDetail('grass');
-    const reg = groundDetail('regolith');
-    this.earthMat = makeGroundMaterial(maps.earthColor, grass.albedo, grass.normal, true);
-    this.moonMat = makeGroundMaterial(maps.moonColor, reg.albedo, reg.normal, false);
-    this.mesh = new THREE.Mesh(this.geo, this.earthMat);
+    this.maps = maps;
+    this.mesh = new THREE.Mesh(this.geo, this.material('earth'));
     this.mesh.frustumCulled = false;
     this.mesh.receiveShadow = true;
     this.mesh.visible = false;
@@ -91,7 +117,8 @@ export class TerrainPatch {
 
   /** 每帧调用。shipBf 为飞船在天体固连系中的位置。 */
   update(body: Body, t: number, shipBf: THREE.Vector3, radarAlt: number, origin: THREE.Vector3): void {
-    const limit = body.id === 'earth' ? 60_000 : 45_000;
+    // 金星：浓密云层之下才显示地面网格（见 FlightScene 中的云层过渡）
+    const limit = body.id === 'earth' ? 60_000 : body.id === 'venus' ? 30_000 : 45_000;
     this.active = radarAlt < limit;
     if (!this.active) {
       this.mesh.visible = false;
@@ -100,7 +127,7 @@ export class TerrainPatch {
     }
     if (this.body !== body) {
       this.body = body;
-      this.mesh.material = body.id === 'earth' ? this.earthMat : this.moonMat;
+      this.mesh.material = this.material(body.id);
       this.shownKey = '';
       this.pendingKey = null;
       this.angularRadius = 0;
@@ -150,6 +177,23 @@ export class TerrainPatch {
     this.mesh.rotation.set(0, bodyRotation(body, t), 0);
   }
 
+  /** 每个天体一种地面材质（首次降落时才创建） */
+  private material(id: BodyId): THREE.MeshStandardMaterial {
+    let m = this.mats.get(id);
+    if (!m) {
+      if (id === 'earth') {
+        const grass = groundDetail('grass');
+        m = makeGroundMaterial(this.maps.earthColor, grass.albedo, grass.normal, 'earth');
+      } else {
+        const reg = groundDetail('regolith');
+        const map = id === 'moon' ? this.maps.moonColor : this.maps.bodies[id]!.color;
+        m = makeGroundMaterial(map, reg.albedo, reg.normal, ATMO_LOOK[id] ? 'atmo' : 'airless');
+      }
+      this.mats.set(id, m);
+    }
+    return m;
+  }
+
   private apply(r: PatchResult, keyOverride?: string): void {
     if (!this.body || r.bodyId !== this.body.id) return;
     const key = keyOverride ?? this.pendingKey ?? '';
@@ -175,7 +219,10 @@ export class TerrainPatch {
   }
 }
 
-function makeGroundMaterial(map: THREE.Texture, detail: THREE.Texture, detailNormal: THREE.Texture, earth: boolean): THREE.MeshStandardMaterial {
+/** kind：earth = 地球（水面、植被调色、大气）；atmo = 火星/金星（大气）；airless = 月球/水星 */
+function makeGroundMaterial(map: THREE.Texture, detail: THREE.Texture, detailNormal: THREE.Texture, kind: 'earth' | 'atmo' | 'airless'): THREE.MeshStandardMaterial {
+  const earth = kind === 'earth';
+  const atmo = kind !== 'airless';
   const m = new THREE.MeshStandardMaterial({
     map,
     roughness: earth ? 0.95 : 0.97,
@@ -199,12 +246,13 @@ function makeGroundMaterial(map: THREE.Texture, detail: THREE.Texture, detailNor
     sh.fragmentShader = sh.fragmentShader
       .replace(
         '#include <common>',
-        `#include <common>\nvarying vec3 vWorldPosAtm;\nvarying float vDist;\nuniform sampler2D uDetail;\n${earth ? ATMOSPHERE_GLSL + LIGHT_GLSL : ''}`,
+        `#include <common>\nvarying vec3 vWorldPosAtm;\nvarying float vDist;\nuniform sampler2D uDetail;\n${atmo ? ATMOSPHERE_GLSL + LIGHT_GLSL : 'uniform float uTime;'}`,
       )
       .replace(
         '#include <map_fragment>',
         `#include <map_fragment>
         float waterMask = ${earth ? 'sampledDiffuseColor.a' : '0.0'};
+        ${earth ? SHORE : ''}
         diffuseColor.rgb = pow(max(diffuseColor.rgb, vec3(0.0)), vec3(2.2));
         diffuseColor.a = 1.0;
         float detFade = 1.0 - smoothstep(300.0, 4000.0, vDist);
@@ -223,9 +271,14 @@ function makeGroundMaterial(map: THREE.Texture, detail: THREE.Texture, detailNor
         roughnessFactor = mix(roughnessFactor, 0.08, waterMask);`,
       )
       .replace(
+        '#include <normal_fragment_maps>',
+        `#include <normal_fragment_maps>
+        ${earth ? WATER_WAVES : ''}`,
+      )
+      .replace(
         '#include <opaque_fragment>',
         `#include <opaque_fragment>
-        ${earth ? 'gl_FragColor.rgb = applyAtmo(gl_FragColor.rgb, vWorldPosAtm);' : ''}`,
+        ${atmo ? 'gl_FragColor.rgb = applyAtmo(gl_FragColor.rgb, vWorldPosAtm);' : ''}`,
       );
   };
   return m;
