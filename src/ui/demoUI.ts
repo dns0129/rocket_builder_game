@@ -293,7 +293,7 @@ export class ReplayControls {
         { class: 'rp-row' },
         btn('地图 M', '地图', () => cb.toggleMap()),
         btn('相机 V', '切换相机', () => cb.cycleCamera()),
-        btn('📷', '截图模式 (F2)：只留星空和飞船，Esc 退出', () => cb.shot()),
+        btn('📷', '截图模式 (F2)：隐藏所有面板，Esc 退出', () => cb.shot()),
         (E.logBtn = btn('📋 操作记录 L', '显示 / 隐藏操作记录', () => this.toggleLog(), 'on')),
       ),
       (E.status = h('div', { class: 'rp-status' })),

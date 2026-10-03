@@ -22,7 +22,6 @@ const QUALITY_KEY = 'rocket-game-quality';
 const VOLUME_KEY = 'rocket-game-volume';
 const AUTOSCALE_KEY = 'rocket-game-autoscale';
 const INFINITE_FUEL_KEY = 'rocket-game-infinite-fuel';
-const SHOT_PURE_KEY = 'rocket-game-shot-pure';
 
 function lsGet(k: string): string | null {
   try {
@@ -73,10 +72,8 @@ class App {
   realTime = 0;
   /** 无限燃料模式（保存在本地，下次打开仍然有效） */
   infiniteFuel: boolean;
-  /** 截图模式：隐藏所有仪表、提示与轨迹，只留三维画面（Esc / F2 退出） */
+  /** 截图模式：隐藏所有数据面板、按钮与提示，三维画面（飞船和背景）保持不变（Esc / F2 退出） */
   shotMode = false;
-  /** 截图模式的背景：true = 只有星空和飞船（默认），false = 保留星球、地面与发射台（B 键切换，保存在本地） */
-  shotPure: boolean;
   private shotHint: HTMLDivElement | null = null;
   private lastSepSound = -1;
   /** 调试与自动化测试用 */
@@ -90,7 +87,6 @@ class App {
     this.engine = new RenderEngine(canvas, this.quality);
     this.engine.setAutoScale(lsGet(AUTOSCALE_KEY) !== '0');
     this.infiniteFuel = lsGet(INFINITE_FUEL_KEY) === '1';
-    this.shotPure = lsGet(SHOT_PURE_KEY) !== '0';
     const vol = parseFloat(lsGet(VOLUME_KEY) ?? '0.7');
     this.sound.volume = isFinite(vol) ? vol : 0.7;
   }
@@ -184,8 +180,8 @@ class App {
   }
 
   /**
-   * 截图模式：整个屏幕只留三维画面（默认只有星空和飞船），所有仪表、按钮、提示、轨迹都不显示。
-   * 鼠标照常旋转 / 缩放视角，V 换相机；Esc 或 F2 退出，B 切换纯星空 / 保留星球。地图中进入时先回到飞船视图。
+   * 截图模式：所有数据面板、按钮、提示都不显示，只留三维画面（飞船与背景的星空、星球、地面照常显示）。
+   * 鼠标照常旋转 / 缩放视角，V 换相机；Esc 或 F2 退出。地图中进入时先回到飞船视图。
    */
   toggleShotMode(on = !this.shotMode): void {
     const f = this.flight;
@@ -196,17 +192,7 @@ class App {
     }
     this.shotMode = on;
     document.body.classList.toggle('shot-mode', on);
-    f?.scene.setShotMode(on, this.shotPure);
-    if (on) this.flashShotHint(`📷 截图模式 · 拖动旋转、滚轮缩放、V 换相机 · B ${this.shotPure ? '显示星球与地面' : '只留星空和飞船'} · Esc 退出`);
-    else this.flashShotHint(null);
-  }
-
-  /** 截图模式下切换背景：只有星空和飞船 ↔ 保留星球、地面与发射台。 */
-  private toggleShotPure(): void {
-    this.shotPure = !this.shotPure;
-    lsSet(SHOT_PURE_KEY, this.shotPure ? '1' : '0');
-    this.flight?.scene.setShotMode(this.shotMode, this.shotPure);
-    this.flashShotHint(this.shotPure ? '只留星空和飞船（B 显示星球与地面）' : '显示星球与地面（B 只留星空和飞船）');
+    this.flashShotHint(on ? '📷 截图模式 · 拖动旋转、滚轮缩放、V 换相机 · Esc 退出' : null);
   }
 
   /** 截图模式的提示：在屏幕底部停留两秒多后淡出，不影响截图。 */
@@ -253,14 +239,10 @@ class App {
         return;
       }
       if (!f || this.modal) return;
-      // F2：截图模式开关（飞行与回放都可以用）；截图模式中 B 切换背景
+      // F2：截图模式开关（飞行与回放都可以用）
       if (e.code === 'F2') {
         e.preventDefault();
         if (!e.repeat) this.toggleShotMode();
-        return;
-      }
-      if (this.shotMode && e.code === 'KeyB') {
-        if (!e.repeat) this.toggleShotPure();
         return;
       }
       if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
@@ -917,7 +899,7 @@ class App {
           ...k('方向轴', '左上角随视角转动的小坐标轴：飞行时显示东 / 北 / 上，地图中显示赤道坐标（北 = 地轴北极）；点击轴端从该方向观察'),
           ...k('Esc', '暂停菜单'),
           ...k('F1', '隐藏 / 显示界面'),
-          ...k('F2', '截图模式：所有仪表、按钮和轨迹都不显示，只留星空和飞船（B 切换是否显示星球与地面，Esc 退出）'),
+          ...k('F2', '截图模式：所有数据面板和按钮都不显示，画面（飞船和背景）不变（Esc 退出）'),
         ),
         h('h2', { style: { marginTop: '18px', fontSize: '17px' } }, '看懂轨迹'),
         h(

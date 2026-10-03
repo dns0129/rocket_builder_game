@@ -297,7 +297,7 @@ export class FlightHUD {
         h('button', { class: 'primary', onclick: () => this.sim.stage(), title: '空格键' }, '分级 / 点火'),
         h('div', { class: 'row' }, act('地图 M', () => this.cb.toggleMap()), act('相机 V', () => this.cb.cycleCamera())),
         h('div', { class: 'row' }, act('着陆腿 G', () => this.sim.toggleLegs()), act('降落伞 P', () => this.sim.armChute())),
-        h('div', { class: 'row' }, act('机动规划 N', () => this.togglePlanner()), act('📷 截图 F2', () => this.cb.shot(), '截图模式：所有仪表、按钮和轨迹都不显示，只留星空和飞船（B 切换是否显示星球与地面，Esc 退出）')),
+        h('div', { class: 'row' }, act('机动规划 N', () => this.togglePlanner()), act('📷 截图 F2', () => this.cb.shot(), '截图模式：所有数据面板和按钮都不显示，画面（飞船和背景）不变（Esc 退出）')),
         h('h3', { style: { margin: '6px 0 0' } }, '飞行辅助'),
         h('div', { class: 'row' }, apBtn('ascent', '自动入轨'), apBtn('node', '执行机动')),
         h('div', { class: 'row' }, apBtn('land', '自动着陆')),
