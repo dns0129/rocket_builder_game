@@ -17,6 +17,12 @@ import { lambert } from './maneuver';
  * 只约束经过 P 和轨道能量、不约束到达时刻：点火位置与计划差几百米时，硬要按时到达 P 会改变轨道能量
  * （奔月时远地点会偏差上百公里），而到达时刻差零点几秒几乎没有影响。
  * 计划轨道和实际轨道都用同一个二体模型外推到 P，第三体摄动对两者几乎相同，因此不影响精度。
+ *
+ * 逃离行星、进入日心轨道的双曲线（行星际转移入射）改为直接瞄准计划中的双曲线剩余速度矢量 v∞：
+ * 离开影响球之后的飞行只取决于 v∞ 的方向和大小。经过 P 的约束只定下了“当前位置 + P”所在的平面，
+ * 停泊轨道与转移方向不共面、需要大角度转向时（例如从极地轨道飞往木星，法向 Δv 两千多 m/s），
+ * 点火的几分钟里飞船还在旧轨道面上，烧完的轨道面会偏好几度，到木星时差出上百万公里。
+ * 由位置和 v∞ 矢量可以直接解出所需速度（见 hyperbolicVelocity），点火早晚、转向多少都能精确补偿。
  */
 export interface BurnTarget {
   body: Body;
@@ -30,10 +36,14 @@ export interface BurnTarget {
   span: number;
   /** 计划轨道的比机械能（相对 body） */
   energy: number;
+  /** 逃离行星的双曲线：计划中的剩余速度矢量（出影响球后的方向与大小）；有它时按 v∞ 制导 */
+  vInf?: Vector3;
 }
 
 /** 目标点在节点之后转过的真近点角 */
 const SWEEP = (2 * Math.PI) / 3;
+/** 目标点至少要领先节点这么多（否则点火开始时转移角已接近 180°，平面不确定），不够时退回按固定方向执行 */
+const MIN_SWEEP = (40 * Math.PI) / 180;
 const TWO_PI = Math.PI * 2;
 
 function mod2pi(x: number): number {
@@ -53,6 +63,16 @@ export function makeBurnTarget(r: Vector3, v: Vector3, t: number, dvWorld: Vecto
   const hl = o.h.length();
   if (!(hl > 1e-3 * r0.length()) || !isFinite(o.e) || Math.abs(o.e - 1) < 1e-4) return null;
   const e = o.e;
+  const hHat0 = o.h.clone().divideScalar(hl);
+  // 逃离行星（进入日心轨道）的双曲线：瞄准 v∞ 矢量，不需要目标点
+  if (e > 1 && body.parent === 'sun') {
+    const s = Math.sqrt(e * e - 1);
+    const pHat = o.eVec.clone().divideScalar(e);
+    const qHat = new Vector3().crossVectors(hHat0, pHat);
+    const vInf = pHat.multiplyScalar(-1).addScaledVector(qHat, s).multiplyScalar(Math.sqrt(2 * o.energy) / e);
+    return { body, tP: Infinity, rP: new Vector3(), hHat: hHat0, span: Infinity, energy: o.energy, vInf };
+  }
+  if (sweepMax < MIN_SWEEP) return null;
   // 近拱点方向（近圆轨道以当前位置为参考）
   let P: Vector3;
   let nu0: number;
@@ -107,6 +127,13 @@ const _vrel = new Vector3();
  * 目标点已经太近、转移角接近 180°（平面不确定）或求解失败时返回 null。
  */
 export function velocityToGain(tgt: BurnTarget, r: Vector3, v: Vector3, t: number, out = new Vector3()): Vector3 | null {
+  if (tgt.vInf) {
+    const b = tgt.body;
+    _rel.copy(r).sub(bodyPosition(b, t, out));
+    _vrel.copy(v).sub(bodyVelocity(b, t, out));
+    const req = hyperbolicVelocity(_rel, tgt.vInf, b.mu, tgt.hHat, out);
+    return req ? req.sub(_vrel) : null;
+  }
   const tof0 = tgt.tP - t;
   if (!(tof0 > 0.25 * tgt.span)) return null;
   const b = tgt.body;
@@ -145,4 +172,36 @@ export function velocityToGain(tgt: BurnTarget, r: Vector3, v: Vector3, t: numbe
     if (bs && Math.abs(bs.de) < Math.abs(best.s!.de)) best = { tof: bTof, s: bs };
   }
   return out.copy(best.s!.v1).sub(_vrel);
+}
+
+/**
+ * 在位置 r（相对天体中心）上、使双曲线剩余速度矢量为 vInf 所需的速度（outward 分支，沿 hRef 的绕行方向）。
+ * 轨道面由 r 与 vInf 张成；r 到渐近线方向的转角 θ 与偏心率满足 R(1 − cos θ + s·sin θ) = a·s²，
+ * 其中 s = √(e² − 1)、a = μ/v∞²，是关于 s 的二次方程，取正根即可，不需要迭代。
+ * r 与 vInf 几乎平行（平面不确定）时返回 null。
+ */
+export function hyperbolicVelocity(r: Vector3, vInf: Vector3, mu: number, hRef: Vector3, out = new Vector3()): Vector3 | null {
+  const R = r.length();
+  const V = vInf.length();
+  if (!(R > 0) || !(V > 0)) return null;
+  const rHat = r.clone().divideScalar(R);
+  const uHat = vInf.clone().divideScalar(V);
+  const hHat = new Vector3().crossVectors(rHat, uHat);
+  const sinAbs = hHat.length();
+  if (sinAbs < 1e-6) return null;
+  hHat.divideScalar(sinAbs);
+  let theta = Math.atan2(sinAbs, rHat.dot(uHat));
+  // 计划轨道的绕行方向与“短程”相反时走另一边（转角大于 180°）
+  if (hHat.dot(hRef) < 0) {
+    hHat.negate();
+    theta = TWO_PI - theta;
+  }
+  const a = mu / (V * V);
+  const sn = Math.sin(theta);
+  const s = (R * sn + Math.sqrt(R * R * sn * sn + 4 * a * R * (1 - Math.cos(theta)))) / (2 * a);
+  const e = Math.sqrt(1 + s * s);
+  const nu = Math.acos(-1 / e) - theta;
+  const h = Math.sqrt(mu * a) * s;
+  const tHat = new Vector3().crossVectors(hHat, rHat);
+  return out.copy(rHat).multiplyScalar((mu / h) * e * Math.sin(nu)).addScaledVector(tHat, h / R);
 }

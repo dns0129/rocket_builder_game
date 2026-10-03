@@ -447,7 +447,8 @@ export class FlightHUD {
     setText(R.label, active ? `方向舵 ${dirTxt(cmd)}` : `方向舵 关 · ${dirTxt(actual)}`);
     R.label.classList.toggle('on', active);
     setText(R.hdgLabel, `航向 ${fmtHeading(sim.rudderHeading)}`);
-    R.hdgLabel.classList.toggle('on', active);
+    // 自动入轨也沿这个航向转弯：飞行辅助工作时同样高亮
+    R.hdgLabel.classList.toggle('on', active || sim.autopilot.mode === 'ascent');
   }
 
   /** 方向轴：飞行视图显示当地的东 / 北 / 上，地图显示赤道坐标系。 */

@@ -2,6 +2,7 @@ import { Vector3 } from 'three';
 import { G0, type Body } from '../physics/bodies';
 import type { FlightSim } from './flight';
 import { solveCircularize } from './maneuver';
+import { fmtHeading } from '../ui/format';
 
 export type APMode = 'off' | 'ascent' | 'node' | 'land';
 
@@ -80,6 +81,9 @@ export class Autopilot {
       }
     }
     this.mode = mode;
+    // 方向舵是手动操纵：飞行辅助接管后改为“保持”。否则辅助结束时 SAS 会把火箭转回方向舵原来的设定，
+    // 例如发射前转动航向轴时设定的“竖直 0°”——入轨后火箭会自己转成竖直朝上
+    if (sim.sasMode === 'rudder') sim.setSas('stability');
     this.phase = mode === 'ascent' ? 'start' : '';
     this.nodeStarted = false;
     this.targetDir = null;
@@ -163,7 +167,7 @@ export class Autopilot {
       const maxAcc = 3.2 * G0;
       if (thrust > 0) V.setEffectiveThrottle(Math.min(1, (maxAcc * V.mass) / thrust));
       else V.throttle = 1;
-      this.status = `上升段：俯仰 ${pitch.toFixed(0)}°，远地点 ${(tel.orbit.apAlt / 1000).toFixed(1)} / ${(target / 1000).toFixed(0)} km`;
+      this.status = `上升段：俯仰 ${pitch.toFixed(0)}°，航向 ${fmtHeading(sim.rudderHeading)}，远地点 ${(tel.orbit.apAlt / 1000).toFixed(1)} / ${(target / 1000).toFixed(0)} km`;
       if (tel.orbit.apAlt >= target) {
         V.throttle = 0;
         this.phase = 'coast';

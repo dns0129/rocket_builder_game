@@ -508,6 +508,11 @@ export class FlightSim {
    */
   setRudderHeading(heading: number): void {
     if (this.destroyed) return;
+    // 自动入轨沿这个航向转弯：飞行辅助工作时只改入轨方向，不接管
+    if (this.autopilot.mode === 'ascent') {
+      this.rudderHeading = wrapHeading(heading);
+      return;
+    }
     if (!this.rudderActive) {
       const tel = this.telemetry;
       const fwd = UP.clone().applyQuaternion(this.vessel.q);
@@ -518,9 +523,9 @@ export class FlightSim {
     this.setRudder(a);
   }
 
-  /** 在当前航向（方向舵未开启时为箭体实际指向的航向）基础上增减。 */
+  /** 在当前航向（方向舵未开启时为箭体实际指向的航向；自动入轨时为入轨方向）基础上增减。 */
   nudgeRudderHeading(delta: number): void {
-    const base = this.rudderActive ? this.rudderHeading : (this.actualHeading() ?? this.rudderHeading);
+    const base = this.rudderActive || this.autopilot.mode === 'ascent' ? this.rudderHeading : (this.actualHeading() ?? this.rudderHeading);
     this.setRudderHeading(base + delta);
   }
 
@@ -1420,7 +1425,8 @@ export class FlightSim {
     }
     this.replanNotified = false;
     n.replanAt = null;
-    const res = solveTransfer({ r: this.vessel.r, v: this.vessel.v, t: this.t }, BODY_BY_ID[n.replanTarget]);
+    // 只精修原定的窗口（见 solveTransfer 的 near）
+    const res = solveTransfer({ r: this.vessel.r, v: this.vessel.v, t: this.t }, BODY_BY_ID[n.replanTarget], n.t);
     if (res.node) {
       this.addNode(res.node, res.replanAt != null && res.target ? { at: res.replanAt, target: res.target.id } : null);
       // 正在“加速到节点前”时，改为加速到新的节点之前
@@ -1516,7 +1522,8 @@ export class FlightSim {
     const vrel = v.clone().sub(bodyVelocity(body, n.t, _v2));
     const rate = Math.max(rel.clone().cross(vrel).length(), rel.clone().cross(vrel.add(dv)).length()) / rel.lengthSq();
     const sweep = Math.min((2 * Math.PI) / 3, (165 * Math.PI) / 180 - rate * (this.nodeBurnLead() + 5));
-    n.target = l > 0.05 && sweep > (40 * Math.PI) / 180 ? makeBurnTarget(r, v, n.t, dv, body, sweep) : null;
+    // 目标点领先太少时 makeBurnTarget 返回 null（逃离行星的双曲线按 v∞ 制导，不受此限）
+    n.target = l > 0.05 ? makeBurnTarget(r, v, n.t, dv, body, sweep) : null;
     this.guideNode(n);
   }
 

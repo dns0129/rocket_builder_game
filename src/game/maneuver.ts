@@ -420,26 +420,73 @@ export function solveReturn(s: StateVec, targetAlt = 35_000): SolveResult {
 }
 
 /**
+ * 中途修正的“最小 Δv”解：找满足 miss(Δv) = 0 的最小 Δv（miss 为近拱点高度与目标的偏差，米）。
+ * 在当前解处用有限差分求梯度 g，线性化后满足 miss = 0 的最小范数解是 Δv = g·(g·Δv₀ − miss₀)/|g|²，
+ * 也就是沿着最能改变近拱点的方向，正好消掉偏差；迭代几次即收敛，偏差没有变小时往回收一半。
+ * 以前只用沿坐标轴的模式搜索：最省的方向与坐标轴不对齐时（倾斜、极地轨道上很常见）会停在很费燃料的解上，
+ * 例如从极地停泊轨道奔月后把近月点修正 18 km 要花 18.6 m/s，木星转移 25,000 km 的偏差要花 41 m/s。
+ * 返回 null 表示没有收敛（轨迹无效、函数不光滑），调用方退回到模式搜索。
+ */
+function minNormCorrection(miss: (dv: Vector3) => number, tol: number, h: number, f0: number, maxIter = 10): Vector3 | null {
+  let dv = new Vector3();
+  if (!isFinite(f0)) return null;
+  for (let it = 0; it < maxIter; it++) {
+    if (Math.abs(f0) <= tol) return dv;
+    const g = new Vector3();
+    for (let k = 0; k < 3; k++) {
+      const d = dv.clone();
+      d.setComponent(k, d.getComponent(k) + h);
+      const fk = miss(d);
+      if (!isFinite(fk)) return null;
+      g.setComponent(k, (fk - f0) / h);
+    }
+    const gg = g.lengthSq();
+    if (gg < 1e-12) return null;
+    let next = g.clone().multiplyScalar((g.dot(dv) - f0) / gg);
+    let fn = miss(next);
+    for (let tries = 0; (!isFinite(fn) || Math.abs(fn) >= Math.abs(f0)) && tries < 6; tries++) {
+      next = dv.clone().lerp(next, 0.5);
+      fn = miss(next);
+    }
+    if (!isFinite(fn) || Math.abs(fn) >= Math.abs(f0)) return null;
+    dv = next;
+    f0 = fn;
+  }
+  return Math.abs(f0) <= tol * 3 ? dv : null;
+}
+
+/** 修正结果：Δv 小到可以忽略时不给节点（accurate 表示本来就足够准确）。 */
+function correctionResult(tb: number, dv: Vector3, accurate: boolean, what: string): SolveResult {
+  if (dv.length() < 0.05) return { node: null, msg: accurate ? '轨道已经很准确，无需修正。' : '找不到有效的修正方案。' };
+  return { node: { t: tb, dv }, msg: `${what}：Δv ${dv.length().toFixed(1)} m/s` };
+}
+
+/**
  * 中途修正：在 delay 秒后做一次小规模三维机动。
  * target = 'moon'：使近月点高度为 targetAlt；'earth'：使地球近地点高度为 targetAlt（再入走廊）。
  */
 export function solveCorrection(s: StateVec, target: 'moon' | 'earth', targetAlt: number, delay = 120): SolveResult {
   const tb = s.t + delay;
   const until = target === 'earth' ? (e: PredEvent) => e.type === 'pe' && e.afterNode && e.body.id === 'earth' : undefined;
-  const cost = (dv: Vector3) => {
+  /** 近拱点高度与目标的偏差（米，带符号）；轨迹无效（没有近地点、撞上月球）时为 NaN */
+  const miss = (dv: Vector3) => {
     const p = predict(s.r, s.v, s.t, [{ t: tb, dv }], { maxSteps: 2500, eta: 0.03, maxTime: delay + 4e5, until });
-    let c: number;
-    if (target === 'moon') {
-      c = Math.abs(p.moonMinDist - (MOON.radius + targetAlt));
-      if (p.moonMinDist < MOON.radius) c += 2e6;
-    } else {
-      const pe = p.events.find((e) => e.afterNode && e.type === 'pe' && e.body.id === 'earth');
-      const imp = p.impact && p.impact.body.id === 'earth' ? p.impact : null;
-      if (pe) c = Math.abs(pe.alt - targetAlt);
-      else if (imp) c = Math.abs(virtualPeAlt(imp) - targetAlt); // 直接撞击：近地点在地下多深
-      else c = 5e7;
-      if (p.impact && p.impact.body.id === 'moon') c += 5e7;
-    }
+    if (target === 'moon') return p.moonMinDist - (MOON.radius + targetAlt);
+    if (p.impact && p.impact.body.id === 'moon') return NaN;
+    const pe = p.events.find((e) => e.afterNode && e.type === 'pe' && e.body.id === 'earth');
+    if (pe) return pe.alt - targetAlt;
+    // 直接撞击：近地点在地下多深（连续的，知道还差多少）
+    if (p.impact && p.impact.body.id === 'earth') return virtualPeAlt(p.impact) - targetAlt;
+    return NaN;
+  };
+  const base0 = miss(new Vector3());
+  const fast = minNormCorrection(miss, 200, 0.2, base0);
+  if (fast) return correctionResult(tb, fast, Math.abs(base0) < 5000, '中途修正');
+  // 牛顿迭代不收敛时（轨迹不光滑等）退回到沿坐标轴的模式搜索
+  const cost = (dv: Vector3) => {
+    const m = miss(dv);
+    let c = isFinite(m) ? Math.abs(m) : 5e7;
+    if (target === 'moon' && m < -targetAlt) c += 2e6;
     return c + dv.length() * 20;
   };
   const dv = new Vector3();
@@ -627,8 +674,12 @@ export interface TransferPlan extends SolveResult {
  * 2. 根据逃逸双曲线的几何算出停泊轨道上的点火点与点火时刻、Δv 的顺行 / 法向分量。
  * 3. 窗口在两天以内时，用完整的多体积分精修点火时刻与 Δv，使目标行星的近拱点高度符合要求；
  *    窗口还远时先给出近似节点，飞到窗口前一天左右会自动重新精确计算。
+ *
+ * near：重新精确计算时传入原定的点火时刻，只在它附近几天内找出发时刻，精修同一个窗口。
+ * 否则停泊轨道与转移方向不共面时（例如向正北发射的极地轨道），转向代价随出发日期缓慢变化，
+ * 代价最低的方案总落在搜索范围的末端：每次重算都跳到一个会合周期之后的下一个窗口，永远等不到点火。
  */
-export function solveTransfer(s: StateVec, target: Body): TransferPlan {
+export function solveTransfer(s: StateVec, target: Body, near: number | null = null): TransferPlan {
   const from = dominantBody(s.r, s.t);
   const fail = (msg: string): TransferPlan => ({ node: null, msg, replanAt: null, target: null });
   if (!HELIO[from.id]) return fail(from.id === 'moon' ? '请先回到地球轨道再出发。' : '需要先进入某颗行星的环绕轨道。');
@@ -674,8 +725,13 @@ export function solveTransfer(s: StateVec, target: Body): TransferPlan {
   };
   let best: ReturnType<typeof evalPlan> = null;
   const nD = 240;
+  // 精修同一个窗口：出发（离开影响球）时刻在原定点火时刻之后，逃逸段一般不到两天
+  const NEAR_BEFORE = 2 * 86_400;
+  const NEAR_AFTER = 4 * 86_400;
+  const spanStart = near !== null ? Math.max(tMin, near - NEAR_BEFORE) : tMin;
+  const span = near !== null ? Math.max(0, near + NEAR_AFTER - spanStart) : searchSpan;
   for (let i = 0; i <= nD; i++) {
-    const td = tMin + (searchSpan * i) / nD;
+    const td = spanStart + (span * i) / nD;
     for (let j = 0; j < 14; j++) {
       const tof = tHoh * (0.55 + (0.95 * j) / 13);
       const p = evalPlan(td, tof);
@@ -684,7 +740,7 @@ export function solveTransfer(s: StateVec, target: Body): TransferPlan {
   }
   if (!best) return fail('找不到可行的转移轨道。');
   // 局部细化
-  let stepD = searchSpan / nD;
+  let stepD = Math.max(span, 1) / nD;
   let stepT = (tHoh * 0.95) / 13;
   for (let it = 0; it < 6; it++) {
     for (const [dd, dt] of [
@@ -754,9 +810,9 @@ export function solveTransfer(s: StateVec, target: Body): TransferPlan {
   const waitTxt = tb - s.t > 1.5 * o.period ? `，窗口在 ${fmtWait(tb - s.t)} 后` : '';
   const head = `前往${target.name}：Δv ${Math.hypot(dvP, dvN, dvR).toFixed(0)} m/s，飞行约 ${days.toFixed(0)} 天`;
 
-  // 窗口还远：先给出近似节点，飞到窗口前一天左右再精修
+  // 窗口还远：先给出近似节点，飞到窗口前一天左右再精修（重新精确计算时不再推迟）
   const REPLAN_LEAD = 1.2 * 86_400;
-  if (tb - s.t > 2.2 * 86_400) {
+  if (near === null && tb - s.t > 2.2 * 86_400) {
     return {
       node: { t: tb, dv: new Vector3(dvP, dvN, dvR) },
       msg: `${head}${waitTxt}。先用“⏩ 加速到节点前”，到窗口前会自动精确计算`,
@@ -777,6 +833,21 @@ export function solveTransfer(s: StateVec, target: Body): TransferPlan {
     t += h;
   }
   const maxTime = lead + best.tof * 1.5 + 30 * 86_400;
+  // 先在点火时刻不变的情况下，用最小改动的牛顿迭代让近拱点正好落在目标高度（与中途修正相同的做法）：
+  // 停泊轨道倾斜时近似方案偏差可达上百万公里，沿坐标轴的模式搜索常常收敛不了
+  const x0 = new Vector3(dvP, dvN, dvR);
+  const missAt = (d: Vector3) => {
+    const pred = predict(r1, v1, t, [{ t: t + lead, dv: x0.clone().add(d) }], { maxSteps: 3500, eta: 0.03, maxTime });
+    const md = pred.minDist[target.id];
+    if (!md || (pred.impact && pred.impact.body !== target && pred.impact.afterNode)) return NaN;
+    return md.dist - rp;
+  };
+  const fix = minNormCorrection(missAt, Math.max(2_000, arrivalAltitude(target) * 0.05), 0.01, missAt(new Vector3()), 14);
+  if (fix) {
+    dvP += fix.x;
+    dvN += fix.y;
+    dvR += fix.z;
+  }
   const cost = (dtb: number, p: number, n: number, rr: number) => {
     const pred = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(p, n, rr) }], { maxSteps: 3500, eta: 0.03, maxTime });
     const md = pred.minDist[target.id];
@@ -787,9 +858,10 @@ export function solveTransfer(s: StateVec, target: Body): TransferPlan {
   let bT = 0;
   let best3 = cost(bT, dvP, dvN, dvR);
   const base = { p: dvP, n: dvN, r: dvR };
-  let sT = o.period / 40;
-  let sV = 10;
-  for (let iter = 0; iter < 9; iter++) {
+  // 牛顿迭代成功时只用很小的步长微调；失败时退回到原来的大范围模式搜索
+  let sT = fix ? o.period / 2000 : o.period / 40;
+  let sV = fix ? 0.05 : 10;
+  for (let iter = 0; iter < (fix ? 3 : 9); iter++) {
     let improved = true;
     let guard = 0;
     while (improved && guard++ < 25) {
@@ -863,12 +935,21 @@ export function solvePlanetCorrection(s: StateVec, target: Body, delay = 120): S
   const probe = predict(s.r, s.v, s.t, [], { maxSteps: 3500, eta: 0.03, maxTime: 9e7 });
   const arrive = probe.minDist[target.id]?.t ?? s.t + 9e7;
   const maxTime = arrive - s.t + 20 * 86_400;
-  const cost = (dv: Vector3) => {
+  /** 与目标天体的最近距离减去目标近拱点半径（米）；撞上别的天体时为 NaN */
+  const miss = (dv: Vector3) => {
     const p = predict(s.r, s.v, s.t, [{ t: tb, dv }], { maxSteps: 3500, eta: 0.03, maxTime });
     const md = p.minDist[target.id];
-    let c = md ? Math.abs(md.dist - rp) : 1e12;
-    if (p.impact && p.impact.body !== target) c += 1e10;
-    return c / 1000 + dv.length() * 0.2;
+    if (!md || (p.impact && p.impact.body !== target)) return NaN;
+    return md.dist - rp;
+  };
+  const base0 = miss(new Vector3());
+  // 离目标越远，同样的 Δv 偏得越多：有限差分的步长按剩余航程取（几百天外 0.02 m/s 就能移动几百公里）
+  const h = Math.min(0.5, Math.max(0.02, (0.2 * 86_400 * 30) / Math.max(86_400, arrive - s.t)));
+  const fast = minNormCorrection(miss, 1000, h, base0);
+  if (fast) return correctionResult(tb, fast, Math.abs(base0) < 5_000_000, `中途修正（${target.name}）`);
+  const cost = (dv: Vector3) => {
+    const m = miss(dv);
+    return (isFinite(m) ? Math.abs(m) : 1e13) / 1000 + dv.length() * 0.2;
   };
   const dv = new Vector3();
   let best = cost(dv);
@@ -894,4 +975,5 @@ export function solvePlanetCorrection(s: StateVec, target: Body, delay = 120): S
   }
   if (dv.length() < 0.05) return { node: null, msg: base < 5_000 ? '轨道已经很准确，无需修正。' : '找不到有效的修正方案。' };
   return { node: { t: tb, dv }, msg: `中途修正（${target.name}）：Δv ${dv.length().toFixed(1)} m/s` };
+
 }

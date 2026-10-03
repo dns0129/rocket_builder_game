@@ -39,7 +39,7 @@ export function nextStep(sim: FlightSim): GuideStep | null {
   // 方向舵的航向（默认正东）
   const dirName = compassName(sim.rudderHeading);
 
-  if (ap.mode !== 'off') return { text: `飞行辅助工作中 —— ${ap.status || '请稍候'}（按 ← / → 可随时接管）`, kind: 'wait' };
+  if (ap.mode !== 'off') return { text: `飞行辅助工作中 —— ${ap.status || '请稍候'}（${ap.mode === 'ascent' ? '[ / ] 改变入轨方向，' : ''}按 ← / → 可随时接管）`, kind: 'wait' };
 
   // 发射前
   if (sim.scenario === 'pad' && !sim.metStarted) return { text: '按 空格 点火升空（新手可点右下角“自动入轨”全程托管）', kind: 'act' };
