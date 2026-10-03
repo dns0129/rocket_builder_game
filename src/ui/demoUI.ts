@@ -189,6 +189,8 @@ export interface ReplayCallbacks {
   toggleMap(): void;
   cycleCamera(): void;
   click(): void;
+  /** 进入截图模式 */
+  shot(): void;
 }
 
 /** 回放控制面板（右下角）+ 操作记录面板（右侧）。 */
@@ -289,8 +291,9 @@ export class ReplayControls {
       h(
         'div',
         { class: 'rp-row' },
-        btn('地图 M', '二维地图', () => cb.toggleMap()),
+        btn('地图 M', '地图', () => cb.toggleMap()),
         btn('相机 V', '切换相机', () => cb.cycleCamera()),
+        btn('📷', '截图模式 (F2)：只留星空和飞船，Esc 退出', () => cb.shot()),
         (E.logBtn = btn('📋 操作记录 L', '显示 / 隐藏操作记录', () => this.toggleLog(), 'on')),
       ),
       (E.status = h('div', { class: 'rp-status' })),

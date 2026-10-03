@@ -54,7 +54,7 @@ export function nextStep(sim: FlightSim): GuideStep | null {
       const hint = Math.abs(diff) < 4 ? '保持住' : diff > 0 ? `按 → 再向${dirName}倾斜` : '按 ← 回正一点';
       return { text: `重力转弯：建议倾角 ${want.toFixed(0)}°（当前 ${cur.toFixed(0)}°），${hint} · 远地点 ${km(o.apAlt)} / 目标 100 km`, kind: 'act' };
     }
-    if (o.apAlt >= 90_000 && thrust && tel.alt < atmoTop) return { text: '远地点已够高：按 X 关机，滑行出大气层（看蓝色预测弹道的最高点）', kind: 'act' };
+    if (o.apAlt >= 90_000 && thrust && tel.alt < atmoTop) return { text: '远地点已够高：按 X 关机，滑行出大气层（看左下角弹道剖面里预测弹道的最高点）', kind: 'act' };
     if (o.apAlt >= 70_000 && !thrust) {
       if (sim.nodes.length) return { text: '已规划圆化机动：点“执行机动”自动点火（或 ⏩ 加速到节点前）', kind: 'act' };
       return { text: `滑行至远地点（${Math.max(0, o.timeToAp).toFixed(0)} 秒后）：按 N 打开机动规划 → “远拱点圆化” → “执行机动”`, kind: 'act' };

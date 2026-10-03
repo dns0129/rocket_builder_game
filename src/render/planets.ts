@@ -934,6 +934,13 @@ export class Planets {
     this.pointMat.uniforms.uPixelRatio.value = pixelRatio;
   }
 
+  /** 截图模式的纯星空背景：隐藏所有天体（含云层、光环、太阳圆盘与光晕、远处行星的光点），只留星空。 */
+  setBodiesVisible(v: boolean): void {
+    for (const vis of this.visuals.values()) vis.group.visible = v;
+    this.sunGlow.visible = v;
+    this.points.visible = v;
+  }
+
   /** 近地表地形网格所在的天体：在该天体的球面上挖掉网格覆盖的区域。 */
   setPatch(bodyId: BodyId | null, dir: THREE.Vector3, cosA: number): void {
     for (const v of this.visuals.values()) {

@@ -22,6 +22,7 @@ const QUALITY_KEY = 'rocket-game-quality';
 const VOLUME_KEY = 'rocket-game-volume';
 const AUTOSCALE_KEY = 'rocket-game-autoscale';
 const INFINITE_FUEL_KEY = 'rocket-game-infinite-fuel';
+const SHOT_PURE_KEY = 'rocket-game-shot-pure';
 
 function lsGet(k: string): string | null {
   try {
@@ -72,6 +73,11 @@ class App {
   realTime = 0;
   /** 无限燃料模式（保存在本地，下次打开仍然有效） */
   infiniteFuel: boolean;
+  /** 截图模式：隐藏所有仪表、提示与轨迹，只留三维画面（Esc / F2 退出） */
+  shotMode = false;
+  /** 截图模式的背景：true = 只有星空和飞船（默认），false = 保留星球、地面与发射台（B 键切换，保存在本地） */
+  shotPure: boolean;
+  private shotHint: HTMLDivElement | null = null;
   private lastSepSound = -1;
   /** 调试与自动化测试用 */
   readonly __THREE = THREE;
@@ -84,6 +90,7 @@ class App {
     this.engine = new RenderEngine(canvas, this.quality);
     this.engine.setAutoScale(lsGet(AUTOSCALE_KEY) !== '0');
     this.infiniteFuel = lsGet(INFINITE_FUEL_KEY) === '1';
+    this.shotPure = lsGet(SHOT_PURE_KEY) !== '0';
     const vol = parseFloat(lsGet(VOLUME_KEY) ?? '0.7');
     this.sound.volume = isFinite(vol) ? vol : 0.7;
   }
@@ -127,6 +134,7 @@ class App {
       toggleMap: () => this.toggleMap(),
       cycleCamera: () => this.cycleCamera(),
       click: () => this.sound.click(),
+      shot: () => this.toggleShotMode(true),
     });
     this.flight = { sim, scene, hud, design, scenario, maxAlt: 0, maxSpeed: 0, destroyedAt: null, victoryShown: false, recorder, replay: null, replayUI: null };
     if (scenario === 'pad') {
@@ -149,6 +157,7 @@ class App {
   endFlight(showBuilder = true): void {
     const f = this.flight;
     if (!f) return;
+    this.toggleShotMode(false);
     f.replayUI?.dispose();
     f.scene.dispose();
     f.hud.dispose();
@@ -164,12 +173,53 @@ class App {
   toggleMap(): void {
     const f = this.flight;
     if (!f) return;
+    // 截图模式只看飞船：打开地图时先退出
+    this.toggleShotMode(false);
     const m = f.scene.mode === 'map' ? 'flight' : 'map';
     f.scene.setMode(m);
     // 回放时右侧是操作记录，不打开机动规划
     if (f.replay) return;
     f.hud.togglePlanner(m === 'map' ? true : undefined);
     if (m === 'flight') f.hud.togglePlanner(false);
+  }
+
+  /**
+   * 截图模式：整个屏幕只留三维画面（默认只有星空和飞船），所有仪表、按钮、提示、轨迹都不显示。
+   * 鼠标照常旋转 / 缩放视角，V 换相机；Esc 或 F2 退出，B 切换纯星空 / 保留星球。地图中进入时先回到飞船视图。
+   */
+  toggleShotMode(on = !this.shotMode): void {
+    const f = this.flight;
+    if (on === this.shotMode || (on && !f)) return;
+    if (on) {
+      this.closeModal();
+      if (f!.scene.mode === 'map') this.toggleMap();
+    }
+    this.shotMode = on;
+    document.body.classList.toggle('shot-mode', on);
+    f?.scene.setShotMode(on, this.shotPure);
+    if (on) this.flashShotHint(`📷 截图模式 · 拖动旋转、滚轮缩放、V 换相机 · B ${this.shotPure ? '显示星球与地面' : '只留星空和飞船'} · Esc 退出`);
+    else this.flashShotHint(null);
+  }
+
+  /** 截图模式下切换背景：只有星空和飞船 ↔ 保留星球、地面与发射台。 */
+  private toggleShotPure(): void {
+    this.shotPure = !this.shotPure;
+    lsSet(SHOT_PURE_KEY, this.shotPure ? '1' : '0');
+    this.flight?.scene.setShotMode(this.shotMode, this.shotPure);
+    this.flashShotHint(this.shotPure ? '只留星空和飞船（B 显示星球与地面）' : '显示星球与地面（B 只留星空和飞船）');
+  }
+
+  /** 截图模式的提示：在屏幕底部停留两秒多后淡出，不影响截图。 */
+  private flashShotHint(text: string | null): void {
+    this.shotHint?.remove();
+    this.shotHint = null;
+    if (!text) return;
+    const el = h('div', { class: 'shot-hint' }, text);
+    document.body.appendChild(el);
+    el.addEventListener('animationend', () => el.remove());
+    // 动画事件被节流（例如后台标签页）时也按时移除
+    setTimeout(() => el.remove(), 3200);
+    this.shotHint = el;
   }
 
   cycleCamera(): void {
@@ -196,12 +246,23 @@ class App {
       this.sound.start();
       const f = this.flight;
       if (e.code === 'Escape') {
-        if (this.modal) this.closeModal();
+        if (this.shotMode) this.toggleShotMode(false);
+        else if (this.modal) this.closeModal();
         else if (f) this.showPause();
         e.preventDefault();
         return;
       }
       if (!f || this.modal) return;
+      // F2：截图模式开关（飞行与回放都可以用）；截图模式中 B 切换背景
+      if (e.code === 'F2') {
+        e.preventDefault();
+        if (!e.repeat) this.toggleShotMode();
+        return;
+      }
+      if (this.shotMode && e.code === 'KeyB') {
+        if (!e.repeat) this.toggleShotPure();
+        return;
+      }
       if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
       if (f.replay) {
         if (!e.repeat) this.replayKey(e.code);
@@ -419,6 +480,8 @@ class App {
   // ---------------------------------------------------------------- 模态框
 
   openModal(content: HTMLElement): void {
+    // 对话框在界面层里：截图模式下先退出，否则看不见（例如坠毁后的“任务失败”）
+    this.toggleShotMode(false);
     this.closeModal();
     this.modal = h('div', { class: 'modal-bg' }, content);
     this.ui.appendChild(this.modal);
@@ -706,6 +769,7 @@ class App {
         toggleMap: () => this.toggleMap(),
         cycleCamera: () => this.cycleCamera(),
         click: () => this.sound.click(),
+        shot: () => this.toggleShotMode(true),
       },
       { replay: true },
     );
@@ -722,6 +786,7 @@ class App {
         toggleMap: () => this.toggleMap(),
         cycleCamera: () => this.cycleCamera(),
         click: () => this.sound.click(),
+        shot: () => this.toggleShotMode(true),
       },
       builtin,
     );
@@ -852,12 +917,13 @@ class App {
           ...k('方向轴', '左上角随视角转动的小坐标轴：飞行时显示东 / 北 / 上，地图中显示赤道坐标（北 = 地轴北极）；点击轴端从该方向观察'),
           ...k('Esc', '暂停菜单'),
           ...k('F1', '隐藏 / 显示界面'),
+          ...k('F2', '截图模式：所有仪表、按钮和轨迹都不显示，只留星空和飞船（B 切换是否显示星球与地面，Esc 退出）'),
         ),
         h('h2', { style: { marginTop: '18px', fontSize: '17px' } }, '看懂轨迹'),
         h(
           'p',
           { style: { fontSize: '12.5px' } },
-          '青色亮线 = 从火箭出发的预测轨迹（末段变红表示会撞地），白色淡线 = 约 1 秒前的预测轨迹。转向或点火时白线与青线分开，差距就是你的操作带来的变化。左下角“弹道剖面”画出高度随航程的变化（橙色 = 已飞过的动力段，淡蓝 = 滑行段），远/近拱点旁的 ▲▼ 表示正在升高或降低。',
+          '地图（M）里：青色亮线 = 从火箭出发的预测轨迹（末段变红表示会撞地），白色淡线 = 约 1 秒前的预测轨迹（飞行视图只看飞船，不画轨迹）。转向或点火时白线与青线分开，差距就是你的操作带来的变化。左下角“弹道剖面”画出高度随航程的变化（橙色 = 已飞过的动力段，淡蓝 = 滑行段），远/近拱点旁的 ▲▼ 表示正在升高或降低。',
         ),
         h('h2', { style: { marginTop: '18px', fontSize: '17px' } }, '登月攻略（也可以跟着屏幕上方的“下一步”提示做）'),
         h(

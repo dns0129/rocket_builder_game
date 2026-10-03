@@ -1,10 +1,7 @@
 import * as THREE from 'three';
-import { BODY_BY_ID, type Body, type BodyId, bodyPosition, bodyRotation, positionInParent, rotateY } from '../physics/bodies';
-import type { FlightSim } from '../game/flight';
+import { BODY_BY_ID, type Body, type BodyId, positionInParent } from '../physics/bodies';
 import type { PathSegment, PredEvent, PredEventType, Prediction } from '../game/predictor';
-import { DynLine, PolyBuilder, fadeLineMaterial } from './lines';
-import { ScreenLabels } from './labels';
-import { fmtDist, fmtTime } from '../ui/format';
+import { fmtDist } from '../ui/format';
 
 /** 轨迹配色（线性空间）。 */
 export const TRAJ = {
@@ -45,7 +42,7 @@ export class PredictionHistory {
   }
 }
 
-export function firstEvent(pred: Prediction | null, type: PredEventType, body: Body, afterNode: boolean, tMin: number): PredEvent | null {
+function firstEvent(pred: Prediction | null, type: PredEventType, body: Body, afterNode: boolean, tMin: number): PredEvent | null {
   if (!pred) return null;
   for (const e of pred.events) if (e.type === type && e.body === body && e.afterNode === afterNode && e.t > tMin) return e;
   return null;
@@ -155,153 +152,3 @@ export function placeSegments(pred: Prediction): SegPlacement[] {
   return out;
 }
 
-/** 包含某时刻、属于某天体的预测轨迹段。 */
-export function segmentAt(pred: Prediction, t: number, body: Body): PathSegment | null {
-  for (const s of pred.segments) if (s.body === body && t >= s.times[0] - 1e-6 && t <= s.times[s.times.length - 1] + 1e-6) return s;
-  return null;
-}
-
-const _p = new THREE.Vector3();
-const _q = new THREE.Vector3();
-const _c = new THREE.Color();
-
-/**
- * 飞行视图中的轨迹（不画已飞过的航迹）：
- * - 从火箭出发的预测弹道（蓝色，将要撞地的一段变红），
- * - 1 秒多以前的“幽灵”弹道（白色），操纵时两条线分开，
- * - 远地点 / 落点标签及其变化量。
- * 都换算到随天体自转的坐标系，因此与地面、发射台对得上（BODY_ROTATION 关闭时即惯性系）。
- */
-export class FlightTrajectory {
-  group = new THREE.Group();
-  private pred: DynLine;
-  private ghost: DynLine;
-  private labels: ScreenLabels;
-  private pb = new PolyBuilder();
-  visible = true;
-
-  constructor(overlay: HTMLElement) {
-    this.ghost = new DynLine([fadeLineMaterial({ width: 1.8 })], 42);
-    this.pred = new DynLine([fadeLineMaterial({ width: 5, opacity: 0.12 }), fadeLineMaterial({ width: 2.2 })], 44);
-    for (const l of [this.ghost, this.pred]) l.addTo(this.group);
-    this.labels = new ScreenLabels(overlay);
-  }
-
-  setResolution(w: number, h: number): void {
-    for (const l of [this.ghost, this.pred]) for (const o of l.objects) o.material.resolution.set(w, h);
-  }
-
-  setVisible(v: boolean): void {
-    this.visible = v;
-    this.group.visible = v;
-    if (!v) {
-      this.labels.begin();
-    }
-  }
-
-  update(sim: FlightSim, ghost: Prediction | null, origin: THREE.Vector3, camera: THREE.Camera, w: number, h: number): void {
-    this.labels.begin();
-    if (!this.visible) return;
-    const tel = sim.telemetry;
-    const body = tel.body;
-    const t = sim.t;
-    const th = bodyRotation(body, t);
-    const bp = bodyPosition(body, t, new THREE.Vector3()).sub(origin);
-    const V = sim.vessel;
-    const vesselRel = V.r.clone().sub(origin);
-    // 相对天体中心的惯性位置（时刻 ti）-> 当前时刻随天体转动后的位置（浮动原点系）
-    const place = (x: number, y: number, z: number, ti: number, out: THREE.Vector3) => {
-      _q.set(x, y, z);
-      rotateY(_q, th - bodyRotation(body, ti), out);
-      return out.add(bp);
-    };
-
-    // ---------------------------------------------------------------- 预测弹道与幽灵
-    const pred = sim.destroyed || sim.landed ? null : sim.prediction;
-    this.buildPrediction(pred, body, t, vesselRel, place, 1, this.pred);
-    this.buildPrediction(ghost && pred ? ghost : null, body, t, vesselRel, place, 0.45, this.ghost, true);
-
-    // ---------------------------------------------------------------- 标签
-    if (pred) {
-      const ap = firstEvent(pred, 'ap', body, false, t);
-      if (ap) {
-        place(ap.pos.x, ap.pos.y, ap.pos.z, ap.t, _p);
-        this.labels.add(_p, `<b>${apsisName('ap', body)}</b> ${fmtDist(ap.alt)}${deltaHtml(ap, ghost, t)}<br><small>${fmtTime(ap.t - t)} 后</small>`, 'mk-ap fl');
-      }
-      const imp = pred.impact && pred.impact.body === body && !pred.impact.afterNode ? pred.impact : null;
-      if (imp) {
-        place(imp.pos.x, imp.pos.y, imp.pos.z, imp.t, _p);
-        this.labels.add(_p, `<b>✖ 预计落点</b><br><small>${fmtTime(imp.t - t)} 后</small>`, 'mk-impact fl');
-      } else {
-        const pe = firstEvent(pred, 'pe', body, false, t);
-        if (pe) {
-          place(pe.pos.x, pe.pos.y, pe.pos.z, pe.t, _p);
-          this.labels.add(_p, `<b>${apsisName('pe', body)}</b> ${fmtDist(pe.alt)}${deltaHtml(pe, ghost, t)}<br><small>${fmtTime(pe.t - t)} 后</small>`, 'mk-pe fl');
-        }
-      }
-    }
-    this.labels.layout(camera, w, h);
-  }
-
-  /** 从火箭当前位置开始画预测轨迹（丢弃已经飞过的点），只画当前天体的部分。 */
-  private buildPrediction(
-    pred: Prediction | null,
-    body: Body,
-    t: number,
-    start: THREE.Vector3,
-    place: (x: number, y: number, z: number, ti: number, out: THREE.Vector3) => THREE.Vector3,
-    alpha: number,
-    line: DynLine,
-    flat = false,
-  ): void {
-    const pb = this.pb.clear();
-    if (!pred) {
-      line.visible = false;
-      return;
-    }
-    // 点数多时隔点抽稀，但火箭附近的前 150 个点保持逐点
-    let total = 0;
-    for (const seg of pred.segments) {
-      if (seg.body !== body) break;
-      total += seg.times.length;
-    }
-    const stride = Math.max(1, Math.ceil(total / 900));
-    let budget = 1200;
-    let first = true;
-    for (const seg of pred.segments) {
-      if (seg.body !== body || budget <= 0) break;
-      const n = seg.times.length;
-      if (seg.times[n - 1] <= t) continue;
-      let k = 0;
-      while (k < n && seg.times[k] <= t) k++;
-      const impactT = segImpactT(pred, seg);
-      if (first) {
-        segColor(seg, k, impactT, _c);
-        pb.push(start.x, start.y, start.z, flat ? TRAJ.ghost : _c, alpha);
-        first = false;
-      } else if (pb.n) {
-        // 不连续的两段之间插入透明连接，避免画出多余的弦
-        const L = pb.n - 1;
-        pb.push(pb.pts[L * 3], pb.pts[L * 3 + 1], pb.pts[L * 3 + 2], _c, 0);
-        place(seg.pts[k * 3], seg.pts[k * 3 + 1], seg.pts[k * 3 + 2], seg.times[k], _p);
-        pb.push(_p.x, _p.y, _p.z, _c, 0);
-      }
-      for (let i = k; i < n && budget > 0; ) {
-        place(seg.pts[i * 3], seg.pts[i * 3 + 1], seg.pts[i * 3 + 2], seg.times[i], _p);
-        segColor(seg, i, impactT, _c);
-        pb.push(_p.x, _p.y, _p.z, flat ? TRAJ.ghost : _c, alpha);
-        budget--;
-        i = i === n - 1 ? n : Math.min(n - 1, i + (pb.n < 150 ? 1 : stride));
-      }
-    }
-    // 由近及远渐隐
-    const N = pb.n;
-    for (let i = 0; i < N; i++) if (pb.alpha[i] > 0) pb.alpha[i] *= 1 - 0.65 * (i / Math.max(1, N - 1));
-    pb.flush(line);
-  }
-
-  dispose(): void {
-    for (const l of [this.ghost, this.pred]) l.dispose();
-    this.labels.dispose();
-  }
-}

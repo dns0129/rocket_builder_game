@@ -1416,27 +1416,6 @@ input[type='text'] {
   font-weight: 700;
 }
 
-/* 飞行视图中的轨迹标签：加底色，便于在明亮的天空上阅读 */
-.map-marker.fl {
-  background: rgba(6, 10, 16, 0.55);
-  border-radius: 6px;
-  padding: 2px 7px 2px 14px;
-  margin-left: -4px;
-  line-height: 1.35;
-}
-
-.map-marker.fl::before {
-  left: 3px;
-  top: 7px;
-}
-
-.traj-overlay {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  overflow: hidden;
-}
-
 /* 二维地图工具栏 */
 .map-toolbar {
   position: absolute;
@@ -1675,6 +1654,44 @@ input[type='text'] {
   }
   .hud-br {
     width: 150px;
+  }
+}
+
+/* ---------------------------------------------------------------- 截图模式 */
+
+/* 所有界面（仪表、按钮、提示、地图标签）都不显示，只留三维画面 */
+body.shot-mode #ui,
+body.shot-mode #map-overlay,
+body.shot-mode .narrow-note {
+  display: none !important;
+}
+
+/* 进入截图模式时的操作提示：停留约两秒后淡出，截图时屏幕上什么都没有 */
+.shot-hint {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 60;
+  max-width: calc(100vw - 32px);
+  padding: 7px 16px;
+  border-radius: 18px;
+  background: rgba(10, 16, 24, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #dfe8f2;
+  font-size: 13px;
+  text-align: center;
+  pointer-events: none;
+  animation: shot-hint 2.8s ease forwards;
+}
+
+@keyframes shot-hint {
+  0%,
+  75% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
   }
 }
 

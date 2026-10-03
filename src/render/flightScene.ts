@@ -10,7 +10,7 @@ import { VesselView } from './vesselView';
 import { Particles, ReentryGlow } from './effects';
 import { SeparationFx } from './separation';
 import { MapView, type MapBasis, type MapFocus } from './mapView';
-import { FlightTrajectory, PredictionHistory, bodyChain, placeSegments } from './trajectoryView';
+import { PredictionHistory, bodyChain, placeSegments } from './trajectoryView';
 import type { RenderEngine } from './engine';
 
 export type CamMode = 'orbit' | 'chase' | 'free';
@@ -51,9 +51,7 @@ export class FlightScene {
   hemi: THREE.HemisphereLight;
   engineLight: THREE.PointLight;
   map: MapView;
-  traj: FlightTrajectory;
   history = new PredictionHistory();
-  private trajOverlay: HTMLDivElement;
   mode: 'flight' | 'map' = 'flight';
   camMode: CamMode = 'orbit';
   origin = new THREE.Vector3();
@@ -111,6 +109,10 @@ export class FlightScene {
   private firing = new Set<string>();
   private vesselHidden = false;
   shake = 0;
+  /** 截图模式（界面由 App 隐藏；飞行视图本来就不画轨迹） */
+  shotMode = false;
+  /** 截图模式的纯星空背景：只留星空和飞船，隐藏星球、地面、发射台与大气，光照也不再被星球遮挡 */
+  shotPure = false;
 
   constructor(engine: RenderEngine, maps: PlanetMaps, sim: FlightSim, mapOverlay: HTMLDivElement) {
     this.engine = engine;
@@ -148,17 +150,11 @@ export class FlightScene {
     this.map.onFocus = (f) => this.setMapFocus(f);
     this.map.onToggle3d = () => this.toggleMap3d();
     this.scene.add(this.map.group);
-    // 飞行视图的轨迹标签（远地点、落点）放在界面层之下
-    this.trajOverlay = document.createElement('div');
-    this.trajOverlay.className = 'traj-overlay';
-    mapOverlay.parentElement?.insertBefore(this.trajOverlay, mapOverlay.nextSibling);
-    this.traj = new FlightTrajectory(this.trajOverlay);
-    this.scene.add(this.traj.group);
+    // 飞行视图（看飞船本身）不画任何轨迹：预测轨迹只在地图和左下角的弹道剖面里显示
     engine.onResize((w, h) => {
       this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
       this.map.setResolution(w, h);
-      this.traj.setResolution(w, h);
     });
 
     // 环境反射：天空/地面渐变
@@ -228,6 +224,16 @@ export class FlightScene {
     this.vesselHidden = false;
     this.firing.clear();
     this.emitAcc.clear();
+  }
+
+  /** 进入 / 退出截图模式；pure 为纯星空背景。 */
+  setShotMode(on: boolean, pure: boolean): void {
+    this.shotMode = on;
+    this.shotPure = on && pure;
+    this.planets.setBodiesVisible(!this.shotPure);
+    // 光照环境立即按新的背景重新生成
+    this.envSig = null;
+    this.envTimer = 99;
   }
 
   // ---------------------------------------------------------------- 输入
@@ -543,7 +549,6 @@ export class FlightScene {
   setMode(m: 'flight' | 'map'): void {
     this.mode = m;
     this.map.setVisible(m === 'map');
-    this.traj.setVisible(m === 'flight');
     if (m === 'map') {
       this.mapSnap = true;
       this.setMapFocus('auto');
@@ -660,8 +665,9 @@ export class FlightScene {
     if (this.pad) {
       this.pad.update(t, origin);
       const padDist = this.pad.group.position.length();
-      this.pad.group.visible = padDist < 400_000 && this.mode === 'flight';
+      this.pad.group.visible = padDist < 400_000 && this.mode === 'flight' && !this.shotPure;
     }
+    if (this.shotPure) this.patch.mesh.visible = false;
 
     // 飞船
     const vOrigin = V.r.clone().sub(V.com.clone().applyQuaternion(V.q));
@@ -773,7 +779,8 @@ export class FlightScene {
     const camAbs = this.camera.position.clone().add(origin);
     sunDirection(camAbs, t, sharedUniforms.uSunDir.value);
     sharedUniforms.uCamPos.value.copy(this.camera.position);
-    const atmo = this.activeAtmosphere(camAbs, t);
+    // 纯星空背景：关闭大气散射，天空是黑的，白天也看得见星星
+    const atmo = this.shotPure ? null : this.activeAtmosphere(camAbs, t);
     const atmoC = atmo ? bodyPosition(atmo, t, new THREE.Vector3()).sub(origin) : bodyPosition(EARTH, t, new THREE.Vector3()).sub(origin);
     setActiveAtmosphere(atmo?.id ?? null, atmoC);
     sharedUniforms.uSunIntensity.value = 9 * (atmo ? sunlightFactor(bodyPosition(SUN, t, new THREE.Vector3()).distanceTo(camAbs)) : 1);
@@ -784,8 +791,8 @@ export class FlightScene {
     if (this.sun.castShadow !== wantShadow) this.sun.castShadow = wantShadow;
     this.planets.sky.position.copy(this.camera.position);
     // 二维地图是窄视场的长焦相机：太阳周围按角度计算的光晕会糊满整个屏幕
-    this.planets.skyMat.uniforms.uAureole.value = this.mode === 'map' ? 0 : 1;
-    this.planets.skyMat.uniforms.uGalaxy.value = this.mode === 'map' && this.map3d ? 1 : 0;
+    this.planets.skyMat.uniforms.uAureole.value = this.mode === 'map' || this.shotPure ? 0 : 1;
+    this.planets.skyMat.uniforms.uGalaxy.value = (this.mode === 'map' && this.map3d) || this.shotPure ? 1 : 0;
     this.planets.stars.position.copy(this.camera.position);
     this.planets.starMat.uniforms.uPixelRatio.value = this.engine.renderer.getPixelRatio();
     // 星空可见度：在有大气的天体上白天看不见星星
@@ -815,11 +822,9 @@ export class FlightScene {
     const glow = this.glowColor.copy(this.sunTint).multiplyScalar(this.sunOccl * (1 - day * 0.7));
     this.planets.updateView(this.camera.position, this.camera.near, pxPerRad, this.engine.renderer.getPixelRatio(), glow);
 
-    // 轨迹：飞行视图与二维地图
+    // 轨迹：只在地图中画（幽灵轨迹也供弹道剖面使用）
     this.history.update(sim.prediction, this.time);
-    const ghost = this.history.ghost();
-    if (this.mode === 'map') this.map.update(sim, ghost, origin, this.camera, this.engine.width, this.engine.height, this.mapBasis!, dtReal);
-    else this.traj.update(sim, ghost, origin, this.camera, this.engine.width, this.engine.height);
+    if (this.mode === 'map') this.map.update(sim, this.history.ghost(), origin, this.camera, this.engine.width, this.engine.height, this.mapBasis!, dtReal);
   }
 
   private smokeLight = new THREE.Color(1, 1, 1);
@@ -901,10 +906,12 @@ export class FlightScene {
     const V = sim.vessel;
     const tel = sim.telemetry;
     const sunDir = sunDirection(V.r, sim.t, new THREE.Vector3());
+    // 纯星空背景（截图模式）：画面里没有星球，阳光既不被遮挡也不经过大气，飞船始终被照亮
+    const pure = this.shotPure;
     // 太阳是否被天体遮挡
     let occl = 1;
     for (const b of BODIES) {
-      if (b.kind === 'star') continue;
+      if (b.kind === 'star' || pure) continue;
       const c = bodyPosition(b, sim.t, new THREE.Vector3());
       const rel = c.sub(V.r);
       const along = rel.dot(sunDir);
@@ -914,7 +921,7 @@ export class FlightScene {
       occl *= THREE.MathUtils.smoothstep(perp, b.radius - soft, b.radius + soft);
     }
     // 大气对太阳光的染色（只考虑飞船所在天体的大气）
-    const look = ATMO_LOOK[tel.body.id];
+    const look = pure ? undefined : ATMO_LOOK[tel.body.id];
     const upB = V.r.clone().sub(bodyPosition(tel.body, sim.t, new THREE.Vector3())).normalize();
     const mu = upB.dot(sunDir);
     let tr = [1, 1, 1];
@@ -946,7 +953,7 @@ export class FlightScene {
     this.sun.position.copy(focus).addScaledVector(sunDir, size * 8 + 150);
     // 半球光：天空与地面反照
     const atm = tel.body.atmosphere;
-    const dayF = THREE.MathUtils.smoothstep(mu, -0.1, 0.15);
+    const dayF = pure ? 1 : THREE.MathUtils.smoothstep(mu, -0.1, 0.15);
     const airF = atm && tel.alt < atm.height ? 1 - THREE.MathUtils.smoothstep(tel.alt, atm.height * 0.07, atm.height * 0.85) : 0;
     const look2 = HEMI_LOOK[tel.body.id] ?? HEMI_LOOK.moon!;
     const sky = look2.sky.clone().multiplyScalar(0.55 * dayF * airF * flux + 0.02);
@@ -956,6 +963,12 @@ export class FlightScene {
     const ground = look2.ground.clone().multiplyScalar((look2.k + 0.4 * airF) * dayF * (0.3 + solid) * occl * flux);
     // 夜面补光：与星球着色器的夜面亮度一致（半球光的辐照度 × 反照率 / π），夜里的地面和火箭也看得清
     const fill = NIGHT_TINT.clone().multiplyScalar(Math.PI * NIGHT_LIGHT * Math.min(1.2, flux) * (1 - 0.8 * dayF * occl));
+    if (pure) {
+      // 没有天空散射与地面反照：背光面只留一点星光补光，看得出轮廓
+      sky.setRGB(0.02, 0.022, 0.03);
+      ground.copy(sky);
+      fill.copy(NIGHT_TINT).multiplyScalar(Math.PI * NIGHT_LIGHT * 0.3);
+    }
     this.hemi.color.copy(sky).add(fill);
     this.hemi.groundColor.copy(ground).add(fill);
     this.hemi.intensity = 1.0;
@@ -1115,7 +1128,5 @@ export class FlightScene {
     this.pmrem.dispose();
     this.map.setVisible(false);
     this.map.dispose();
-    this.traj.dispose();
-    this.trajOverlay.remove();
   }
 }
