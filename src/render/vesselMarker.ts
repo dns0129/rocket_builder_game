@@ -1,128 +1,77 @@
 import * as THREE from 'three';
 
-/** 标记在屏幕上的高度（像素） */
-const MARKER_PX = 40;
-
-/**
- * 面着色：固定在相机上的“头灯”（从左上方照过来），朝向不同的面明暗不同，转动时一眼就能看出立体的朝向；
- * 与太阳方向无关，在星球的夜面上也一样清楚。
- * 棱线：每个面的三个顶点带重心坐标，离边越近越暗（屏幕上约 1.5 像素宽）；背面已剔除，只画看得见的棱。
- */
-const SHADE_VERT = /* glsl */ `
-attribute vec3 color;
-attribute vec3 bary;
-varying vec3 vColor;
-varying vec3 vNormal;
-varying vec3 vBary;
-void main() {
-  vColor = color;
-  vBary = bary;
-  vNormal = normalize(normalMatrix * normal);
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}
-`;
-const SHADE_FRAG = /* glsl */ `
-varying vec3 vColor;
-varying vec3 vNormal;
-varying vec3 vBary;
-void main() {
-  vec3 L = normalize(vec3(-0.45, 0.65, 0.6));
-  float k = 0.4 + 0.6 * max(dot(normalize(vNormal), L), 0.0);
-  float e = min(min(vBary.x, vBary.y), vBary.z);
-  float w = fwidth(e);
-  float edge = 1.0 - smoothstep(w * 0.6, w * 1.8, e);
-  gl_FragColor = vec4(mix(vColor * k, vec3(0.05, 0.04, 0.0), edge * 0.85), 1.0);
-}
-`;
-/** 三角锥的尺寸（单位长度 = 标记高度）：尖端在 +Y，底面三角形外接圆半径 */
+/** 标记的大小：机头到尾部约这么多像素（侧面看时） */
+const SIZE_PX = 20;
+/** 三角锥的尺寸（单位长度 = 机头到尾部）：尖端在 +Y，底面三角形外接圆半径 */
 const TIP = 0.6;
 const BASE_Y = -0.4;
 const BASE_R = 0.42;
+/** 面着色用的“头灯”方向（相机坐标系，从左上方照过来） */
+const LIGHT = new THREE.Vector3(-0.45, 0.65, 0.6).normalize();
 
-/**
- * 三角锥的顶点与面颜色。尖端指向箭体 +Y（机头），底面的三个顶点均匀分布，
- * 其中朝向箭体 +Z 的那一面（发射时朝西，向东重力转弯时朝天）涂成红色，用来看出滚转；
- * 另外两个侧面一黄一浅白、底面（尾部）深色，再加上随相机的面光照与棱线，从任何方向看都能分清各个面。
- */
-function pyramidGeometry(scale = 1): THREE.BufferGeometry {
-  const apex = new THREE.Vector3(0, TIP * scale, 0);
-  // 底面顶点：+Z 面的两个顶点在 ±60°，第三个顶点在 -Z 方向
-  const base = [60, 180, 300].map((deg) => {
-    const a = (deg * Math.PI) / 180;
-    return new THREE.Vector3(Math.sin(a) * BASE_R * scale, BASE_Y * scale, Math.cos(a) * BASE_R * scale);
-  });
-  // 底面顶点按 60° → 180° → 300° 的顺序，从外侧看侧面为逆时针
-  // 三个侧面颜色分明（红 / 黄 / 浅白），看到哪一面就知道箭体朝哪边；颜色略偏饱和，整幅画面最后要经过 ACES 色调映射
-  const top = new THREE.Color('#ff3a1e');
-  const sideA = new THREE.Color('#ffd21a');
-  const sideB = new THREE.Color('#fff3c0');
-  const tail = new THREE.Color('#5a4006');
-  const faces: [THREE.Vector3, THREE.Vector3, THREE.Vector3, THREE.Color][] = [
-    [apex, base[2], base[0], top], // +Z 面（300° 与 60° 之间）
-    [apex, base[0], base[1], sideA],
-    [apex, base[1], base[2], sideB],
-    [base[0], base[2], base[1], tail], // 底面朝 -Y
-  ];
-  const pos: number[] = [];
-  const col: number[] = [];
-  const bary: number[] = [];
-  for (const [a, b, c, k] of faces) {
-    for (const p of [a, b, c]) {
-      pos.push(p.x, p.y, p.z);
-      col.push(k.r, k.g, k.b);
-    }
-    bary.push(1, 0, 0, 0, 1, 0, 0, 0, 1);
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
-  g.setAttribute('bary', new THREE.Float32BufferAttribute(bary, 3));
-  g.computeVertexNormals();
-  return g;
+interface Face {
+  v: THREE.Vector3[];
+  n: THREE.Vector3;
+  color: THREE.Color;
 }
 
 /**
- * 地图上的飞船标记：三维三角锥，尖端指向机头，随箭体姿态（四元数）实时转动，
- * 俯仰、偏航、滚转都看得出来（以前的二维箭头只能在屏幕平面内转，机头指向屏幕里外时看不出来）。
- * 大小按屏幕像素固定；放在透明物体队列里画在天空和轨迹线之后（不写深度的不透明物体会被最后绘制的天空盖掉），
- * 不参与深度测试（凸多面体剔除背面即可正确显示），外面套一层略大的深色背面作为描边，
- * 在明亮的星球上也看得清。被星球挡住时由调用方隐藏。
+ * 三角锥：尖端指向箭体 +Y（机头），底面的三个顶点均匀分布。
+ * 朝向箭体 +Z 的侧面（发射时朝西，向东重力转弯时朝天）为橙红色，另外两个侧面一金一米白，
+ * 看到哪一面就知道箭体滚转到了哪里；底面（尾部）为深琥珀色。
  */
-export class VesselMarker {
-  readonly group = new THREE.Group();
+const FACES: Face[] = (() => {
+  const apex = new THREE.Vector3(0, TIP, 0);
+  const base = [60, 180, 300].map((deg) => {
+    const a = (deg * Math.PI) / 180;
+    return new THREE.Vector3(Math.sin(a) * BASE_R, BASE_Y, Math.cos(a) * BASE_R);
+  });
+  const face = (v: THREE.Vector3[], hex: string): Face => {
+    const n = new THREE.Vector3().subVectors(v[1], v[0]).cross(new THREE.Vector3().subVectors(v[2], v[0])).normalize();
+    return { v, n, color: new THREE.Color(hex) };
+  };
+  // 顶点从外侧看为逆时针，法向朝外
+  return [face([apex, base[2], base[0]], '#ff6a3d'), face([apex, base[0], base[1]], '#ffc93a'), face([apex, base[1], base[2]], '#fff0c4'), face([base[0], base[2], base[1]], '#8a5a14')];
+})();
 
-  constructor() {
-    const body = new THREE.Mesh(
-      pyramidGeometry(),
-      new THREE.ShaderMaterial({ vertexShader: SHADE_VERT, fragmentShader: SHADE_FRAG, depthTest: false, depthWrite: false, transparent: true, side: THREE.FrontSide }),
-    );
-    // 描边：放大一点、只画背面的深色外壳，先于本体绘制
-    const outline = new THREE.Mesh(
-      pyramidGeometry(1.16),
-      new THREE.MeshBasicMaterial({ color: 0x1a1400, depthTest: false, depthWrite: false, transparent: true, side: THREE.BackSide }),
-    );
-    outline.renderOrder = 70;
-    body.renderOrder = 71;
-    for (const m of [outline, body]) m.frustumCulled = false;
-    this.group.add(outline, body);
-  }
+const _p = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _n = new THREE.Vector3();
+const _w = new THREE.Vector3();
+const _eye = new THREE.Vector3();
+const _c = new THREE.Color();
 
-  /** 每帧：放到飞船位置（浮动原点系），按箭体姿态转动，按相机距离缩放到固定的屏幕大小。 */
-  update(pos: THREE.Vector3, q: THREE.Quaternion, camera: THREE.PerspectiveCamera, viewportH: number, visible: boolean): void {
-    this.group.visible = visible;
-    if (!visible) return;
-    this.group.position.copy(pos);
-    this.group.quaternion.copy(q);
-    const dist = camera.position.distanceTo(pos);
-    const mpp = (2 * dist * Math.tan(((camera.fov / 2) * Math.PI) / 180)) / Math.max(1, viewportH);
-    this.group.scale.setScalar(MARKER_PX * mpp);
+/**
+ * 地图上的飞船标记：随箭体姿态（四元数 q）实时转动的三维三角锥，画成 SVG。
+ * 把各顶点按相机的朝向投影到屏幕上（含透视修正：标记不在画面中央时，看它的方向与相机正前方不同），
+ * 只画朝向相机的面；凸多面体剔除背面后各面互不遮挡，不需要排序。
+ * 交给浏览器画 SVG：边缘有抗锯齿，棱用各面自身颜色的深色调细线，比在三维场景里画（没有多重采样，边缘一圈锯齿）好看得多。
+ * pos 为飞船位置（浮动原点系）；飞船在相机背后时返回空串。
+ */
+export function vesselMarkerSvg(q: THREE.Quaternion, pos: THREE.Vector3, camera: THREE.Camera): string {
+  const P = _p.copy(pos).applyMatrix4(camera.matrixWorldInverse);
+  if (P.z > -1e-9) return '';
+  // 小物体的透视投影：偏移 (dX, dY, dZ) 在屏幕上移动 (dX − dZ·X/Z, dY − dZ·Y/Z)（再整体乘一个常数）
+  const kx = P.x / P.z;
+  const ky = P.y / P.z;
+  const qv = _q.copy(camera.quaternion).invert().multiply(q);
+  _eye.copy(P).negate().normalize();
+  let polys = '';
+  for (const f of FACES) {
+    _n.copy(f.n).applyQuaternion(qv);
+    if (_n.dot(_eye) <= 1e-4) continue;
+    const pts = f.v
+      .map((v) => {
+        _w.copy(v).applyQuaternion(qv);
+        const x = (_w.x - _w.z * kx) * SIZE_PX;
+        const y = -(_w.y - _w.z * ky) * SIZE_PX;
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      })
+      .join(' ');
+    const k = 0.58 + 0.42 * Math.max(0, _n.dot(LIGHT));
+    const fill = _c.copy(f.color).multiplyScalar(k).getHexString();
+    const edge = _c.copy(f.color).multiplyScalar(k * 0.45).getHexString();
+    polys += `<polygon points="${pts}" fill="#${fill}" stroke="#${edge}"/>`;
   }
-
-  dispose(): void {
-    for (const o of this.group.children) {
-      const m = o as THREE.Mesh;
-      m.geometry.dispose();
-      (m.material as THREE.Material).dispose();
-    }
-  }
+  return `<svg viewBox="-16 -16 32 32">${polys}</svg>`;
 }

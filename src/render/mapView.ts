@@ -5,7 +5,7 @@ import type { FlightSim } from '../game/flight';
 import type { Prediction } from '../game/predictor';
 import { DynLine, PolyBuilder, RingLine, fadeLineMaterial } from './lines';
 import { ScreenLabels } from './labels';
-import { VesselMarker } from './vesselMarker';
+import { vesselMarkerSvg } from './vesselMarker';
 import { TRAJ, apsisName, deltaHtml, placeSegments, segColor, segImpactT, type SegPlacement } from './trajectoryView';
 import { fmtDist, fmtTime } from '../ui/format';
 
@@ -61,8 +61,6 @@ export class MapView {
   group = new THREE.Group();
   private overlay: HTMLDivElement;
   private labels: ScreenLabels;
-  /** 飞船标记：随箭体姿态转动的三维三角锥 */
-  private marker = new VesselMarker();
   private pb = new PolyBuilder();
   private pred: Record<BodyId, DynLine>;
   private ghost: Record<BodyId, DynLine>;
@@ -92,7 +90,6 @@ export class MapView {
   constructor(overlay: HTMLDivElement) {
     this.overlay = overlay;
     this.labels = new ScreenLabels(overlay);
-    this.group.add(this.marker.group);
     const mkSet = (make: () => DynLine) => Object.fromEntries(BODY_IDS.map((id) => [id, make()])) as Record<BodyId, DynLine>;
     // 线宽含两侧各约 1 像素的抗锯齿渐变；流动光点亮度低于泛光阈值，避免泛光把细线糊成一串方块
     this.ghost = mkSet(() => new DynLine([fadeLineMaterial({ width: 1.8, depthTest: false })], 52));
@@ -211,10 +208,9 @@ export class MapView {
     this.btn3d.classList.toggle('on', on);
     this.btn3d.textContent = on ? '3D' : '2D';
     this.hint.textContent = on ? '拖动旋转 · 右键平移 · 滚轮缩放' : '拖动平移 · 滚轮缩放';
-    // 飞船标记始终画在最上层（被星球挡住时整个隐藏），不参与深度测试
     this.group.traverse((o) => {
       const m = (o as THREE.Mesh).material as THREE.Material | undefined;
-      if (m && o !== this.stars && o.parent !== this.marker.group) m.depthTest = on;
+      if (m && o !== this.stars) m.depthTest = on;
     });
   }
 
@@ -376,6 +372,8 @@ export class MapView {
       this.labels.add(bodyW[b.id].clone().addScaledVector(view.up, -off), tgt ? `◎ ${b.name}` : b.name, tgt ? 'mk-body mk-target' : 'mk-body');
     }
     for (const e of encs) this.labels.add(e.pos.clone().addScaledVector(view.up, Math.max(e.body.radius * 1.3, mpp * 13)), `${e.body.name}（相遇时）<br><small>${fmtTime(e.t - t)} 后</small>`, 'mk-body mk-enc');
+    // 飞船：随箭体姿态实时转动的三维三角锥（SVG，见 vesselMarker.ts）
+    if (!sim.destroyed) this.labels.add(vesselW, vesselMarkerSvg(V.q, vesselW, camera), 'mk-vessel');
     // 三维地图：被星球挡住的标签不显示
     let hidden: ((p: THREE.Vector3) => boolean) | undefined;
     if (this.is3d) {
@@ -400,8 +398,6 @@ export class MapView {
       };
     }
     this.labels.layout(camera, w, h, hidden);
-    // 飞船：三维三角锥，随箭体姿态实时转动（被星球挡住时隐藏）
-    this.marker.update(vesselW, V.q, camera, h, !sim.destroyed && !hidden?.(vesselW));
 
     // 比例尺
     const target = mpp * 110;
@@ -414,7 +410,6 @@ export class MapView {
   dispose(): void {
     for (const id of BODY_IDS) for (const set of [this.ghost, this.pred]) set[id].dispose();
     for (const r of this.allRings) r.dispose();
-    this.marker.dispose();
     this.labels.dispose();
     this.toolbar.remove();
   }

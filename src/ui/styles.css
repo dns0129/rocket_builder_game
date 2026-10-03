@@ -1447,6 +1447,28 @@ input[type='text'] {
   white-space: nowrap;
 }
 
+/* 飞船标记：随箭体姿态转动的三维三角锥（SVG，见 render/vesselMarker.ts） */
+.mk-vessel {
+  padding-left: 0;
+  margin-left: -16px;
+  margin-top: -16px;
+}
+
+.mk-vessel svg {
+  display: block;
+  width: 32px;
+  height: 32px;
+  overflow: visible;
+  /* 柔和的投影 + 淡淡的暖色光晕：在明亮的星球和漆黑的太空上都看得清，又没有生硬的黑边 */
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.55)) drop-shadow(0 0 4px rgba(255, 196, 80, 0.35));
+}
+
+.mk-vessel polygon {
+  stroke-width: 0.7;
+  stroke-linejoin: round;
+}
+
+.mk-vessel::before,
 .mk-body::before {
   display: none;
 }
