@@ -80,7 +80,8 @@
       ],
       "category": "public.app-category.games",
       "icon": "build/icon.png",
-      "identity": "-"
+      "identity": "-",
+      "hardenedRuntime": false
     },
     "linux": {
       "target": [

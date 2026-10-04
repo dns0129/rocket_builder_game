@@ -10,12 +10,16 @@
 
 像普通软件一样安装：游戏在自己的窗口里运行（没有浏览器的地址栏和标签页），有桌面图标，不需要浏览器、Node.js，也不需要联网。
 
+**下载**：[GitHub Releases 最新版](https://github.com/dns0129/rocket_builder_game/releases/latest)（发布页上写着每个文件对应哪种设备）。
+
 | 系统 | 安装包 | 安装方法 |
 | --- | --- | --- |
-| Windows 10 / 11（64 位） | `火箭工坊-安装程序-0.1.0-Windows.exe`（约 115 MB） | 双击，按提示安装；装好后桌面和开始菜单里会有“火箭工坊” |
-| macOS 13 及以上，Apple 芯片（M1 / M2 / M3 / M4…） | `火箭工坊-0.1.0-macOS-AppleSilicon.zip` | 双击解压，把“火箭工坊.app”拖进“应用程序”文件夹 |
-| macOS 13 及以上，Intel 芯片 | `火箭工坊-0.1.0-macOS-Intel.zip` | 同上 |
-| Linux（64 位） | `火箭工坊-0.1.0-Linux-x86_64.AppImage` | `chmod +x` 后双击运行 |
+| Windows 10 / 11（64 位） | `RocketWorkshop-Setup-…-Windows-x64.exe`（约 115 MB） | 双击，按提示安装；装好后桌面和开始菜单里会有“火箭工坊” |
+| macOS 13 及以上，Apple 芯片（M1 / M2 / M3 / M4…） | `RocketWorkshop-…-macOS-AppleSilicon.zip` | 双击解压，把“火箭工坊.app”拖进“应用程序”文件夹 |
+| macOS 13 及以上，Intel 芯片 | `RocketWorkshop-…-macOS-Intel.zip` | 同上 |
+| Linux（64 位） | `RocketWorkshop-…-Linux-x86_64.AppImage` | `chmod +x` 后双击运行 |
+
+发布页由 GitHub Actions（`.github/workflows/desktop-app.yml`）在 Windows、macOS、Linux 上分别原生打包后自动更新：`main` 上的游戏或客户端有改动时自动运行，也可以在 Actions 页面手动运行。发布的版本号取自 `desktop/package.json`，版本号不变时用新构建替换同一个发布。单文件离线包（手机版 / 电脑浏览器版）也一起放在发布页上。
 
 - 安装包没有付费的代码签名，第一次运行时系统会提醒。**Windows**：“Windows 已保护你的电脑” → 点“更多信息” → “仍要运行”。**macOS**：提示无法验证开发者时点“完成”，打开 **系统设置 → 隐私与安全性**，在页面底部点 **“仍要打开”**。
 - 窗口默认最大化；**F11** 全屏，**F12** 开发者工具（报告问题时用）。飞行中关闭窗口会先确认。

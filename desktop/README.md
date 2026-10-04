@@ -2,7 +2,11 @@
 
 把游戏装成普通的电脑程序：在自己的窗口里运行（没有浏览器的地址栏和标签页），有桌面图标和开始菜单 / 启动台入口，不需要浏览器、Node.js，也不需要联网。用 [Electron](https://www.electronjs.org/) 实现，内容就是仓库根目录 `vite build` 生成的电脑版游戏。
 
-## 生成安装包
+## 下载
+
+[GitHub Releases 最新版](https://github.com/dns0129/rocket_builder_game/releases/latest)。由 `.github/workflows/desktop-app.yml` 在 Windows、macOS、Linux 上分别原生打包并发布：`main` 上的游戏或客户端有改动时自动运行，也可以在 Actions 页面手动运行。发布的 tag 是 `v` + 本目录 `package.json` 的 `version`；版本号不变时，用新构建替换同一个发布（下载链接不变），要保留旧版本就先把版本号加一。发布页上的文件名是 ASCII 的（GitHub 会把中文文件名改成点号），中文写在显示标签里。
+
+## 在本地生成安装包
 
 在仓库根目录：
 
