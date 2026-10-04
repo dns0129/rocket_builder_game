@@ -241,7 +241,7 @@ function zip(entries) {
 
 const mb = (n) => (n / 1024 / 1024).toFixed(1);
 
-rmSync(OUT, { recursive: true, force: true });
+// 只覆盖自己生成的文件：release/app/ 里是 npm run app 生成的客户端安装包
 mkdirSync(OUT, { recursive: true });
 
 for (const v of VARIANTS) {
