@@ -1,0 +1,106 @@
+# 生成电脑客户端安装包并发布到 GitHub Releases（每个平台在对应系统上原生打包）。
+# main 上的游戏或客户端有改动时自动运行，也可以在 Actions 页面手动运行。
+# 发布的 tag 是 v<desktop/package.json 的 version>：版本号不变时，用新构建替换同一个发布（下载链接不变）。
+name: 电脑客户端安装包
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - public/**
+      - index.html
+      - vite.config.ts
+      - package.json
+      - package-lock.json
+      - desktop/**
+      - mobile/src/**
+      - mobile/public/**
+      - mobile/index.html
+      - scripts/build-app.mjs
+      - scripts/build-offline.mjs
+      - .github/release-notes.md
+      - .github/workflows/desktop-app.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-app-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: --win
+          - os: macos-latest
+            platform: --mac
+          - os: ubuntu-latest
+            platform: --linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      - run: npm ci
+      - run: npm run app -- ${{ matrix.platform }}
+      # 单文件离线包（电脑浏览器版 / 安卓手机版）只需打一次
+      - if: runner.os == 'Linux'
+        run: npm --prefix mobile ci && npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ runner.os }}
+          if-no-files-found: error
+          path: |
+            release/app/*.exe
+            release/app/*.zip
+            release/app/*.AppImage
+            release/*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+          merge-multiple: true
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./desktop/package.json').version")
+          tag="v$version"
+          mkdir upload
+          assets=()
+          # 发布页的文件名用 ASCII（GitHub 会把中文文件名改成点号），中文写在显示标签里
+          add() {
+            local src
+            src=$(find dl -type f -name "$1" | head -n 1)
+            if [ -z "$src" ]; then echo "缺少 $1"; exit 1; fi
+            cp "$src" "upload/$2"
+            assets+=("upload/$2#$3")
+          }
+          add '*-Windows.exe'          "RocketWorkshop-Setup-$version-Windows-x64.exe"      '火箭工坊 · Windows 安装程序（64 位）'
+          add '*-macOS-AppleSilicon.zip' "RocketWorkshop-$version-macOS-AppleSilicon.zip"   '火箭工坊 · macOS（Apple 芯片）'
+          add '*-macOS-Intel.zip'      "RocketWorkshop-$version-macOS-Intel.zip"           '火箭工坊 · macOS（Intel 芯片）'
+          add '*.AppImage'             "RocketWorkshop-$version-Linux-x86_64.AppImage"     '火箭工坊 · Linux（AppImage）'
+          add '*-手机版.zip'            'RocketWorkshop-Offline-Mobile.zip'                 '火箭工坊 · 手机版离线单文件（安卓）'
+          add '*-电脑版.zip'            'RocketWorkshop-Offline-Desktop.zip'                '火箭工坊 · 电脑浏览器离线单文件'
+          ls -la upload
+          # 同一版本重新发布：先删掉旧的发布和 tag，再在当前提交上重建（下载链接不变）
+          if gh release view "$tag" >/dev/null 2>&1; then gh release delete "$tag" --cleanup-tag --yes; fi
+          gh release create "$tag" "${assets[@]}" --target "$GITHUB_SHA" --latest \
+            --title "火箭工坊 $version" --notes-file .github/release-notes.md

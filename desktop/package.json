@@ -1,0 +1,103 @@
+{
+  "name": "rocket-workshop",
+  "productName": "火箭工坊",
+  "version": "0.1.0",
+  "private": true,
+  "description": "火箭工坊 · 登月计划：在独立窗口中运行的火箭总装与飞行模拟（电脑客户端）",
+  "author": "dns0129",
+  "repository": "github:dns0129/rocket_builder_game",
+  "desktopName": "rocket-workshop.desktop",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "io.github.dns0129.rocket-builder-game",
+    "copyright": "Copyright © 2026 dns0129",
+    "publish": [],
+    "directories": {
+      "output": "../release/app",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.cjs",
+      "build/icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist",
+        "to": "game",
+        "filter": [
+          "**/*",
+          "!artifact.html"
+        ]
+      }
+    ],
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
+    "win": {
+      "executableName": "RocketWorkshop",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon-win.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "火箭工坊",
+      "uninstallDisplayName": "火箭工坊",
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "language": "2052",
+      "runAfterFinish": true,
+      "artifactName": "火箭工坊-安装程序-${version}-Windows.${ext}"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.games",
+      "icon": "build/icon.png",
+      "identity": "-",
+      "hardenedRuntime": false
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Game",
+      "executableName": "rocket-workshop",
+      "icon": "build/icon-win.png",
+      "synopsis": "火箭总装与飞行模拟",
+      "artifactName": "火箭工坊-${version}-Linux-${arch}.${ext}",
+      "syncDesktopName": true
+    }
+  }
+}

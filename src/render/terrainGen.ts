@@ -1,4 +1,4 @@
-import { EARTH, MOON } from '../physics/bodies';
+import { BODY_BY_ID, type BodyId } from '../physics/bodies';
 import { terrainHeight } from '../physics/terrain';
 import { Vector3 } from 'three';
 
@@ -6,7 +6,7 @@ import { Vector3 } from 'three';
 
 export interface PatchJob {
   id: number;
-  bodyId: 'earth' | 'moon';
+  bodyId: BodyId;
   lat: number;
   lon: number;
   d0: number;
@@ -20,7 +20,7 @@ export interface PatchJob {
 
 export interface PatchResult {
   id: number;
-  bodyId: 'earth' | 'moon';
+  bodyId: BodyId;
   key: string;
   center: [number, number, number];
   centerDir: [number, number, number];
@@ -36,7 +36,7 @@ function dirOf(lat: number, lon: number): Vector3 {
 }
 
 export function generatePatch(job: PatchJob): PatchResult {
-  const body = job.bodyId === 'moon' ? MOON : EARTH;
+  const body = BODY_BY_ID[job.bodyId];
   const R = body.radius;
   const { rings: N, segs: S, d0, rMax, lat, lon } = job;
   const cd = dirOf(lat, lon);
