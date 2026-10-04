@@ -6,6 +6,28 @@
 
 ## 快速开始
 
+### 离线下载包：不用安装任何东西
+
+电脑版和手机版各有一个**单文件离线包**：游戏程序、地形 Worker、地球与行星贴图、演示录像全部内嵌在一个 `.html` 里，双击就能在浏览器中玩，不需要 Node.js、本地服务器，也不需要联网；可以拷到 U 盘或直接发给别人。
+
+| 下载包 | 内容 | 大小 | 怎么打开 |
+| --- | --- | --- | --- |
+| `火箭工坊-电脑版.zip` | `火箭工坊.html` + `使用说明.txt` | 约 17 MB（网页约 24 MB，含 4K 行星贴图） | 解压后双击 `火箭工坊.html`，推荐 Chrome / Edge，Safari、Firefox 也可以 |
+| `火箭工坊-手机版.zip` | `火箭工坊-手机版.html` + `使用说明.txt` | 约 2.4 MB（网页约 4 MB） | 安卓：解压后点 `.html`，用 Chrome 打开（Edge、Firefox 也可以） |
+
+生成方法（输出到 `release/`，同时附带不压缩的 `.html`，方便直接传到手机上）：
+
+```bash
+npm install
+npm run package
+```
+
+注意事项：
+
+- **iPhone / iPad 无法运行离线包**：iOS 的“文件”App 只预览网页、不运行其中的脚本，Safari 也打不开本地文件。
+- 火箭设计、任务进度和录制的 Demo 保存在浏览器里，不在 `.html` 文件中；换浏览器或清除浏览器数据后看不到原来的存档。部分手机浏览器以本地文件方式打开时不允许保存，关掉页面后存档不会保留。
+- 实现：`scripts/build-offline.mjs` 用 `vite build --mode offline` 构建，构建时把 `new Worker(new URL(…, import.meta.url))` 换成内嵌的经典 Worker（`file://` 页面不能从 `blob:` 地址启动模块 Worker），把指向 `public/` 中贴图、演示录像的路径字符串换成 `data:` 地址，最后把脚本和样式内联进页面。源码中可用 `import.meta.env.MODE === 'offline'` 判断离线包（手机版据此不注册 Service Worker）。
+
 ### Windows：双击启动
 
 1. 下载项目：GitHub 页面上点 **Code → Download ZIP** 并解压（或 `git clone`）。
@@ -25,7 +47,7 @@
 
 > 如果双击后提示“没有适当的访问权限”（用第三方解压软件解压时可能丢失可执行权限）：打开“终端”，输入 `bash `（后面有一个空格），把 `Start Game.command` 拖进终端窗口，按回车即可。
 
-> 不能直接双击 `dist/index.html`：浏览器禁止以 `file://` 方式加载模块脚本、Web Worker 和贴图，必须通过本地服务器打开。推荐使用 Chrome、Edge 或 Safari。
+> 不能直接双击 `dist/index.html`：浏览器禁止以 `file://` 方式加载模块脚本、Web Worker 和贴图，必须通过本地服务器打开。推荐使用 Chrome、Edge 或 Safari。想要双击就能玩，请用上面的**离线下载包**（`npm run package`）。
 
 Linux（或习惯命令行）可以用 `npm install` 之后 `npm start`，效果相同。
 
@@ -62,7 +84,7 @@ npm run dev        # 手机与电脑连同一 Wi-Fi，用手机打开终端里�
 npm run build      # 输出到 mobile/dist/
 ```
 
-详见 [mobile/README.md](mobile/README.md)。
+手机版的单文件离线包和电脑版一起由仓库根目录的 `npm run package` 生成（见上面的“离线下载包”）。详见 [mobile/README.md](mobile/README.md)。
 
 ## 玩法流程
 

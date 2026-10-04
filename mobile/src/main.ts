@@ -689,8 +689,8 @@ function webglOk(): boolean {
   }
 }
 
-// 离线缓存（PWA）：只在正式构建中注册，开发时不缓存
-if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+// 离线缓存（PWA）：只在正式构建中注册，开发时不缓存；单文件离线包（npm run package）本身就不需要网络
+if (import.meta.env.PROD && import.meta.env.MODE !== 'offline' && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker
       .register('./sw.js')

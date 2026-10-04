@@ -9,6 +9,7 @@
     "start": "vite build && vite preview --host 127.0.0.1 --port 4173 --open",
     "build": "tsc --noEmit && vite build",
     "artifact": "vite build && node scripts/build-artifact.mjs",
+    "package": "node scripts/build-offline.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

@@ -16,6 +16,8 @@ npm test           # 物理与平衡测试（与电脑版相同）
 
 **在手机上调试**：手机和电脑连同一个 Wi-Fi，`npm run dev` 后终端会显示 `Network: http://192.168.x.x:5174`，用手机浏览器打开这个地址即可。
 
+**离线下载包**：在仓库根目录运行 `npm install && npm run package`，会生成 `release/火箭工坊-手机版.zip`（以及电脑版）。整个游戏内嵌在一个 `.html` 里，安卓手机上解压后用 Chrome 打开即可离线游玩，不需要服务器；iOS 不能运行本地网页，不适用。离线包以 `offline` 模式构建，不注册 Service Worker。
+
 **部署**：`dist/` 是纯静态文件（`base: './'`，放在任意子路径下都能用）。正式发布请使用 **HTTPS**——屏幕常亮、离线缓存、“添加到主屏幕”都要求安全连接。
 
 需要支持 WebGL2 的手机浏览器：iOS / iPadOS 15+ 的 Safari，或安卓上较新的 Chrome / Edge / 三星浏览器。
