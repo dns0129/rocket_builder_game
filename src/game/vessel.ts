@@ -73,6 +73,11 @@ export class Vessel {
   contacts: ContactPoint[] = [];
   crew = 0;
   dirty = true;
+  /**
+   * 无限燃料模式：液体燃料箱始终是满的，液体发动机不会因燃料耗尽而熄火。
+   * 固体助推器照常烧完、照常自动分离——它们无法节流也无法关机，无限燃烧反而没法控制。
+   */
+  infiniteFuel = false;
 
   constructor(design: RocketDesign) {
     this.design = design;
@@ -362,6 +367,26 @@ export class Vessel {
     return total;
   }
 
+  /**
+   * 开关无限燃料。打开时把液体燃料箱加满，已点燃但因燃料耗尽熄火的液体发动机重新工作；
+   * 关闭时保留当前（满的）燃料，之后正常消耗。返回重新点燃的发动机。
+   */
+  setInfiniteFuel(on: boolean): string[] {
+    this.infiniteFuel = on;
+    const relit: string[] = [];
+    if (!on) return relit;
+    for (const rp of this.parts) {
+      if (rp.fuelMax > 0 && rp.p.prop !== 'solid') rp.fuel = rp.fuelMax;
+      const e = rp.p.def.engine;
+      if (e && e.propellant !== 'solid' && rp.ignited && rp.flameout) {
+        rp.flameout = false;
+        relit.push(rp.key);
+      }
+    }
+    this.computeMassProps();
+    return relit;
+  }
+
   /** 消耗推进剂；返回是否有发动机因燃料耗尽而熄火。 */
   consumeFuel(dt: number): string[] {
     const flameouts: string[] = [];
@@ -369,6 +394,8 @@ export class Vessel {
     for (const rp of this.parts) {
       const e = rp.p.def.engine;
       if (!e || rp.throttleEff <= 0) continue;
+      // 无限燃料：液体发动机不耗油（固体助推器照常燃烧）
+      if (this.infiniteFuel && e.propellant !== 'solid') continue;
       const md = (rp.throttleEff * e.thrustVac) / (e.ispVac * G0);
       const k = enginePoolKey(rp.p);
       demand.set(k, (demand.get(k) ?? 0) + md * dt);
@@ -406,6 +433,7 @@ export class Vessel {
   stageDeltaV(): number {
     const act = this.activeEngines();
     if (!act.length) return 0;
+    if (this.infiniteFuel && act.some((e) => e.p.def.engine!.propellant !== 'solid')) return Infinity;
     let fv = 0;
     let md = 0;
     const keys = new Set<string>();

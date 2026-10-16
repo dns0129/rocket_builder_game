@@ -38,12 +38,15 @@ export function computeOrbit(r: Vector3, v: Vector3, body: Body): OrbitInfo {
   const energy = v2 / 2 - mu / rl;
   const eVec = new Vector3().crossVectors(v, h).divideScalar(mu).sub(r.clone().divideScalar(rl));
   let e = eVec.length();
+  // 几乎竖直上下（角动量≈0，如静止在不自转天体的地面上）时 e 会算成 ≥1，但能量为负仍是束缚轨道
+  if (energy < 0 && e >= 1) e = 1 - 1e-12;
   const hyperbolic = energy >= 0 && e >= 1 - 1e-9;
   let a = -mu / (2 * energy);
   if (!isFinite(a)) a = Infinity;
   const p = (hl * hl) / mu;
   const pe = p / (1 + e);
-  const ap = e < 1 ? p / (1 - e) : Infinity;
+  // 束缚轨道用 ap = 2a - pe（e→1 时比 p/(1-e) 稳定）
+  const ap = e < 1 ? 2 * a - pe : Infinity;
   const inc = hl > 0 ? Math.acos(Math.max(-1, Math.min(1, h.y / hl))) : 0;
 
   let nu: number;

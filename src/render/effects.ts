@@ -394,8 +394,14 @@ class ParticlePool {
 }
 
 export class Particles {
-  smoke = new ParticlePool(2600, false);
-  fire = new ParticlePool(1400, true);
+  smoke: ParticlePool;
+  fire: ParticlePool;
+
+  /** 粒子上限随画质变化：烟雾是大面积半透明精灵，重叠绘制对显卡负担很大 */
+  constructor(quality: 'low' | 'medium' | 'high' = 'high') {
+    this.smoke = new ParticlePool(quality === 'high' ? 2600 : quality === 'medium' ? 1800 : 1000, false);
+    this.fire = new ParticlePool(quality === 'high' ? 1400 : quality === 'medium' ? 1000 : 700, true);
+  }
 
   addTo(scene: THREE.Scene): void {
     scene.add(this.smoke.mesh, this.fire.mesh);

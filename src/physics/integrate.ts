@@ -1,5 +1,5 @@
 import { Vector3 } from 'three';
-import { EARTH, MOON, gravityAccel, moonPosition } from './bodies';
+import { BODIES, EARTH, bodyPosition, gravityAccel } from './bodies';
 
 const _k1v = new Vector3();
 const _k2v = new Vector3();
@@ -34,12 +34,15 @@ export function rk4Step(r: Vector3, v: Vector3, t: number, h: number): void {
   v.addScaledVector(_k1v, h / 6).addScaledVector(_k2v, h / 3).addScaledVector(_k3v, h / 3).addScaledVector(_k4v, h / 6);
 }
 
-/** 自适应步长：取各天体的动力学时间尺度 sqrt(r³/μ) 的 eta 倍。 */
+/** 自适应步长：取各天体的动力学时间尺度 sqrt(r³/μ) 的 eta 倍（最近的天体起决定作用）。 */
 export function adaptiveStep(r: Vector3, t: number, eta: number): number {
   const rE = r.length();
-  const tE = Math.sqrt((rE * rE * rE) / EARTH.mu);
-  moonPosition(t, _mp);
-  const rM = r.distanceTo(_mp);
-  const tM = Math.sqrt((rM * rM * rM) / MOON.mu);
-  return eta * Math.min(tE, tM);
+  let tMin = Math.sqrt((rE * rE * rE) / EARTH.mu);
+  for (const b of BODIES) {
+    if (b === EARTH) continue;
+    const d = r.distanceTo(bodyPosition(b, t, _mp));
+    const tb = Math.sqrt((d * d * d) / b.mu);
+    if (tb < tMin) tMin = tb;
+  }
+  return eta * tMin;
 }

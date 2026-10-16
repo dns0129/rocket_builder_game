@@ -1,8 +1,8 @@
 import { Vector3 } from 'three';
-import { EARTH, MOON, MOON_ORBIT, type Body, bodyPosition, bodyVelocity, dominantBody, moonPosition, moonVelocity } from '../physics/bodies';
+import { EARTH, HELIO, MOON, MOON_ORBIT, SUN, type Body, bodyPosition, bodyVelocity, dominantBody, helioPosition, helioVelocity, moonPosition, moonVelocity } from '../physics/bodies';
 import { adaptiveStep, rk4Step } from '../physics/integrate';
-import { computeOrbit, visViva } from '../physics/orbit';
-import { predict, type NodeSpec } from './predictor';
+import { computeOrbit, keplerPropagate, visViva } from '../physics/orbit';
+import { predict, virtualPeAlt, type NodeSpec, type PredEvent, type Prediction } from './predictor';
 
 export interface StateVec {
   r: Vector3;
@@ -30,13 +30,13 @@ export function solveCircularize(s: StateVec, where: 'ap' | 'pe'): SolveResult {
     if (o.hyperbolic || !isFinite(o.ap)) return { node: null, msg: '当前为逃逸轨道，没有远拱点。' };
     const vAt = visViva(body.mu, o.ap, o.a);
     const vc = Math.sqrt(body.mu / o.ap);
-    return { node: { t: s.t + o.timeToAp, dv: new Vector3(vc - vAt, 0, 0) }, msg: `在远${body.id === 'moon' ? '月' : '地'}点圆化` };
+    return { node: { t: s.t + o.timeToAp, dv: new Vector3(vc - vAt, 0, 0) }, msg: `在远${body.apsisChar}点圆化` };
   }
   if (o.timeToPe < 0) return { node: null, msg: '已经飞过近拱点。' };
   if (o.peAlt < 0) return { node: null, msg: '近拱点在地表以下。' };
   const vAt = o.hyperbolic ? Math.sqrt(body.mu * (2 / o.pe - 1 / o.a)) : visViva(body.mu, o.pe, o.a);
   const vc = Math.sqrt(body.mu / o.pe);
-  return { node: { t: s.t + o.timeToPe, dv: new Vector3(vc - vAt, 0, 0) }, msg: `在近${body.id === 'moon' ? '月' : '地'}点圆化` };
+  return { node: { t: s.t + o.timeToPe, dv: new Vector3(vc - vAt, 0, 0) }, msg: `在近${body.apsisChar}点圆化` };
 }
 
 /** 调整另一侧拱点高度：在远拱点调整近拱点，或在近拱点调整远拱点。 */
@@ -309,87 +309,156 @@ export function solveReturn(s: StateVec, targetAlt = 35_000): SolveResult {
     }
   }
 
-  // ---- 3. 三体精修：点火时刻、顺行 Δv、法向 Δv
-  const cost = (dtb: number, dv: number, dn: number) => {
-    const p = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(dv, dn, 0) }], { maxSteps: 2000, eta: 0.03, maxTime: lead + dtb + (5 * 86400) / 3.16 });
-    if (p.impact && p.impact.body.id === 'moon') return 5e7;
-    let c: number;
-    if (p.earthPeAfterMoon) {
-      c = Math.abs(p.earthPeAfterMoon.alt - targetAlt);
-    } else {
-      // 尚未到达近地点（或直接撞地）：用飞出月球影响球时的二体近地点作为连续代价
-      const ex = p.events.find((e) => e.type === 'soiExit' && e.afterNode && e.vel);
-      if (!ex || !ex.vel) return 4e7 + Math.abs(dv - dvEst) * 1e4;
-      c = Math.abs(computeOrbit(ex.pos, ex.vel, EARTH).pe - rpE);
-    }
-    return c + Math.abs(dn) * 30;
+  // ---- 3. 三体精修
+  // 能命中再入走廊的（点火时刻, Δv）有一整族：点火早一点或晚一点，多烧一点也能把近地点压到目标高度。
+  // 对每个点火时刻，用割线法求出使近地点正好在目标高度的顺行 Δv；再在点火时刻上找 Δv 最小的那个。
+  // （直接在二维里做模式搜索容易卡在一条斜着的窄谷里，多花几十 m/s。）
+  // 返回地球约需 1.6 天：预测到第一个地球近地点为止，最长约 4.6 天（太短的话有些几何下还没到近地点就截止了）
+  const untilEarthPe = (e: PredEvent) => e.type === 'pe' && e.afterNode && e.body.id === 'earth';
+  const horizon = 4e5;
+  /** 近地点高度与目标之差（m）；撞月等无效方案返回 null */
+  const peErr = (dtb: number, dv: number, dn: number): number | null => {
+    const p = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(dv, dn, 0) }], { maxSteps: 3000, eta: 0.03, maxTime: lead + dtb + horizon, until: untilEarthPe });
+    if (p.impact && p.impact.body.id === 'moon') return null;
+    if (p.earthPeAfterMoon) return p.earthPeAfterMoon.alt - targetAlt;
+    // 还没到近地点就撞上了：用撞击时刻的二体近地点（已包含途中所有摄动）衡量差多少
+    if (p.impact && p.impact.body.id === 'earth' && p.impact.afterNode) return virtualPeAlt(p.impact) - targetAlt;
+    // 预测截止前还没到近地点：用飞出月球影响球时的二体近地点近似
+    const ex = p.events.find((e) => e.type === 'soiExit' && e.afterNode && e.vel);
+    return ex && ex.vel ? computeOrbit(ex.pos, ex.vel, EARTH).pe - rpE : null;
   };
+  /** 给定点火时刻（与法向分量），求命中目标近地点的顺行 Δv */
+  const solveDv = (dtb: number, dn: number, dv0: number): { dv: number; err: number } | null => {
+    let a = dv0;
+    let fa = peErr(dtb, a, dn);
+    if (fa === null) return null;
+    // 顺行 Δv 越大，相对地球越“停得住”，近地点越低
+    let b = dv0 + (fa > 0 ? 6 : -6);
+    let fb = peErr(dtb, b, dn);
+    if (fb === null) return null;
+    for (let i = 0; i < 14 && Math.abs(fb) > 30; i++) {
+      const slope = (fb - fa) / (b - a);
+      if (!isFinite(slope) || slope === 0) break;
+      const c = Math.max(b - 60, Math.min(b + 60, b - fb / slope));
+      a = b;
+      fa = fb;
+      b = c;
+      const fc = peErr(dtb, b, dn);
+      if (fc === null) return null;
+      fb = fc;
+    }
+    return { dv: b, err: Math.abs(fb) };
+  };
+  // 窗口就在眼前时没有向前调整的余地：改用下一圈的同一位置
+  if (lead < T / 4 + 30) lead += T;
   let bT = 0;
   let bDv = dvEst;
   let bN = 0;
-  let best = Infinity;
-  for (const dT of [-T / 8, -T / 16, 0, T / 16, T / 8]) {
-    if (lead + dT < 20) continue;
-    for (const dD of [-30, 0, 30, 80]) {
-      for (const dN of [-60, 0, 60]) {
-        const c = cost(dT, dvEst + dD, dN);
-        if (c < best) {
-          best = c;
-          bT = dT;
-          bDv = dvEst + dD;
-          bN = dN;
-        }
-      }
+  let bErr = Infinity;
+  const consider = (dtb: number, r: { dv: number; err: number } | null) => {
+    if (!r) return Infinity;
+    // 先保证命中，再比 Δv
+    const score = Math.abs(r.dv) + Math.max(0, r.err - 2_000) * 0.05;
+    const bScore = Math.abs(bDv) + Math.max(0, bErr - 2_000) * 0.05;
+    if (score < bScore || !isFinite(bErr)) {
+      bT = dtb;
+      bDv = r.dv;
+      bErr = r.err;
+    }
+    return score;
+  };
+  const span = T / 24;
+  for (let k = -6; k <= 6; k++) consider(k * span, solveDv(k * span, 0, dvEst));
+  // 黄金分割细化点火时刻
+  let lo = bT - span;
+  let hi = bT + span;
+  const gr = (Math.sqrt(5) - 1) / 2;
+  const evalAt = (x: number) => {
+    const r = solveDv(x, 0, bDv);
+    const sc = consider(x, r);
+    return sc;
+  };
+  let x1 = hi - gr * (hi - lo);
+  let x2 = lo + gr * (hi - lo);
+  let f1 = evalAt(x1);
+  let f2 = evalAt(x2);
+  for (let i = 0; i < 9; i++) {
+    if (f1 < f2) {
+      hi = x2;
+      x2 = x1;
+      f2 = f1;
+      x1 = hi - gr * (hi - lo);
+      f1 = evalAt(x1);
+    } else {
+      lo = x1;
+      x1 = x2;
+      f1 = f2;
+      x2 = lo + gr * (hi - lo);
+      f2 = evalAt(x2);
     }
   }
-  let sT = T / 32;
-  let sDv = 16;
-  let sN = 24;
-  for (let iter = 0; iter < 9; iter++) {
-    let improved = true;
-    let guard = 0;
-    while (improved && guard++ < 30) {
-      improved = false;
-      for (const [dT, dD, dN] of [
-        [sT, 0, 0],
-        [-sT, 0, 0],
-        [0, sDv, 0],
-        [0, -sDv, 0],
-        [sT, sDv, 0],
-        [-sT, -sDv, 0],
-        [sT, -sDv, 0],
-        [-sT, sDv, 0],
-        [0, 0, sN],
-        [0, 0, -sN],
-      ]) {
-        const nt = bT + dT;
-        if (lead + nt < 20) continue;
-        const c = cost(nt, bDv + dD, bN + dN);
-        if (c < best) {
-          best = c;
-          bT = nt;
-          bDv += dD;
-          bN += dN;
-          improved = true;
-        }
-      }
-    }
-    sT /= 2.5;
-    sDv /= 2.5;
-    sN /= 2.5;
+  // 收尾：在最终点火时刻把近地点再对准一些
+  const fin = solveDv(bT, bN, bDv);
+  if (fin && fin.err < bErr) {
+    bDv = fin.dv;
+    bErr = fin.err;
   }
   const nodeT = t + lead + bT;
-  const miss = best - Math.abs(bN) * 30;
   const dvTot = Math.hypot(bDv, bN);
-  const ok = miss < 30_000 && dvTot < dvEst + 300;
   const wait = nodeT - s.t;
   const waitTxt = wait > 1.5 * T ? `，返回窗口在 ${fmtWait(wait)} 后（可用时间加速）` : '';
+  // 用更精细的积分核对结果，报告实际预计的再入近地点（而不是目标值）
+  const check = predict(r1, v1, t, [{ t: nodeT, dv: new Vector3(bDv, bN, 0) }], { maxSteps: 12000, eta: 0.01, maxTime: lead + bT + horizon, until: untilEarthPe });
+  const peEv = check.earthPeAfterMoon ? check.earthPeAfterMoon.alt : check.impact && check.impact.body.id === 'earth' ? virtualPeAlt(check.impact) : null;
+  const ok = peEv !== null && Math.abs(peEv - targetAlt) < 15_000 && dvTot < dvEst + 300;
   return {
     node: { t: nodeT, dv: new Vector3(bDv, bN, 0) },
     msg: ok
-      ? `返回地球：Δv ${dvTot.toFixed(0)} m/s，再入近地点约 ${(targetAlt / 1000).toFixed(0)} km${waitTxt}`
-      : `未找到理想返回轨道，已给出近似方案，请手动微调${waitTxt}。`,
+      ? `返回地球：Δv ${dvTot.toFixed(0)} m/s，预计再入近地点 ${(peEv! / 1000).toFixed(0)} km${waitTxt}`
+      : `未找到理想返回轨道，已给出近似方案（预计近地点 ${peEv === null ? '—' : `${(peEv / 1000).toFixed(0)} km`}），途中请用“修正再入角”${waitTxt}。`,
   };
+}
+
+/**
+ * 中途修正的“最小 Δv”解：找满足 miss(Δv) = 0 的最小 Δv（miss 为近拱点高度与目标的偏差，米）。
+ * 在当前解处用有限差分求梯度 g，线性化后满足 miss = 0 的最小范数解是 Δv = g·(g·Δv₀ − miss₀)/|g|²，
+ * 也就是沿着最能改变近拱点的方向，正好消掉偏差；迭代几次即收敛，偏差没有变小时往回收一半。
+ * 以前只用沿坐标轴的模式搜索：最省的方向与坐标轴不对齐时（倾斜、极地轨道上很常见）会停在很费燃料的解上，
+ * 例如从极地停泊轨道奔月后把近月点修正 18 km 要花 18.6 m/s，木星转移 25,000 km 的偏差要花 41 m/s。
+ * 返回 null 表示没有收敛（轨迹无效、函数不光滑），调用方退回到模式搜索。
+ */
+function minNormCorrection(miss: (dv: Vector3) => number, tol: number, h: number, f0: number, maxIter = 10): Vector3 | null {
+  let dv = new Vector3();
+  if (!isFinite(f0)) return null;
+  for (let it = 0; it < maxIter; it++) {
+    if (Math.abs(f0) <= tol) return dv;
+    const g = new Vector3();
+    for (let k = 0; k < 3; k++) {
+      const d = dv.clone();
+      d.setComponent(k, d.getComponent(k) + h);
+      const fk = miss(d);
+      if (!isFinite(fk)) return null;
+      g.setComponent(k, (fk - f0) / h);
+    }
+    const gg = g.lengthSq();
+    if (gg < 1e-12) return null;
+    let next = g.clone().multiplyScalar((g.dot(dv) - f0) / gg);
+    let fn = miss(next);
+    for (let tries = 0; (!isFinite(fn) || Math.abs(fn) >= Math.abs(f0)) && tries < 6; tries++) {
+      next = dv.clone().lerp(next, 0.5);
+      fn = miss(next);
+    }
+    if (!isFinite(fn) || Math.abs(fn) >= Math.abs(f0)) return null;
+    dv = next;
+    f0 = fn;
+  }
+  return Math.abs(f0) <= tol * 3 ? dv : null;
+}
+
+/** 修正结果：Δv 小到可以忽略时不给节点（accurate 表示本来就足够准确）。 */
+function correctionResult(tb: number, dv: Vector3, accurate: boolean, what: string): SolveResult {
+  if (dv.length() < 0.05) return { node: null, msg: accurate ? '轨道已经很准确，无需修正。' : '找不到有效的修正方案。' };
+  return { node: { t: tb, dv }, msg: `${what}：Δv ${dv.length().toFixed(1)} m/s` };
 }
 
 /**
@@ -398,20 +467,26 @@ export function solveReturn(s: StateVec, targetAlt = 35_000): SolveResult {
  */
 export function solveCorrection(s: StateVec, target: 'moon' | 'earth', targetAlt: number, delay = 120): SolveResult {
   const tb = s.t + delay;
+  const until = target === 'earth' ? (e: PredEvent) => e.type === 'pe' && e.afterNode && e.body.id === 'earth' : undefined;
+  /** 近拱点高度与目标的偏差（米，带符号）；轨迹无效（没有近地点、撞上月球）时为 NaN */
+  const miss = (dv: Vector3) => {
+    const p = predict(s.r, s.v, s.t, [{ t: tb, dv }], { maxSteps: 2500, eta: 0.03, maxTime: delay + 4e5, until });
+    if (target === 'moon') return p.moonMinDist - (MOON.radius + targetAlt);
+    if (p.impact && p.impact.body.id === 'moon') return NaN;
+    const pe = p.events.find((e) => e.afterNode && e.type === 'pe' && e.body.id === 'earth');
+    if (pe) return pe.alt - targetAlt;
+    // 直接撞击：近地点在地下多深（连续的，知道还差多少）
+    if (p.impact && p.impact.body.id === 'earth') return virtualPeAlt(p.impact) - targetAlt;
+    return NaN;
+  };
+  const base0 = miss(new Vector3());
+  const fast = minNormCorrection(miss, 200, 0.2, base0);
+  if (fast) return correctionResult(tb, fast, Math.abs(base0) < 5000, '中途修正');
+  // 牛顿迭代不收敛时（轨迹不光滑等）退回到沿坐标轴的模式搜索
   const cost = (dv: Vector3) => {
-    const p = predict(s.r, s.v, s.t, [{ t: tb, dv }], { maxSteps: 1800, eta: 0.03, maxTime: delay + 6 * 86400 / 3.16 });
-    let c: number;
-    if (target === 'moon') {
-      c = Math.abs(p.moonMinDist - (MOON.radius + targetAlt));
-      if (p.moonMinDist < MOON.radius) c += 2e6;
-    } else {
-      const pe = p.events.find((e) => e.afterNode && e.type === 'pe' && e.body.id === 'earth');
-      const imp = p.impact && p.impact.body.id === 'earth' ? p.impact : null;
-      if (pe) c = Math.abs(pe.alt - targetAlt);
-      else if (imp) c = targetAlt + 50_000; // 直接撞击：说明近地点过低
-      else c = 5e7;
-      if (p.impact && p.impact.body.id === 'moon') c += 5e7;
-    }
+    const m = miss(dv);
+    let c = isFinite(m) ? Math.abs(m) : 5e7;
+    if (target === 'moon' && m < -targetAlt) c += 2e6;
     return c + dv.length() * 20;
   };
   const dv = new Vector3();
@@ -452,4 +527,453 @@ export function burnTime(dv: number, mass: number, thrust: number, mdot: number)
   if (thrust <= 0 || mdot <= 0) return Infinity;
   const ve = thrust / mdot;
   return ((mass * ve) / thrust) * (1 - Math.exp(-Math.abs(dv) / ve));
+}
+
+/**
+ * 从点火到“Δv 加权中心”的时间：在这个时刻之前点火，有限推力烧完后的位置与瞬时机动完全一致。
+ * 质量越烧越轻、加速度越来越大，所以它比燃烧时间的一半略长（奔月时约晚 0.7 s，对应近千米的位置偏差）。
+ */
+export function burnLead(dv: number, mass: number, thrust: number, mdot: number): number {
+  if (thrust <= 0 || mdot <= 0) return Infinity;
+  const ve = thrust / mdot;
+  const L = Math.abs(dv) / ve;
+  if (L <= 0) return 0;
+  const U = -Math.expm1(-L);
+  return ((mass * ve) / thrust) * (1 - U / L);
+}
+
+// ================================================================ 行星际转移
+
+/** Stumpff 函数 C(z)、S(z)。 */
+function stumpffC(z: number): number {
+  if (z > 1e-6) return (1 - Math.cos(Math.sqrt(z))) / z;
+  if (z < -1e-6) return (Math.cosh(Math.sqrt(-z)) - 1) / -z;
+  return 1 / 2 - z / 24 + (z * z) / 720;
+}
+
+function stumpffS(z: number): number {
+  if (z > 1e-6) {
+    const s = Math.sqrt(z);
+    return (s - Math.sin(s)) / (s * s * s);
+  }
+  if (z < -1e-6) {
+    const s = Math.sqrt(-z);
+    return (Math.sinh(s) - s) / (s * s * s);
+  }
+  return 1 / 6 - z / 120 + (z * z) / 5040;
+}
+
+const Y_AXIS = new Vector3(0, 1, 0);
+
+/**
+ * 兰伯特问题（普适变量法，单圈、顺行）：已知两点位置与飞行时间，求两端速度。
+ * 顺行指角动量与 hRef 同向（默认 +Y，即与行星公转方向一致）。
+ */
+export function lambert(r1: Vector3, r2: Vector3, tof: number, mu: number, hRef: Vector3 = Y_AXIS): { v1: Vector3; v2: Vector3 } | null {
+  if (!(tof > 0)) return null;
+  const r1n = r1.length();
+  const r2n = r2.length();
+  const cosD = Math.max(-1, Math.min(1, r1.dot(r2) / (r1n * r2n)));
+  let dth = Math.acos(cosD);
+  if (new Vector3().crossVectors(r1, r2).dot(hRef) < 0) dth = 2 * Math.PI - dth;
+  const A = Math.sin(dth) * Math.sqrt((r1n * r2n) / (1 - cosD));
+  if (!isFinite(A) || Math.abs(A) < 1e-9) return null;
+  const y = (z: number) => r1n + r2n + (A * (z * stumpffS(z) - 1)) / Math.sqrt(stumpffC(z));
+  const F = (z: number) => {
+    const yz = y(z);
+    if (yz < 0) return -Infinity;
+    return Math.pow(yz / stumpffC(z), 1.5) * stumpffS(z) + A * Math.sqrt(yz) - Math.sqrt(mu) * tof;
+  };
+  // F(z) 随 z 单调递增：先找到 y>0 的下界，再二分
+  let lo = -4 * Math.PI * Math.PI;
+  // 飞行时间很短的双曲线弧（例如逃逸点火）需要更小的 z
+  for (let k = 0; k < 40 && y(lo) >= 0 && F(lo) > 0 && lo > -1e5; k++) lo *= 2;
+  if (y(lo) < 0) {
+    // y(0) ≥ 0（转移角小于 180°），在 [lo, 0] 内二分出 y = 0 的边界
+    let a = lo;
+    let b = 0;
+    if (y(b) < 0) return null;
+    for (let i = 0; i < 60; i++) {
+      const m = (a + b) / 2;
+      if (y(m) < 0) a = m;
+      else b = m;
+    }
+    lo = b;
+  }
+  let hi = 4 * Math.PI * Math.PI - 1e-6;
+  if (!(F(lo) < 0) || !(F(hi) > 0)) return null;
+  for (let i = 0; i < 90; i++) {
+    const mid = (lo + hi) / 2;
+    if (F(mid) > 0) hi = mid;
+    else lo = mid;
+  }
+  const z = (lo + hi) / 2;
+  const yz = y(z);
+  const f = 1 - yz / r1n;
+  const g = A * Math.sqrt(yz / mu);
+  const gd = 1 - yz / r2n;
+  const v1 = r2.clone().addScaledVector(r1, -f).divideScalar(g);
+  const v2 = r2.clone().multiplyScalar(gd).sub(r1).divideScalar(g);
+  return { v1, v2 };
+}
+
+/** 各天体的目标近拱点高度（捕获 / 飞掠时希望掠过的高度）。 */
+export function arrivalAltitude(body: Body): number {
+  if (body.id === 'earth') return 35_000; // 再入走廊
+  if (body.atmosphere) return body.atmosphere.height + (body.kind === 'gas' ? 700_000 : 50_000);
+  return 50_000;
+}
+
+/**
+ * 从停泊轨道逃逸、得到给定双曲线剩余速度 vInf（相对出发天体）所需的 Δv，以及点火点方向。
+ * 停泊轨道平面不包含 vInf 时，点火点取在使逃逸双曲线平面与停泊轨道平面夹角最小的位置。
+ */
+function ejectionGeometry(vInf: Vector3, r0: number, vCirc: number, hHat: Vector3, mu: number) {
+  const vi = vInf.length();
+  const vHat = vInf.clone().divideScalar(vi);
+  const e = 1 + (r0 * vi * vi) / mu;
+  const nuInf = Math.acos(-1 / e);
+  const sinDelta = Math.max(-1, Math.min(1, vHat.dot(hHat)));
+  const phi = Math.asin(Math.min(1, Math.abs(sinDelta) / Math.sin(nuInf)));
+  const vp = Math.sqrt(vi * vi + (2 * mu) / r0);
+  const dv = Math.sqrt(vp * vp + vCirc * vCirc - 2 * vp * vCirc * Math.cos(phi));
+  return { dv, nuInf, vp, vHat };
+}
+
+/** 停泊轨道上的点火方向 r̂：与 vInf 方向夹角为 nuInf，且沿轨道顺行方向转过去。 */
+function ejectionPoint(vHat: Vector3, nuInf: number, pHat: Vector3, hHat: Vector3): Vector3 {
+  const qHat = new Vector3().crossVectors(hHat, pHat);
+  const a = pHat.dot(vHat);
+  const b = qHat.dot(vHat);
+  const c = Math.cos(nuInf);
+  const rr = Math.hypot(a, b);
+  const base = Math.atan2(b, a);
+  const cands: Vector3[] = [];
+  if (rr > 1e-9 && Math.abs(c / rr) <= 1) {
+    const d = Math.acos(c / rr);
+    for (const th of [base + d, base - d]) cands.push(pHat.clone().multiplyScalar(Math.cos(th)).addScaledVector(qHat, Math.sin(th)));
+  } else {
+    // vInf 几乎垂直于轨道面：取离它最远的点
+    cands.push(pHat.clone().multiplyScalar(-Math.cos(base)).addScaledVector(qHat, -Math.sin(base)));
+  }
+  // 运动方向为顺行：r̂ × v̂ 与轨道角动量同向
+  cands.sort((x, y) => new Vector3().crossVectors(y, vHat).dot(hHat) - new Vector3().crossVectors(x, vHat).dot(hHat));
+  return cands[0];
+}
+
+export interface TransferPlan extends SolveResult {
+  /** 离窗口还远时只给出近似节点，到窗口前一天左右需要重新精确计算 */
+  replanAt: number | null;
+  target: Body | null;
+}
+
+/**
+ * 行星际转移（从当前环绕的行星出发，飞往另一颗行星；回地球时瞄准再入走廊）。
+ * 1. 在未来一个会合周期内做“猪排图”搜索：对出发时刻 × 飞行时间求解兰伯特问题，
+ *    取 逃逸 Δv + 抵达时的捕获 Δv（加权）最小的方案；停泊轨道与黄道面不共面时计入转向代价。
+ * 2. 根据逃逸双曲线的几何算出停泊轨道上的点火点与点火时刻、Δv 的顺行 / 法向分量。
+ * 3. 窗口在两天以内时，用完整的多体积分精修点火时刻与 Δv，使目标行星的近拱点高度符合要求；
+ *    窗口还远时先给出近似节点，飞到窗口前一天左右会自动重新精确计算。
+ *
+ * near：重新精确计算时传入原定的点火时刻，只在它附近几天内找出发时刻，精修同一个窗口。
+ * 否则停泊轨道与转移方向不共面时（例如向正北发射的极地轨道），转向代价随出发日期缓慢变化，
+ * 代价最低的方案总落在搜索范围的末端：每次重算都跳到一个会合周期之后的下一个窗口，永远等不到点火。
+ */
+export function solveTransfer(s: StateVec, target: Body, near: number | null = null): TransferPlan {
+  const from = dominantBody(s.r, s.t);
+  const fail = (msg: string): TransferPlan => ({ node: null, msg, replanAt: null, target: null });
+  if (!HELIO[from.id]) return fail(from.id === 'moon' ? '请先回到地球轨道再出发。' : '需要先进入某颗行星的环绕轨道。');
+  if (from === target) return fail(`已经在${target.name}的影响球内。`);
+  if (!HELIO[target.id]) return fail('只能飞往行星。');
+  const { r, v } = relState(s, from);
+  const o = computeOrbit(r, v, from);
+  const safe = (from.atmosphere?.height ?? 0) + 5_000;
+  if (o.hyperbolic || o.peAlt < safe) return fail(`请先进入稳定的${from.name}轨道（近${from.apsisChar}点高于 ${(safe / 1000).toFixed(0)} km）。`);
+  if (o.ap > from.soi * 0.3) return fail('轨道已经很高，请先回到低轨道。');
+  const A = HELIO[from.id]!;
+  const B = HELIO[target.id]!;
+  const hHat = o.h.clone().normalize();
+  const r0 = r.length();
+  const vCirc = Math.sqrt(from.mu / r0);
+  const aT = (A.a + B.a) / 2;
+  const tHoh = Math.PI * Math.sqrt((aT * aT * aT) / SUN.mu);
+  const synodic = (2 * Math.PI) / Math.abs(A.n - B.n);
+  const searchSpan = Math.min(synodic * 1.05, 4e7);
+  const rp = target.radius + arrivalAltitude(target);
+  const capW = target.id === 'earth' ? 0.1 : target.kind === 'gas' ? 0.15 : 0.5;
+
+  // ---- 1. 猪排图搜索
+  const rD = new Vector3();
+  const vD = new Vector3();
+  const rA = new Vector3();
+  const vA = new Vector3();
+  const tMin = s.t + 2 * o.period;
+  const evalPlan = (td: number, tof: number) => {
+    helioPosition(from, td, rD);
+    helioVelocity(from, td, vD);
+    helioPosition(target, td + tof, rA);
+    helioVelocity(target, td + tof, vA);
+    const L = lambert(rD, rA, tof, SUN.mu);
+    if (!L) return null;
+    const vInf = L.v1.clone().sub(vD);
+    const vArr = L.v2.clone().sub(vA).length();
+    const ej = ejectionGeometry(vInf, r0, vCirc, hHat, from.mu);
+    const cap = Math.sqrt(vArr * vArr + (2 * target.mu) / rp) - Math.sqrt(target.mu / rp);
+    // 等待越久代价略高：同样好的方案优先选近的窗口
+    const cost = ej.dv + capW * cap + ((td - s.t) / 86_400) * 0.4;
+    return { cost, vInf, ej, td, tof, dvTotal: ej.dv };
+  };
+  let best: ReturnType<typeof evalPlan> = null;
+  const nD = 240;
+  // 精修同一个窗口：出发（离开影响球）时刻在原定点火时刻之后，逃逸段一般不到两天
+  const NEAR_BEFORE = 2 * 86_400;
+  const NEAR_AFTER = 4 * 86_400;
+  const spanStart = near !== null ? Math.max(tMin, near - NEAR_BEFORE) : tMin;
+  const span = near !== null ? Math.max(0, near + NEAR_AFTER - spanStart) : searchSpan;
+  for (let i = 0; i <= nD; i++) {
+    const td = spanStart + (span * i) / nD;
+    for (let j = 0; j < 14; j++) {
+      const tof = tHoh * (0.55 + (0.95 * j) / 13);
+      const p = evalPlan(td, tof);
+      if (p && (!best || p.cost < best.cost)) best = p;
+    }
+  }
+  if (!best) return fail('找不到可行的转移轨道。');
+  // 局部细化
+  let stepD = Math.max(span, 1) / nD;
+  let stepT = (tHoh * 0.95) / 13;
+  for (let it = 0; it < 6; it++) {
+    for (const [dd, dt] of [
+      [stepD, 0],
+      [-stepD, 0],
+      [0, stepT],
+      [0, -stepT],
+    ]) {
+      const td = best.td + dd;
+      if (td < tMin) continue;
+      const p = evalPlan(td, best.tof + dt);
+      if (p && p.cost < best.cost) best = p;
+    }
+    stepD /= 2;
+    stepT /= 2;
+  }
+
+  // ---- 2. 点火点与点火时刻：双曲线从近拱点飞到影响球边界的时间
+  const vi = best.vInf.length();
+  const eH = 1 + (r0 * vi * vi) / from.mu;
+  const aH = from.mu / (vi * vi);
+  const cosF = (aH + from.soi) / (aH * eH);
+  const Fh = Math.acosh(Math.max(1, cosF));
+  const tSoi = Math.sqrt((aH * aH * aH) / from.mu) * (eH * Math.sinh(Fh) - Fh);
+  const pHat = r.clone().normalize();
+  const rHat = ejectionPoint(best.ej.vHat, best.ej.nuInf, pHat, hHat);
+  // 沿停泊轨道（二体开普勒外推）找到最接近理想点火时刻、且位于点火点的那一圈
+  const tIdeal = Math.max(s.t + 60, best.td - tSoi);
+  const kr = r.clone();
+  const kv = v.clone();
+  const t0 = Math.max(s.t, tIdeal - o.period);
+  if (!keplerPropagate(kr, kv, from.mu, t0 - s.t)) return fail('停泊轨道计算失败。');
+  let bestDot = -2;
+  let tb = t0;
+  const nS = 720;
+  const pr = new Vector3();
+  const pv = new Vector3();
+  for (let k = 0; k <= nS * 2; k++) {
+    const dt = (o.period * 2 * k) / (nS * 2);
+    pr.copy(kr);
+    pv.copy(kv);
+    keplerPropagate(pr, pv, from.mu, dt);
+    const d = pr.clone().normalize().dot(rHat) - Math.abs(t0 + dt - tIdeal) / (o.period * 50);
+    if (d > bestDot) {
+      bestDot = d;
+      tb = t0 + dt;
+    }
+  }
+  // 点火时刻的状态与 Δv 分量
+  pr.copy(kr);
+  pv.copy(kv);
+  keplerPropagate(pr, pv, from.mu, tb - t0);
+  const rb = pr.length();
+  const vpB = Math.sqrt(vi * vi + (2 * from.mu) / rb);
+  const rbHat = pr.clone().normalize();
+  const hHyp = new Vector3().crossVectors(rbHat, best.ej.vHat).normalize();
+  if (hHyp.dot(hHat) < 0) hHyp.negate();
+  const vBurn = new Vector3().crossVectors(hHyp, rbHat).multiplyScalar(vpB);
+  const dvW = vBurn.sub(pv);
+  const pro = pv.clone().normalize();
+  const nor = new Vector3().crossVectors(pr, pv).normalize();
+  const rad = new Vector3().crossVectors(nor, pro);
+  let dvP = dvW.dot(pro);
+  let dvN = dvW.dot(nor);
+  let dvR = dvW.dot(rad);
+  const days = best.tof / 86_400;
+  const waitTxt = tb - s.t > 1.5 * o.period ? `，窗口在 ${fmtWait(tb - s.t)} 后` : '';
+  const head = `前往${target.name}：Δv ${Math.hypot(dvP, dvN, dvR).toFixed(0)} m/s，飞行约 ${days.toFixed(0)} 天`;
+
+  // 窗口还远：先给出近似节点，飞到窗口前一天左右再精修（重新精确计算时不再推迟）
+  const REPLAN_LEAD = 1.2 * 86_400;
+  if (near === null && tb - s.t > 2.2 * 86_400) {
+    return {
+      node: { t: tb, dv: new Vector3(dvP, dvN, dvR) },
+      msg: `${head}${waitTxt}。先用“⏩ 加速到节点前”，到窗口前会自动精确计算`,
+      replanAt: tb - REPLAN_LEAD,
+      target,
+    };
+  }
+
+  // ---- 3. 多体积分精修
+  const lead = Math.min(tb - s.t - 1, 0.35 * o.period);
+  const t1 = tb - lead;
+  const r1 = s.r.clone();
+  const v1 = s.v.clone();
+  let t = s.t;
+  for (let guard = 0; t < t1 - 1e-6 && guard < 3_000_000; guard++) {
+    const h = Math.min(t1 - t, adaptiveStep(r1, t, 0.01));
+    rk4Step(r1, v1, t, h);
+    t += h;
+  }
+  const maxTime = lead + best.tof * 1.5 + 30 * 86_400;
+  // 先在点火时刻不变的情况下，用最小改动的牛顿迭代让近拱点正好落在目标高度（与中途修正相同的做法）：
+  // 停泊轨道倾斜时近似方案偏差可达上百万公里，沿坐标轴的模式搜索常常收敛不了
+  const x0 = new Vector3(dvP, dvN, dvR);
+  const missAt = (d: Vector3) => {
+    const pred = predict(r1, v1, t, [{ t: t + lead, dv: x0.clone().add(d) }], { maxSteps: 3500, eta: 0.03, maxTime });
+    const md = pred.minDist[target.id];
+    if (!md || (pred.impact && pred.impact.body !== target && pred.impact.afterNode)) return NaN;
+    return md.dist - rp;
+  };
+  const fix = minNormCorrection(missAt, Math.max(2_000, arrivalAltitude(target) * 0.05), 0.01, missAt(new Vector3()), 14);
+  if (fix) {
+    dvP += fix.x;
+    dvN += fix.y;
+    dvR += fix.z;
+  }
+  const cost = (dtb: number, p: number, n: number, rr: number) => {
+    const pred = predict(r1, v1, t, [{ t: t + lead + dtb, dv: new Vector3(p, n, rr) }], { maxSteps: 3500, eta: 0.03, maxTime });
+    const md = pred.minDist[target.id];
+    let c = md ? Math.abs(md.dist - rp) : 1e12;
+    if (pred.impact && pred.impact.body !== target && pred.impact.afterNode) c += 1e10;
+    return c / 1000 + Math.hypot(p - dvP, n - dvN, rr - dvR) * 2;
+  };
+  let bT = 0;
+  let best3 = cost(bT, dvP, dvN, dvR);
+  const base = { p: dvP, n: dvN, r: dvR };
+  // 牛顿迭代成功时只用很小的步长微调；失败时退回到原来的大范围模式搜索
+  let sT = fix ? o.period / 2000 : o.period / 40;
+  let sV = fix ? 0.05 : 10;
+  for (let iter = 0; iter < (fix ? 3 : 9); iter++) {
+    let improved = true;
+    let guard = 0;
+    while (improved && guard++ < 25) {
+      improved = false;
+      for (const [dT, dp, dn, dr] of [
+        [sT, 0, 0, 0],
+        [-sT, 0, 0, 0],
+        [0, sV, 0, 0],
+        [0, -sV, 0, 0],
+        [0, 0, sV, 0],
+        [0, 0, -sV, 0],
+        [0, 0, 0, sV],
+        [0, 0, 0, -sV],
+      ]) {
+        const nt = bT + dT;
+        if (lead + nt < 20) continue;
+        const c = cost(nt, dvP + dp, dvN + dn, dvR + dr);
+        if (c < best3) {
+          best3 = c;
+          bT = nt;
+          dvP += dp;
+          dvN += dn;
+          dvR += dr;
+          improved = true;
+        }
+      }
+    }
+    sT /= 2.2;
+    sV /= 2.2;
+  }
+  void base;
+  const check = predict(r1, v1, t, [{ t: t + lead + bT, dv: new Vector3(dvP, dvN, dvR) }], { maxSteps: 3500, eta: 0.03, maxTime });
+  const md = check.minDist[target.id];
+  const pe = md ? md.dist - target.radius : Infinity;
+  const hit = md && md.dist < target.soi;
+  return {
+    node: { t: t + lead + bT, dv: new Vector3(dvP, dvN, dvR) },
+    msg: hit
+      ? `前往${target.name}：Δv ${Math.hypot(dvP, dvN, dvR).toFixed(0)} m/s，飞行约 ${days.toFixed(0)} 天，预计近${target.apsisChar}点 ${(pe / 1000).toFixed(0)} km`
+      : `已给出前往${target.name}的近似方案（预计与${target.name}相距 ${md ? (md.dist / 1e6).toFixed(1) : '?'} 千公里），途中请用“中途修正”`,
+    replanAt: null,
+    target,
+  };
+}
+
+/**
+ * 行星捕获：在目标天体的近拱点减速。岩质行星圆化；气态巨行星只减速到远拱点约为影响球的 40%（便宜得多）。
+ */
+export function solveCaptureAt(s: StateVec, target: Body | null, prediction?: Prediction): SolveResult {
+  const pred = prediction ?? predict(s.r, s.v, s.t, [], { maxSteps: 3500, eta: 0.02, maxTime: 9e7 });
+  const ev = pred.events.find((e) => e.type === 'pe' && e.vel && !e.afterNode && e.t > s.t + 5 && e.body.id !== 'sun' && (!target || e.body === target));
+  if (!ev || !ev.vel) return { node: null, msg: '当前轨迹没有经过任何天体的近拱点。' };
+  const b = ev.body;
+  if (ev.alt < (b.atmosphere?.height ?? 3_000) * (b.kind === 'gas' ? 1 : 0.5)) return { node: null, msg: `近${b.apsisChar}点过低，将坠入${b.name}！请先做中途修正抬高近${b.apsisChar}点。` };
+  const rpp = ev.pos.length();
+  const vPe = ev.vel.length();
+  let vTarget = Math.sqrt(b.mu / rpp);
+  if (b.kind === 'gas') {
+    const ra = b.soi * 0.4;
+    vTarget = Math.sqrt(b.mu * (2 / rpp - 2 / (rpp + ra)));
+  }
+  if (vPe <= vTarget + 1) return { node: null, msg: `已经处在${b.name}的环绕轨道上。` };
+  const drag = b.atmosphere && ev.alt < b.atmosphere.height ? `（近${b.apsisChar}点在大气层内，轨道会逐渐衰减）` : '';
+  return { node: { t: ev.t, dv: new Vector3(vTarget - vPe, 0, 0) }, msg: `${b.name}捕获：在近${b.apsisChar}点减速 ${(vPe - vTarget).toFixed(0)} m/s${drag}` };
+}
+
+/** 行星际途中修正：使目标天体的近拱点高度为 targetAlt。 */
+export function solvePlanetCorrection(s: StateVec, target: Body, delay = 120): SolveResult {
+  const rp = target.radius + arrivalAltitude(target);
+  const tb = s.t + delay;
+  const probe = predict(s.r, s.v, s.t, [], { maxSteps: 3500, eta: 0.03, maxTime: 9e7 });
+  const arrive = probe.minDist[target.id]?.t ?? s.t + 9e7;
+  const maxTime = arrive - s.t + 20 * 86_400;
+  /** 与目标天体的最近距离减去目标近拱点半径（米）；撞上别的天体时为 NaN */
+  const miss = (dv: Vector3) => {
+    const p = predict(s.r, s.v, s.t, [{ t: tb, dv }], { maxSteps: 3500, eta: 0.03, maxTime });
+    const md = p.minDist[target.id];
+    if (!md || (p.impact && p.impact.body !== target)) return NaN;
+    return md.dist - rp;
+  };
+  const base0 = miss(new Vector3());
+  // 离目标越远，同样的 Δv 偏得越多：有限差分的步长按剩余航程取（几百天外 0.02 m/s 就能移动几百公里）
+  const h = Math.min(0.5, Math.max(0.02, (0.2 * 86_400 * 30) / Math.max(86_400, arrive - s.t)));
+  const fast = minNormCorrection(miss, 1000, h, base0);
+  if (fast) return correctionResult(tb, fast, Math.abs(base0) < 5_000_000, `中途修正（${target.name}）`);
+  const cost = (dv: Vector3) => {
+    const m = miss(dv);
+    return (isFinite(m) ? Math.abs(m) : 1e13) / 1000 + dv.length() * 0.2;
+  };
+  const dv = new Vector3();
+  let best = cost(dv);
+  const base = best;
+  let step = 20;
+  const dirs = [new Vector3(1, 0, 0), new Vector3(-1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, -1, 0), new Vector3(0, 0, 1), new Vector3(0, 0, -1)];
+  for (let iter = 0; iter < 10; iter++) {
+    let improved = true;
+    let guard = 0;
+    while (improved && guard++ < 25) {
+      improved = false;
+      for (const d of dirs) {
+        const cand = dv.clone().addScaledVector(d, step);
+        const c = cost(cand);
+        if (c < best) {
+          best = c;
+          dv.copy(cand);
+          improved = true;
+        }
+      }
+    }
+    step /= 2.2;
+  }
+  if (dv.length() < 0.05) return { node: null, msg: base < 5_000 ? '轨道已经很准确，无需修正。' : '找不到有效的修正方案。' };
+  return { node: { t: tb, dv }, msg: `中途修正（${target.name}）：Δv ${dv.length().toFixed(1)} m/s` };
+
 }
