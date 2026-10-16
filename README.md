@@ -45,7 +45,7 @@ npm run package
 
 注意事项：
 
-- **iPhone / iPad 无法运行离线包**：iOS 的“文件”App 只预览网页、不运行其中的脚本，Safari 也打不开本地文件。
+- **iPhone / iPad 无法运行离线包**：iOS 的“文件”App 只预览网页、不运行其中的脚本，Safari 也打不开本地文件。iPhone / iPad 请用 Safari 打开手机版的[在线版](https://dns0129.github.io/rocket_builder_game/)，“分享 → 添加到主屏幕”后同样可以离线玩。
 - 火箭设计、任务进度和录制的 Demo 保存在浏览器里，不在 `.html` 文件中；换浏览器或清除浏览器数据后看不到原来的存档。部分手机浏览器以本地文件方式打开时不允许保存，关掉页面后存档不会保留。
 - 实现：`scripts/build-offline.mjs` 用 `vite build --mode offline` 构建，构建时把 `new Worker(new URL(…, import.meta.url))` 换成内嵌的经典 Worker（`file://` 页面不能从 `blob:` 地址启动模块 Worker），把指向 `public/` 中贴图、演示录像的路径字符串换成 `data:` 地址，最后把脚本和样式内联进页面。源码中可用 `import.meta.env.MODE === 'offline'` 判断离线包（手机版据此不注册 Service Worker）。
 

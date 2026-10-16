@@ -170,12 +170,12 @@ describe('trajectory prediction', () => {
     sim.livePrediction = true;
     sim.refreshPrediction();
     const first = sim.prediction;
-    // 每帧 0.2 ms 的预算：要分好几帧才能算完
+    // 预算为 0：每帧只推进一片，要分好几帧才能算完（给 0.2 ms 时机器快了会一帧算完，测试时过时不过）
     let frames = 0;
     sim.predictionAge = 999;
     while (sim.prediction === first && frames < 500) {
       sim.update(1 / 60);
-      sim.pumpPrediction(0.2);
+      sim.pumpPrediction(0);
       frames++;
     }
     expect(sim.prediction).not.toBe(first);
