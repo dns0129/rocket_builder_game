@@ -6,6 +6,49 @@
 
 ## 快速开始
 
+### 电脑客户端：在独立窗口中运行（推荐）
+
+像普通软件一样安装：游戏在自己的窗口里运行（没有浏览器的地址栏和标签页），有桌面图标，不需要浏览器、Node.js，也不需要联网。
+
+**下载**：[GitHub Releases 最新版](https://github.com/dns0129/rocket_builder_game/releases/latest)（发布页上写着每个文件对应哪种设备）。
+
+| 系统 | 安装包 | 安装方法 |
+| --- | --- | --- |
+| Windows 10 / 11（64 位） | `RocketWorkshop-Setup-…-Windows-x64.exe`（约 115 MB） | 双击，按提示安装；装好后桌面和开始菜单里会有“火箭工坊” |
+| macOS 13 及以上，Apple 芯片（M1 / M2 / M3 / M4…） | `RocketWorkshop-…-macOS-AppleSilicon.zip` | 双击解压，把“火箭工坊.app”拖进“应用程序”文件夹 |
+| macOS 13 及以上，Intel 芯片 | `RocketWorkshop-…-macOS-Intel.zip` | 同上 |
+| Linux（64 位） | `RocketWorkshop-…-Linux-x86_64.AppImage` | `chmod +x` 后双击运行 |
+
+发布页由 GitHub Actions（`.github/workflows/desktop-app.yml`）在 Windows、macOS、Linux 上分别原生打包后自动更新：`main` 上的游戏或客户端有改动时自动运行，也可以在 Actions 页面手动运行。发布的版本号取自 `desktop/package.json`，版本号不变时用新构建替换同一个发布。单文件离线包（手机版 / 电脑浏览器版）也一起放在发布页上。
+
+- 安装包没有付费的代码签名，第一次运行时系统会提醒。**Windows**：“Windows 已保护你的电脑” → 点“更多信息” → “仍要运行”。**macOS**：提示无法验证开发者时点“完成”，打开 **系统设置 → 隐私与安全性**，在页面底部点 **“仍要打开”**。
+- 窗口默认最大化；**F11** 全屏，**F12** 开发者工具（报告问题时用）。飞行中关闭窗口会先确认。
+- 存档保存在 `%APPDATA%\RocketWorkshop`（Windows）、`~/Library/Application Support/RocketWorkshop`（macOS），卸载时保留；和浏览器版的存档不互通。
+
+生成方法：`npm install` 后运行 `npm run app`（当前系统）或 `npm run app -- --win --mac --linux`（三个平台），输出到 `release/app/`。跨平台打包需要的工具和实现细节见 [desktop/README.md](desktop/README.md)。
+
+### 离线下载包：不用安装任何东西
+
+电脑版和手机版各有一个**单文件离线包**：游戏程序、地形 Worker、地球与行星贴图、演示录像全部内嵌在一个 `.html` 里，双击就能在浏览器中玩，不需要 Node.js、本地服务器，也不需要联网；可以拷到 U 盘或直接发给别人。
+
+| 下载包 | 内容 | 大小 | 怎么打开 |
+| --- | --- | --- | --- |
+| `火箭工坊-电脑版.zip` | `火箭工坊.html` + `使用说明.txt` | 约 17 MB（网页约 24 MB，含 4K 行星贴图） | 解压后双击 `火箭工坊.html`，推荐 Chrome / Edge，Safari、Firefox 也可以 |
+| `火箭工坊-手机版.zip` | `火箭工坊-手机版.html` + `使用说明.txt` | 约 2.4 MB（网页约 4 MB） | 安卓：解压后点 `.html`，用 Chrome 打开（Edge、Firefox 也可以） |
+
+生成方法（输出到 `release/`，同时附带不压缩的 `.html`，方便直接传到手机上）：
+
+```bash
+npm install
+npm run package
+```
+
+注意事项：
+
+- **iPhone / iPad 无法运行离线包**：iOS 的“文件”App 只预览网页、不运行其中的脚本，Safari 也打不开本地文件。
+- 火箭设计、任务进度和录制的 Demo 保存在浏览器里，不在 `.html` 文件中；换浏览器或清除浏览器数据后看不到原来的存档。部分手机浏览器以本地文件方式打开时不允许保存，关掉页面后存档不会保留。
+- 实现：`scripts/build-offline.mjs` 用 `vite build --mode offline` 构建，构建时把 `new Worker(new URL(…, import.meta.url))` 换成内嵌的经典 Worker（`file://` 页面不能从 `blob:` 地址启动模块 Worker），把指向 `public/` 中贴图、演示录像的路径字符串换成 `data:` 地址，最后把脚本和样式内联进页面。源码中可用 `import.meta.env.MODE === 'offline'` 判断离线包（手机版据此不注册 Service Worker）。
+
 ### Windows：双击启动
 
 1. 下载项目：GitHub 页面上点 **Code → Download ZIP** 并解压（或 `git clone`）。
@@ -25,7 +68,7 @@
 
 > 如果双击后提示“没有适当的访问权限”（用第三方解压软件解压时可能丢失可执行权限）：打开“终端”，输入 `bash `（后面有一个空格），把 `Start Game.command` 拖进终端窗口，按回车即可。
 
-> 不能直接双击 `dist/index.html`：浏览器禁止以 `file://` 方式加载模块脚本、Web Worker 和贴图，必须通过本地服务器打开。推荐使用 Chrome、Edge 或 Safari。
+> 不能直接双击 `dist/index.html`：浏览器禁止以 `file://` 方式加载模块脚本、Web Worker 和贴图，必须通过本地服务器打开。推荐使用 Chrome、Edge 或 Safari。想要双击就能玩，请用上面的**离线下载包**（`npm run package`）。
 
 Linux（或习惯命令行）可以用 `npm install` 之后 `npm start`，效果相同。
 
@@ -64,7 +107,7 @@ npm run dev        # 手机与电脑连同一 Wi-Fi，用手机打开终端里�
 npm run build      # 输出到 mobile/dist/
 ```
 
-详见 [mobile/README.md](mobile/README.md)。
+手机版的单文件离线包和电脑版一起由仓库根目录的 `npm run package` 生成（见上面的“离线下载包”）。详见 [mobile/README.md](mobile/README.md)。
 
 ## 玩法流程
 
