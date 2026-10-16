@@ -1,0 +1,54 @@
+# 手机版自动部署到 GitHub Pages：https://dns0129.github.io/rocket_builder_game/
+# main 上的 mobile/ 有改动时自动构建并发布；也可以在 Actions 页面手动运行。
+# 第一次使用前需要在仓库 Settings → Pages → Build and deployment → Source 里选 “GitHub Actions”。
+name: 部署手机版
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只部署一次；正在进行的部署不取消，排队的旧部署会被新的替换
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npm test
+      # 含类型检查；base 为 './'，放在 /rocket_builder_game/ 子路径下也能用
+      - run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: mobile/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

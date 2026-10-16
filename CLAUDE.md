@@ -6,3 +6,4 @@
   2. 用 Artifact 工具先 `read` 这个链接，再 `list`（`scope: "files"`）列出已发布的文件。
   3. 发布：`url` 填上面的链接，`file_path` 填 `dist/artifact.html`，`files` 填第 1 步打印的映射；已发布、但这次映射里没有的 `assets/` 旧文件（文件名带哈希）传 `null` 删掉。
   4. 只改了文档、测试等、不影响构建产物时可以不发布，但要在回复里说明网页已是 `main` 的最新版本。
+- 手机版（`mobile/`）合并进 `main` 后由 GitHub Actions（`.github/workflows/pages.yml`）自动发布到 GitHub Pages：https://dns0129.github.io/rocket_builder_game/ ，不用手动发布；推送 `main` 后确认一下这次部署是否成功。
