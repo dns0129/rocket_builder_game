@@ -6,6 +6,8 @@
 
 ## 快速开始
 
+**在线玩，不用安装**：电脑打开 <https://dns0129.github.io/rocket_builder_game/desktop/>（推荐 Chrome / Edge），手机打开 <https://dns0129.github.io/rocket_builder_game/>（触屏版）。两个版本在同一个网站上，用同一个浏览器玩时火箭存档和任务进度互通。
+
 ### 电脑客户端：在独立窗口中运行（推荐）
 
 像普通软件一样安装：游戏在自己的窗口里运行（没有浏览器的地址栏和标签页），有桌面图标，不需要浏览器、Node.js，也不需要联网。
@@ -96,7 +98,7 @@ npm run demos      # 重新生成三份电脑演示 demo（public/demos/*.json�
 
 `mobile/` 目录是独立的手机版项目（触屏操作、横竖屏布局、动态分辨率、可添加到主屏幕离线游玩），玩法与物理和电脑版相同。
 
-**在线游玩**：<https://dns0129.github.io/rocket_builder_game/>（手机浏览器直接打开；iPhone 用 Safari 的“分享 → 添加到主屏幕”后全屏运行、可以离线玩）。`main` 上 `mobile/` 有改动时，GitHub Actions（`.github/workflows/pages.yml`）会自动测试、构建并发布到 GitHub Pages。
+**在线游玩**：<https://dns0129.github.io/rocket_builder_game/>（手机浏览器直接打开；iPhone 用 Safari 的“分享 → 添加到主屏幕”后全屏运行、可以离线玩）。电脑版在同一网站的 `desktop/` 下：<https://dns0129.github.io/rocket_builder_game/desktop/>。`main` 上的游戏（电脑版或手机版）有改动时，GitHub Actions（`.github/workflows/pages.yml`）会把两个版本一起测试、构建并发布到 GitHub Pages。
 
 > 注意：手机版是从较早的电脑版移植的（登月往返玩法），**暂不包含**之后加入的太阳系行星、三维 / 二维地图、方向轴、方向舵的航向轴、昼夜补光、Demo 回放等改动；闭环制导执行机动、返回地球规划的修正、实时刷新的预测轨迹和可以转满一圈的方向舵已同步到手机版。
 

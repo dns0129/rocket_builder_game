@@ -1,13 +1,23 @@
-# 手机版自动部署到 GitHub Pages：https://dns0129.github.io/rocket_builder_game/
-# main 上的 mobile/ 有改动时自动构建并发布；也可以在 Actions 页面手动运行。
+# 网页版自动部署到 GitHub Pages：
+#   手机版 https://dns0129.github.io/rocket_builder_game/
+#   电脑版 https://dns0129.github.io/rocket_builder_game/desktop/
+# main 上的游戏有改动时自动测试、构建并发布（两个版本一起发布）；也可以在 Actions 页面手动运行。
 # 第一次使用前需要在仓库 Settings → Pages → Build and deployment → Source 里选 “GitHub Actions”。
-name: 部署手机版
+name: 部署网页版
 
 on:
   push:
     branches: [main]
     paths:
       - 'mobile/**'
+      - 'src/**'
+      - 'public/**'
+      - 'tests/**'
+      - 'index.html'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -24,24 +34,37 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: mobile
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: mobile/package-lock.json
-      - run: npm ci
-      - run: npm test
-      # 含类型检查；base 为 './'，放在 /rocket_builder_game/ 子路径下也能用
-      - run: npm run build
+          cache-dependency-path: |
+            package-lock.json
+            mobile/package-lock.json
+      # build 含类型检查；两个版本的 base 都是 './'，放在任意子路径下都能用
+      - name: 电脑版：测试并构建
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: 手机版：测试并构建
+        working-directory: mobile
+        run: |
+          npm ci
+          npm test
+          npm run build
+      # 手机版在网站根目录（已经添加到主屏幕的地址不变），电脑版在 desktop/ 子目录
+      - name: 组合网站
+        run: |
+          mkdir site
+          cp -r mobile/dist/. site/
+          cp -r dist site/desktop
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: mobile/dist
+          path: site
 
   deploy:
     needs: build

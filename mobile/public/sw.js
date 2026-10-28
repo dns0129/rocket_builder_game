@@ -3,8 +3,10 @@
  * - 页面导航：网络优先（有新版本时立即生效），离线时用缓存；
  * - 带哈希的脚本 / 样式、地球与月球贴图、图标：缓存优先。
  * 更换贴图等非哈希资源时请修改 CACHE 的版本号。
+ * 同一网站的 desktop/ 子目录是电脑版（GitHub Pages 上两个版本放在一起），虽在作用域内，但不归这里管。
  */
-const CACHE = 'rocket-mobile-v2';
+const CACHE = 'rocket-mobile-v3';
+const DESKTOP = new URL('./desktop/', self.location.href).pathname;
 const CORE = [
   './',
   './manifest.webmanifest',
@@ -56,7 +58,7 @@ self.addEventListener('message', (event) => {
       for (const u of data.urls) {
         try {
           const url = new URL(u, self.location.href);
-          if (url.origin !== self.location.origin || url.pathname.endsWith('sw.js')) continue;
+          if (url.origin !== self.location.origin || url.pathname.endsWith('sw.js') || url.pathname.startsWith(DESKTOP)) continue;
           if (!(await cache.match(url))) await cache.add(url);
         } catch {
           /* 忽略单个失败 */
@@ -70,7 +72,7 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;
+  if (url.origin !== self.location.origin || url.pathname.startsWith(DESKTOP)) return;
   if (req.mode === 'navigate') {
     event.respondWith(
       (async () => {

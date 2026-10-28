@@ -20,7 +20,7 @@ npm test           # 物理与平衡测试（与电脑版相同）
 
 **部署**：`dist/` 是纯静态文件（`base: './'`，放在任意子路径下都能用）。正式发布请使用 **HTTPS**——屏幕常亮、离线缓存、“添加到主屏幕”都要求安全连接。
 
-**在线版（GitHub Pages）**：<https://dns0129.github.io/rocket_builder_game/>。仓库根目录的 `.github/workflows/pages.yml` 在 `main` 上 `mobile/` 有改动时自动运行 `npm ci`、`npm test`、`npm run build`，把 `dist/` 发布到 GitHub Pages；也可以在仓库的 Actions 页面选“部署手机版”手动运行。第一次使用前要在仓库 **Settings → Pages → Build and deployment → Source** 里选 **GitHub Actions**（只需设置一次）。
+**在线版（GitHub Pages）**：<https://dns0129.github.io/rocket_builder_game/>。仓库根目录的 `.github/workflows/pages.yml` 在 `main` 上的游戏有改动时，对手机版和电脑版分别运行 `npm ci`、`npm test`、`npm run build`，手机版的 `dist/` 放在网站根目录，电脑版放在 `desktop/` 子目录（<https://dns0129.github.io/rocket_builder_game/desktop/>），一起发布到 GitHub Pages；也可以在仓库的 Actions 页面选“部署网页版”手动运行。手机版的 Service Worker 作用域包含 `desktop/`，但不拦截、不缓存那里的请求。第一次使用前要在仓库 **Settings → Pages → Build and deployment → Source** 里选 **GitHub Actions**（只需设置一次）。
 
 需要支持 WebGL2 的手机浏览器：iOS / iPadOS 15+ 的 Safari，或安卓上较新的 Chrome / Edge / 三星浏览器。
 
