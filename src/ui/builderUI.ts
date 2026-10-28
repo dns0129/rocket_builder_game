@@ -28,9 +28,13 @@ export class BuilderUI {
   selected: number | null = null;
   tab: Tab = 'pod';
   scenario: Scenario = 'pad';
+  /** 无限燃料模式（由 App 保存设置；设置菜单中也能切换，切换后调用 setInfiniteFuel 同步） */
+  infiniteFuel = false;
   stats!: DesignStats;
   onLaunch: (d: RocketDesign, s: Scenario) => void = () => {};
+  onInfiniteFuel: (on: boolean) => void = () => {};
   onHelp: () => void = () => {};
+  onDemos: () => void = () => {};
   onSettings: () => void = () => {};
   private scene: BuilderScene;
   private left!: HTMLDivElement;
@@ -169,6 +173,7 @@ export class BuilderUI {
         },
         '💾 保存',
       ),
+      h('button', { onclick: () => this.onDemos(), title: '回放保存的飞行，或观看电脑飞往月球、火星、木星' }, '🎬 Demo 回放'),
       h('button', { onclick: () => this.onHelp() }, '❔ 操作说明'),
       h('button', { onclick: () => this.onSettings() }, '⚙ 设置'),
     );
@@ -412,6 +417,8 @@ export class BuilderUI {
     for (const e of s.errors) statBox.appendChild(h('div', { class: 'msg err' }, e));
     for (const e of s.warnings) statBox.appendChild(h('div', { class: 'msg warn' }, e));
     for (const e of s.hints.slice(0, 3)) statBox.appendChild(h('div', { class: 'msg hint' }, e));
+    if (this.infiniteFuel)
+      statBox.appendChild(h('div', { class: 'msg hint' }, '无限燃料已开启：液体燃料不会消耗，带液体发动机的级 Δv 不受限；固体助推器照常烧完并自动分离。'));
 
     // 发射
     const launch = h('div', { class: 'panel b-section' });
@@ -425,6 +432,7 @@ export class BuilderUI {
       h('option', { value: 'pad', selected: this.scenario === 'pad' }, '发射台（地球）'),
       h('option', { value: 'leo', selected: this.scenario === 'leo' }, '练习：100 km 地球轨道'),
       h('option', { value: 'llo', selected: this.scenario === 'llo' }, '练习：22 km 环月轨道'),
+      h('option', { value: 'lmo', selected: this.scenario === 'lmo' }, '练习：80 km 火星轨道'),
     );
     launch.appendChild(
       h(
@@ -442,7 +450,26 @@ export class BuilderUI {
         ),
       ),
     );
+    launch.appendChild(
+      h(
+        'label',
+        { class: `launch-opt${this.infiniteFuel ? ' on' : ''}`, title: '液体燃料箱始终是满的，液体发动机不会熄火（固体助推器照常烧完）。飞行中也可以在“设置”里开关。' },
+        h('input', {
+          type: 'checkbox',
+          checked: this.infiniteFuel,
+          onchange: (e: Event) => this.onInfiniteFuel((e.target as HTMLInputElement).checked),
+        }),
+        '∞ 无限燃料模式',
+      ),
+    );
     this.right.append(stackBox, detail, statBox, launch);
+  }
+
+  /** 同步无限燃料设置并刷新右侧面板 */
+  setInfiniteFuel(on: boolean): void {
+    if (on === this.infiniteFuel) return;
+    this.infiniteFuel = on;
+    this.renderRight();
   }
 
   private move(dir: number): void {

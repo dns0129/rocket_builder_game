@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Vector3 } from 'three';
 import { FlightSim } from '../src/game/flight';
 import { templateDesign } from '../src/rocket/design';
-import { EARTH, MOON } from '../src/physics/bodies';
+import { BODY_ROTATION, EARTH, MOON } from '../src/physics/bodies';
 import { computeOrbit } from '../src/physics/orbit';
 import { solveCapture, solveTLI, solveReturn, solveCorrection } from '../src/game/maneuver';
 import type { FlightSim as FS } from '../src/game/flight';
@@ -71,6 +71,36 @@ describe('steering and staging', () => {
     expect(sim.rudderActive).toBe(true);
   });
 
+  it('rudder heading axis tilts the rocket toward any azimuth', () => {
+    const sim = new FlightSim(templateDesign('lunar'));
+    const deg = Math.PI / 180;
+    expect(sim.rudderHeading / deg).toBeCloseTo(90, 9);
+    sim.vessel.throttle = 1;
+    sim.stage();
+    run(sim, 12);
+    // 航向转到正北：未开启方向舵时从当前（接近竖直的）姿态接管
+    sim.setRudderHeading(0);
+    expect(sim.rudderActive).toBe(true);
+    expect(Math.abs(sim.rudderAngle / deg)).toBeLessThan(3);
+    sim.setRudder(20 * deg);
+    run(sim, 10);
+    const tel = sim.telemetry;
+    const fwd = new Vector3(0, 1, 0).applyQuaternion(sim.vessel.q);
+    log('heading 0, rudder 20 -> tilt', (sim.tiltAngle() / deg).toFixed(1), 'heading', ((sim.actualHeading() ?? NaN) / deg).toFixed(1));
+    expect(Math.abs(sim.tiltAngle() / deg - 20)).toBeLessThan(2);
+    expect(fwd.dot(tel.north)).toBeGreaterThan(Math.sin(18 * deg));
+    expect(Math.abs(fwd.dot(tel.east))).toBeLessThan(0.05);
+    // 方向舵开启时转动航向轴：倾角不变，火箭绕竖直方向转到新的航向（西北 315°）
+    sim.nudgeRudderHeading(-45 * deg);
+    expect(sim.rudderHeading / deg).toBeCloseTo(315, 6);
+    expect(sim.rudderAngle / deg).toBeCloseTo(20, 6);
+    run(sim, 12);
+    log('heading 315 -> actual heading', ((sim.actualHeading() ?? NaN) / deg).toFixed(1), 'tilt', (sim.tiltAngle() / deg).toFixed(1));
+    expect(Math.abs(sim.actualHeading()! / deg - 315)).toBeLessThan(4);
+    expect(Math.abs(sim.tiltAngle() / deg - 20)).toBeLessThan(2);
+    expect(sim.destroyed).toBe(false);
+  });
+
   it('separated stage falls behind before the upper stage ignites', () => {
     const sim = new FlightSim(templateDesign('lunar'));
     sim.autopilot.engage('ascent');
@@ -118,10 +148,11 @@ describe('landed separation', () => {
     run(sim, 3);
     expect(d!.alive).toBe(true);
     expect(d!.restPos.distanceTo(p0)).toBe(0);
-    // 惯性系位置随地球自转，但相对地面不动
+    // 惯性系位置随地球自转，但相对地面不动（自转关闭时惯性系中也静止）
     const vs = d!.v.length();
     log('rest debris speed (earth rotation)', vs.toFixed(1));
-    expect(vs).toBeGreaterThan(50);
+    if (BODY_ROTATION) expect(vs).toBeGreaterThan(50);
+    else expect(vs).toBeLessThan(1e-6);
   });
 });
 
@@ -148,6 +179,21 @@ describe('ascent', () => {
   }
 });
 
+describe('ascent along the rudder heading', () => {
+  it('launching north with the ascent autopilot reaches a polar orbit', () => {
+    const sim = new FlightSim(templateDesign('lunar'));
+    sim.setRudderHeading(0);
+    sim.autopilot.engage('ascent');
+    run(sim, 900, 1 / 30, () => sim.autopilot.mode === 'off');
+    const o = sim.telemetry.orbit;
+    log('north launch: pe', (o.peAlt / 1000).toFixed(1), 'inc', ((o.inc * 180) / Math.PI).toFixed(1));
+    expect(sim.destroyed).toBe(false);
+    expect(o.peAlt).toBeGreaterThan(70_000);
+    // 从北纬 19.6° 向正北发射：轨道面经过两极
+    expect((o.inc * 180) / Math.PI).toBeGreaterThan(85);
+  });
+});
+
 describe('full lunar mission', () => {
   it('flies to the moon, lands, and returns', () => {
     const sim = new FlightSim(templateDesign('lunar'));
@@ -170,6 +216,8 @@ describe('full lunar mission', () => {
     log('TLI exec:', sim.destroyed, sim.destroyReason, sim.landed, sim.telemetry.alt, sim.autopilot.mode, sim.t);
     sim.refreshPrediction();
     log('after TLI: moonMin', ((sim.prediction!.moonMinDist - MOON.radius) / 1000).toFixed(0), 'km', 'stage', sim.vessel.stageIndex);
+    // 闭环制导：执行后的近月点应接近计划的 60 km（以前偏到 600 km 以上）
+    expect(Math.abs(sim.prediction!.moonMinDist - MOON.radius - 60_000)).toBeLessThan(25_000);
     // 中途修正
     // 滑行一段时间（按游戏时间计）再做中途修正
     const tCoast = sim.t + 20_000;
@@ -229,6 +277,9 @@ describe('full lunar mission', () => {
     run(sim, 600, 1 / 30, () => sim.autopilot.mode === 'off');
     sim.refreshPrediction();
     log('return: earth pe', sim.prediction?.earthPeAfterMoon, 'dv left', sim.telemetry.stageDv.toFixed(0));
+    // 返回轨道应直接落在再入走廊里（以前规划出的轨迹会直接撞上地球，要靠中途修正补救）
+    expect(sim.prediction?.earthPeAfterMoon).toBeTruthy();
+    expect(Math.abs(sim.prediction!.earthPeAfterMoon!.alt - 35_000)).toBeLessThan(10_000);
     sim.setWarp(8);
     run(sim, 100, 1 / 30, () => sim.telemetry.body.id === 'earth');
     sim.warpIndex = 0;

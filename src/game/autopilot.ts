@@ -1,11 +1,26 @@
 import { Vector3 } from 'three';
-import { G0 } from '../physics/bodies';
+import { G0, type Body } from '../physics/bodies';
 import type { FlightSim } from './flight';
 import { solveCircularize } from './maneuver';
+import { fmtHeading } from '../ui/format';
 
 export type APMode = 'off' | 'ascent' | 'node' | 'land';
 
+/** 各天体的默认入轨高度：高于大气层顶端约 30 km；无大气天体 20 km。 */
+export function defaultAscentAlt(body: Body): number {
+  if (body.id === 'earth') return 100_000;
+  if (body.atmosphere) return body.atmosphere.height + 30_000;
+  return 20_000;
+}
+
 const UP = new Vector3(0, 1, 0);
+
+function fmtWait(s: number): string {
+  s = Math.max(0, s);
+  if (s < 120) return `${s.toFixed(0)} s`;
+  if (s < 7200) return `${(s / 60).toFixed(0)} 分钟`;
+  return s < 172_800 ? `${(s / 3600).toFixed(1)} 小时` : `${(s / 86_400).toFixed(1)} 天`;
+}
 
 /** 飞行辅助：自动入轨、自动执行机动节点、自动着陆（无大气天体）。 */
 export class Autopilot {
@@ -13,6 +28,8 @@ export class Autopilot {
   status = '';
   targetDir: Vector3 | null = null;
   ascentAlt = 100_000;
+  /** 外部（测试或界面）指定了入轨高度时为 true，不再按天体自动选择 */
+  ascentAltLocked = false;
   private phase = '';
   private stageCooldown = 0;
   private sim: FlightSim;
@@ -22,21 +39,63 @@ export class Autopilot {
     this.sim = sim;
   }
 
+  /** 飞行辅助正在负责执行第一个机动节点（“执行机动”或自动入轨的圆化阶段）。 */
+  get executingNode(): boolean {
+    return this.mode === 'node' || (this.mode === 'ascent' && this.phase === 'circ');
+  }
+
+  /** 负责的机动还没执行完时返回点火时刻：时间加速不得越过它；不需要限制时返回 null。 */
+  burnWarpHold(): number | null {
+    if (!this.executingNode) return null;
+    const n = this.sim.nodes[0];
+    if (!n || n.done) return null;
+    return n.t - this.sim.nodeBurnLead();
+  }
+
   engage(mode: APMode): void {
     const sim = this.sim;
-    if (mode === 'land' && sim.telemetry.body.atmosphere) {
-      sim.emit({ type: 'msg', msg: '自动着陆仅适用于无大气天体；在地球请使用降落伞。', level: 'warn' });
+    const body = sim.telemetry.body;
+    if (mode === 'land' && body.atmosphere && body.atmosphere.rho0 > 0.2) {
+      sim.emit({ type: 'msg', msg: `自动着陆仅适用于大气稀薄的天体；在${body.name}请使用降落伞。`, level: 'warn' });
       return;
     }
+    if (mode === 'land' && body.kind !== 'rocky') {
+      sim.emit({ type: 'msg', msg: `${body.name}没有可以着陆的表面。`, level: 'warn' });
+      return;
+    }
+    if (mode === 'ascent' && !this.ascentAltLocked) this.ascentAlt = defaultAscentAlt(body);
     if (mode === 'node' && !sim.nodes.length) {
       sim.emit({ type: 'msg', msg: '没有机动节点', level: 'warn' });
       return;
     }
+    if (mode === 'node') {
+      const n = sim.nodes[0];
+      const bt = sim.nodeBurnTime();
+      if (!isFinite(bt)) {
+        sim.emit({ type: 'msg', msg: '没有可用的发动机/燃料，无法执行机动', level: 'bad' });
+        return;
+      }
+      if (sim.t > n.t + Math.max(120, bt)) {
+        sim.emit({ type: 'msg', msg: '机动节点已经过去太久，请删除后重新规划', level: 'warn' });
+        return;
+      }
+    }
     this.mode = mode;
+    // 方向舵是手动操纵：飞行辅助接管后改为“保持”。否则辅助结束时 SAS 会把火箭转回方向舵原来的设定，
+    // 例如发射前转动航向轴时设定的“竖直 0°”——入轨后火箭会自己转成竖直朝上
+    if (sim.sasMode === 'rudder') sim.setSas('stability');
     this.phase = mode === 'ascent' ? 'start' : '';
     this.nodeStarted = false;
     this.targetDir = null;
     sim.emit({ type: 'msg', msg: `飞行辅助：${mode === 'ascent' ? '自动入轨' : mode === 'node' ? '执行机动' : '自动着陆'}`, level: 'info' });
+    if (mode === 'node') {
+      // 节点还远：自动时间加速到点火前（随时可以按 / 恢复实时）
+      const tStart = sim.nodes[0].t - sim.nodeBurnLead();
+      if (tStart - sim.t > 90 && sim.autoWarpTo === null) {
+        sim.warpToTime(tStart - 45);
+        sim.emit({ type: 'msg', msg: '自动时间加速到点火前', level: 'info' });
+      }
+    }
   }
 
   disengage(msg?: string, keepThrottle = false): void {
@@ -49,26 +108,10 @@ export class Autopilot {
   }
 
   private autoStage(dt: number): void {
-    const sim = this.sim;
-    const V = sim.vessel;
     this.stageCooldown -= dt;
-    if (this.stageCooldown > 0 || V.stageIndex >= V.stages.length) return;
-    const next = V.stages[V.stageIndex];
-    if (next.chutes.length && !next.ignite.length && next.decoupleSection === null) return;
-    const active = V.activeEngines();
-    let should = active.length === 0 && V.stages.slice(V.stageIndex).some((s) => s.ignite.length > 0);
-    if (!should && (next.jettisonRadial.length || next.decoupleSection !== null)) {
-      // 即将抛离的部分中有已熄火的发动机
-      const doomed = V.parts.filter(
-        (rp) =>
-          rp.p.def.engine &&
-          rp.ignited &&
-          ((next.decoupleSection !== null && rp.p.section === next.decoupleSection) || (rp.p.radial && next.jettisonRadial.includes(rp.p.parentUid))),
-      );
-      if (doomed.length && doomed.every((rp) => rp.flameout)) should = true;
-    }
-    if (should) {
-      sim.stage();
+    if (this.stageCooldown > 0) return;
+    if (this.sim.stageWanted()) {
+      this.sim.stage();
       this.stageCooldown = 0.8;
     }
   }
@@ -101,11 +144,13 @@ export class Autopilot {
       this.autoStage(dt);
       const alt = tel.alt;
       const turnStart = 900;
-      const turnEnd = 48_000;
+      // 重力转弯在大气层约 2/3 高度处结束（地球 48 km）；无大气天体沿用同一曲线
+      const turnEnd = tel.body.atmosphere ? (tel.body.atmosphere.height * 48) / 70 : 48_000;
       let pitch = 90;
       if (alt > turnStart) pitch = 90 - 88 * Math.pow(Math.min(1, (alt - turnStart) / (turnEnd - turnStart)), 0.42);
       const pr = (pitch * Math.PI) / 180;
-      const dir = tel.up.clone().multiplyScalar(Math.sin(pr)).addScaledVector(tel.east, Math.cos(pr)).normalize();
+      // 沿方向舵的航向转弯（默认正东；改成正北/正南得到极地轨道）
+      const dir = tel.up.clone().multiplyScalar(Math.sin(pr)).addScaledVector(sim.rudderDir(), Math.cos(pr)).normalize();
       // 大动压时限制攻角
       if (tel.dynPressure > 4000 && tel.surfSpeed > 50) {
         const pro = tel.vSurfVec.clone().normalize();
@@ -122,7 +167,7 @@ export class Autopilot {
       const maxAcc = 3.2 * G0;
       if (thrust > 0) V.setEffectiveThrottle(Math.min(1, (maxAcc * V.mass) / thrust));
       else V.throttle = 1;
-      this.status = `上升段：俯仰 ${pitch.toFixed(0)}°，远地点 ${(tel.orbit.apAlt / 1000).toFixed(1)} / ${(target / 1000).toFixed(0)} km`;
+      this.status = `上升段：俯仰 ${pitch.toFixed(0)}°，航向 ${fmtHeading(sim.rudderHeading)}，远地点 ${(tel.orbit.apAlt / 1000).toFixed(1)} / ${(target / 1000).toFixed(0)} km`;
       if (tel.orbit.apAlt >= target) {
         V.throttle = 0;
         this.phase = 'coast';
@@ -156,21 +201,30 @@ export class Autopilot {
     if (done) this.disengage('机动执行完毕');
   }
 
-  /** 执行第一个机动节点；返回是否完成。 */
+  /**
+   * 执行第一个机动节点；返回是否完成。
+   * 点火时刻以节点为中心；点火方向与剩余 Δv 由闭环制导（guidance.ts）每帧更新，
+   * 关机由物理子步精确完成（node.done），这里只负责对准、油门和分级。
+   */
   private execNode(dt: number): boolean {
     const sim = this.sim;
     const V = sim.vessel;
     const node = sim.nodes[0];
     if (!node) return true;
+    if (node.done) {
+      V.throttle = 0;
+      sim.removeNode(false);
+      return true;
+    }
     const vec = sim.nodeBurnVector();
     if (!vec) return true;
-    const bt = sim.nodeBurnTime();
-    const tStart = node.t - bt / 2;
+    const tStart = node.t - sim.nodeBurnLead();
     const remain = vec.length();
-    this.targetDir = remain > 1e-3 ? vec.clone().normalize() : this.targetDir;
+    if (remain > 1e-6) this.targetDir = vec.clone().normalize();
+    else if (!this.targetDir) this.targetDir = node.burnDir?.clone() ?? null;
     if (sim.t < tStart && !this.nodeStarted) {
       V.throttle = 0;
-      this.status = `等待点火：${Math.max(0, tStart - sim.t).toFixed(0)} s，Δv ${remain.toFixed(1)} m/s`;
+      this.status = `等待点火：${fmtWait(tStart - sim.t)}，Δv ${remain.toFixed(1)} m/s`;
       return false;
     }
     this.nodeStarted = true;
@@ -186,13 +240,17 @@ export class Autopilot {
     const align = this.targetDir ? fwd.angleTo(this.targetDir) : Math.PI;
     const { thrust } = V.maxThrustVac();
     const aMax = thrust / V.mass;
+    // 对准后才点火；已经在烧时允许稍大的偏差（滞回），免得姿态一抖油门就反复开关
+    const lim = ((V.throttle > 0 ? 9 : 4) * Math.PI) / 180;
     let thr = 0;
-    if (align < (6 * Math.PI) / 180 && aMax > 0) thr = Math.min(1, remain / (aMax * 1.2) + 0.02);
-    V.setEffectiveThrottle(thr, remain > 0.15);
-    this.status = `执行机动：剩余 Δv ${remain.toFixed(1)} m/s`;
-    if (node.remaining && node.fixedDv && (node.remaining.dot(node.fixedDv) <= 0 || remain < 0.15)) {
+    // 最后约 0.25 s 逐渐收油门，配合子步关机得到精确的 Δv
+    if (align < lim && aMax > 0) thr = Math.min(1, remain / (aMax * 0.25) + 0.01);
+    V.setEffectiveThrottle(thr, true);
+    this.status = align < lim || V.throttle > 0 ? `执行机动：剩余 Δv ${remain.toFixed(1)} m/s` : `对准点火方向：偏差 ${((align * 180) / Math.PI).toFixed(0)}°`;
+    // 保护：已经“烧过头”（例如不能关机的固体发动机）或剩余量可以忽略
+    if (node.remaining && node.burnDir && (node.remaining.dot(node.burnDir) <= 0 || remain < 0.01)) {
       V.throttle = 0;
-      sim.removeNode();
+      sim.removeNode(false);
       return true;
     }
     return false;
@@ -215,6 +273,14 @@ export class Autopilot {
       this.status = '推力不足，无法悬停！';
     }
     const h = Math.max(0, tel.radarAlt);
+    // 触地即关机：否则在重力较大的天体（火星）上，最低节流的推力会让着陆器一直“悬”在地面上，
+    // 无法判定为着陆，直到烧光燃料
+    if (sim.contactCount > 0 && h < 3 && tel.vVert > -2.5) {
+      V.throttle = 0;
+      this.targetDir = tel.up.clone();
+      this.status = '触地，发动机关机';
+      return;
+    }
     const brake = Math.max(0.3, (aMax - g) * 0.55);
     let vTarget = -Math.min(1.0 + Math.min(Math.sqrt(2 * brake * h), h * 0.22), 400);
     if (h < 4) vTarget = -1.0;
